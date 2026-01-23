@@ -1,6 +1,9 @@
 "dramatization workflow logic."
 
+import difflib
 import json
+import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List
 
@@ -18,8 +21,16 @@ from .config import (
     TXT_EXT,
     VOICE_DESIGN_MODEL,
     WAV_EXT,
+    DEFAULT_CAST,
 )
-from .llm import Character, ScriptSegment, generate_cast, process_script_chunk, split_text_smart
+from .llm import (
+    Character,
+    ScriptSegment,
+    fix_missing_segment,
+    generate_cast,
+    process_script_chunk,
+    split_text_smart,
+)
 from .tts import (
     TTSConfig,
     TTSEngine,
@@ -64,7 +75,7 @@ def load_cast(workdir: Path) -> tuple[List[Character], List[int]]:
     """load cast from json file. returns (characters, analyzed_chapters)."""
     path = workdir / CAST_FILE
     if not path.exists():
-        return [], []
+        return [Character(**c) for c in DEFAULT_CAST], []
 
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
@@ -165,61 +176,98 @@ def _merge_character_into_cast(
     c: Character,
     cast_map: dict[str, Character],
     alias_map: dict[str, str],
+    verbose: bool = False,
 ) -> str:
     """merge a character into the cast, returns 'added', 'updated', or 'merged'."""
     key = c.name.lower()
+    existing = None
+    merge_source = None  # name of the character being merged into existing (if different)
 
-    # check if this name is an alias of an existing character
+    # 1. Check if this name is an alias of an existing character
     if key in alias_map:
         canonical_key = alias_map[key]
         existing = cast_map[canonical_key]
-        new_aliases = set(existing.aliases or [])
-        if c.aliases:
-            new_aliases.update(c.aliases)
-        new_aliases.add(c.name)
-        new_aliases.discard(existing.name)
-        existing.aliases = sorted(new_aliases) if new_aliases else None
-        return "merged"
+        merge_source = c.name
 
-    # check if any of this character's aliases match an existing character
-    matched_key = None
-    if c.aliases:
+    # 2. Check if any of this character's aliases match an existing character
+    elif c.aliases:
         for alias in c.aliases:
             alias_lower = alias.lower()
             if alias_lower in cast_map:
-                matched_key = alias_lower
+                existing = cast_map[alias_lower]
+                merge_source = c.name
                 break
             if alias_lower in alias_map:
-                matched_key = alias_map[alias_lower]
+                existing = cast_map[alias_map[alias_lower]]
+                merge_source = c.name
                 break
 
-    if matched_key:
-        existing = cast_map[matched_key]
+    # 3. Check exact match
+    if not existing and key in cast_map:
+        existing = cast_map[key]
+
+    if existing:
+        updates = []
+        changed = False
+
+        # Calculate new aliases
         new_aliases = set(existing.aliases or [])
         if c.aliases:
             new_aliases.update(c.aliases)
-        new_aliases.add(c.name)
-        new_aliases.discard(existing.name)
-        existing.aliases = sorted(new_aliases) if new_aliases else None
-        if len(c.description) > len(existing.description):
-            existing.description = c.description
-        return "merged"
+        
+        if merge_source:
+            new_aliases.add(merge_source)
+            new_aliases.discard(existing.name)
+            
+        sorted_aliases = sorted(new_aliases) if new_aliases else None
+        
+        # Check for alias changes
+        if sorted_aliases != existing.aliases:
+            if verbose:
+                old_aliases = set(existing.aliases or [])
+                added = set(sorted_aliases or []) - old_aliases
+                if added:
+                    updates.append(f"aliases (+{', '.join(added)})")
+                else:
+                    updates.append("aliases")
+            else:
+                updates.append("aliases")
+            
+            existing.aliases = sorted_aliases
+            changed = True
 
-    if key in cast_map:
-        old = cast_map[key]
-        changed = False
-        if c.description != old.description:
-            old.description = c.description
+        # Check for description changes (always update if different)
+        old_desc = existing.description
+        if c.description and c.description != old_desc:
+            existing.description = c.description
             changed = True
-        new_aliases = set(old.aliases or [])
-        if c.aliases:
-            new_aliases.update(c.aliases)
-        if new_aliases != set(old.aliases or []):
-            old.aliases = sorted(new_aliases) if new_aliases else None
-            changed = True
-        return "updated" if changed else "unchanged"
+            updates.append("description")
+
+        # Logging
+        if verbose:
+            if merge_source:
+                # Merge message
+                msg = f"  merged '{c.name}' into '{existing.name}'"
+                if updates:
+                    msg += f" ({', '.join(updates)})"
+                print(msg)
+            elif changed:
+                # Update message
+                print(f"  updated '{existing.name}': {', '.join(updates)}")
+
+            # Show description diff if it changed
+            if "description" in updates:
+                if old_desc:
+                    print(f"    old description: {old_desc}")
+                print(f"    new description: {existing.description}")
+
+        return "merged" if merge_source else ("updated" if changed else "unchanged")
 
     # new character
+    if verbose:
+        print(f"  added new character: '{c.name}'")
+        if c.description:
+            print(f"    description: {c.description}")
     cast_map[key] = c
     if c.aliases:
         for alias in c.aliases:
@@ -233,6 +281,7 @@ def run_cast_generation(
     api_key: str | None = None,
     model: str | None = None,
     chapters: list[int] | None = None,
+    verbose: bool = False,
 ) -> List[Character]:
     """analyze book and generate cast list."""
     existing_cast, analyzed_chapters = load_cast(workdir)
@@ -322,7 +371,7 @@ def run_cast_generation(
 
         # merge batch results into cast
         for c in batch_cast:
-            result = _merge_character_into_cast(c, cast_map, alias_map)
+            result = _merge_character_into_cast(c, cast_map, alias_map, verbose=verbose)
             if result == "added":
                 added_count += 1
             elif result == "updated":
@@ -357,22 +406,17 @@ def run_auditions(
     workdir: Path,
     cast: List[Character] | None = None,
     min_appearances: int = 0,
+    verbose: bool = False,
 ) -> None:
     """generate voice samples for cast."""
-    from .config import (
-        EXTRA_FEMALE,
-        EXTRA_FEMALE_DESC,
-        EXTRA_FEMALE_LINE,
-        EXTRA_MALE,
-        EXTRA_MALE_DESC,
-        EXTRA_MALE_LINE,
-    )
-
     if cast is None:
         cast, _ = load_cast(workdir)
 
     if not cast:
-        print("no cast found. run 'cast' command first.")
+        if (workdir / CAST_FILE).exists():
+            print(f"cast file found at {workdir / CAST_FILE} but contains no characters.")
+        else:
+            print("no cast found. run 'cast' command first.")
         return
 
     voices_dir = workdir / "voices"
@@ -388,21 +432,6 @@ def run_auditions(
         else:
             minor_count += 1
 
-    # add generic extras if we have minor characters
-    need_extras = minor_count > 0 and min_appearances > 0
-    if need_extras:
-        # check if extras already exist
-        extra_female_path = voices_dir / f"{EXTRA_FEMALE}{WAV_EXT}"
-        extra_male_path = voices_dir / f"{EXTRA_MALE}{WAV_EXT}"
-        if not extra_female_path.exists():
-            main_cast.append(
-                Character(EXTRA_FEMALE, EXTRA_FEMALE_DESC, EXTRA_FEMALE_LINE, appearances=0)
-            )
-        if not extra_male_path.exists():
-            main_cast.append(
-                Character(EXTRA_MALE, EXTRA_MALE_DESC, EXTRA_MALE_LINE, appearances=0)
-            )
-
     engine = TTSEngine(TTSConfig(model_name=VOICE_DESIGN_MODEL))
 
     if min_appearances > 0:
@@ -416,7 +445,12 @@ def run_auditions(
     for char in tqdm(main_cast, desc="casting voices"):
         wav_path = voices_dir / f"{char.name}{WAV_EXT}"
         if wav_path.exists():
+            if verbose:
+                tqdm.write(f"  skipping {char.name} (exists)")
             continue
+
+        if verbose:
+            tqdm.write(f"  generating {char.name}: '{char.audition_line}'")
 
         try:
             audio, sr = engine.design_voice(text=char.audition_line, instruct=char.description)
@@ -431,11 +465,15 @@ def run_script_generation(
     api_key: str | None = None,
     model: str | None = None,
     chapters: list[int] | None = None,
+    verbose: bool = False,
 ) -> None:
     """generate dramatized scripts for chapters incrementally."""
     cast, _ = load_cast(workdir)
     if not cast:
-        print("no cast found. run 'cast' command first.")
+        if (workdir / CAST_FILE).exists():
+            print(f"cast file found at {workdir / CAST_FILE} but contains no characters.")
+        else:
+            print("no cast found. run 'cast' command first.")
         return
 
     # collect chapters to process
@@ -516,6 +554,12 @@ def run_script_generation(
                 chunk_segments = process_script_chunk(
                     chunk, cast, api_base, api_key, model or "gpt-4o"
                 )
+                if verbose:
+                    speakers = set(s.speaker for s in chunk_segments)
+                    tqdm.write(
+                        f"      chunk {i+1}: generated {len(chunk_segments)} segments. "
+                        f"Speakers: {', '.join(sorted(speakers))}"
+                    )
                 segments.extend(chunk_segments)
                 completed_chunks = i + 1
                 save_script(txt_path, segments, completed_chunks, total_chunks)
@@ -550,13 +594,15 @@ def run_performance(
     config: TTSConfig | None = None,
     pooled: bool = False,
     min_appearances: int = 0,
+    verbose: bool = False,
 ) -> None:
     """synthesize audio from scripts with segment-level resume."""
-    from .config import EXTRA_FEMALE, EXTRA_MALE
-
     cast, _ = load_cast(workdir)
     if not cast:
-        print("no cast found. run 'cast' command first.")
+        if (workdir / CAST_FILE).exists():
+            print(f"cast file found at {workdir / CAST_FILE} but contains no characters.")
+        else:
+            print("no cast found. run 'cast' command first.")
         return
 
     # build cast map including aliases
@@ -574,7 +620,7 @@ def run_performance(
             # use description to guess gender, default to male
             desc_lower = c.description.lower()
             is_female = any(w in desc_lower for w in ["female", "woman", "girl", "she", "her"])
-            extra_name = EXTRA_FEMALE if is_female else EXTRA_MALE
+            extra_name = "Extra Female" if is_female else "Extra Male"
             extra_char = Character(extra_name, "", "", appearances=0)
             cast_map[c.name] = extra_char
             if c.aliases:
@@ -769,12 +815,13 @@ def cmd_cast(args):
         api_key=args.api_key,
         model=args.model,
         chapters=chapters,
+        verbose=args.verbose,
     )
 
 
 def cmd_audition(args):
     min_appearances = getattr(args, "min_appearances", 0)
-    run_auditions(Path(args.workdir), min_appearances=min_appearances)
+    run_auditions(Path(args.workdir), min_appearances=min_appearances, verbose=args.verbose)
 
 
 def cmd_script(args):
@@ -790,6 +837,7 @@ def cmd_script(args):
         api_key=args.api_key,
         model=args.model,
         chapters=chapters,
+        verbose=args.verbose,
     )
 
 
@@ -810,7 +858,559 @@ def cmd_perform(args):
     )
 
     min_appearances = getattr(args, "min_appearances", 0)
-    run_performance(Path(args.workdir), chapters, config, args.pooled, min_appearances)
+    run_performance(
+        Path(args.workdir),
+        chapters,
+        config,
+        args.pooled,
+        min_appearances,
+        verbose=args.verbose,
+    )
+
+
+def _normalize_text(text: str) -> str:
+    """normalize text for comparison by collapsing whitespace."""
+    import re
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _strip_boundary_quotes(text: str) -> str:
+    """strip quotes and whitespace from text boundaries for comparison."""
+    return text.strip(' \t\n"\'""''')
+
+
+def _tokenize_with_positions(text: str) -> List[tuple[str, int, int]]:
+    """tokenize text into (word, start, end) tuples, ignoring punctuation."""
+    tokens = []
+    # match alphanumeric words only, treating hyphens/apostrophes as separators
+    # this handles cases like "near-religious" vs "near religious" or "don't" vs "dont"
+    for m in re.finditer(r"\w+", text):
+        word = m.group().lower()
+        if word:
+            tokens.append((word, m.start(), m.end()))
+    return tokens
+
+
+def _find_text_in_source(needle: str, haystack: str, start_pos: int = 0) -> tuple[int, int] | None:
+    """find needle in haystack using token alignment.
+
+    returns (start, end) positions in the original haystack, or None if not found.
+    """
+    needle_tokens = _tokenize_with_positions(needle)
+    if not needle_tokens:
+        return None
+    needle_words = [t[0] for t in needle_tokens]
+
+    # search a window of haystack starting from start_pos
+    haystack_chunk = haystack[start_pos:]
+    haystack_tokens = _tokenize_with_positions(haystack_chunk)
+    if not haystack_tokens:
+        return None
+    haystack_words = [t[0] for t in haystack_tokens]
+
+    matcher = difflib.SequenceMatcher(None, needle_words, haystack_words, autojunk=False)
+    # find the best match for the needle words in the haystack
+    match = matcher.find_longest_match(0, len(needle_words), 0, len(haystack_words))
+
+    # we want a match that includes at least 70% of the needle tokens
+    if match.size >= len(needle_words) * 0.7:
+        start_char = haystack_tokens[match.b][1] + start_pos
+        end_char = haystack_tokens[match.b + match.size - 1][2] + start_pos
+        return (start_char, end_char)
+
+    return None
+
+
+@dataclass
+class ValidationResult:
+    """result of script validation for a chapter."""
+    missing: list[tuple[str, int, int]]  # (text, insertion_index, split_offset)
+    hallucinated: list[int]  # indices of segments not found in source
+
+
+def validate_script(txt_path: Path) -> ValidationResult:
+    """validate that script segments match the source text using fuzzy diffing.
+
+    uses difflib to align normalized words between source and script.
+    identifies missing text (source words not in script) and hallucinated
+    segments (segments with low word match ratio).
+    """
+    segments, completed, total = load_script(txt_path)
+    if not segments:
+        return ValidationResult(missing=[(f"no script found for {txt_path.name}", 0)], hallucinated=[])
+
+    original_text = txt_path.read_text(encoding="utf-8")
+
+    # 1. Tokenize source and script
+    source_tokens = _tokenize_with_positions(original_text)
+    source_words = [t[0] for t in source_tokens]
+
+    script_words = []
+    script_token_info = []  # (seg_idx, start, end)
+
+    segment_stats = {}  # seg_idx -> {'total': 0, 'matched': 0}
+
+    for i, seg in enumerate(segments):
+        # use the same tokenizer for segments
+        seg_tokens = _tokenize_with_positions(seg.text)
+        segment_stats[i] = {"total": len(seg_tokens), "matched": 0}
+        for t in seg_tokens:
+            script_words.append(t[0])
+            script_token_info.append((i, t[1], t[2]))
+
+    # 2. Diff
+    matcher = difflib.SequenceMatcher(None, source_words, script_words, autojunk=False)
+    opcodes = matcher.get_opcodes()
+
+    missing_ranges = []  # list of (start_char, end_char, insertion_index, split_offset)
+
+    for tag, i1, i2, j1, j2 in opcodes:
+        if tag == "equal":
+            # record matches for hallucination detection
+            for j in range(j1, j2):
+                seg_idx = script_token_info[j][0]
+                segment_stats[seg_idx]["matched"] += 1
+        elif tag in ("delete", "replace"):
+            # source words i1:i2 are missing (or replaced)
+            if i1 < i2:
+                start_char = source_tokens[i1][1]
+                end_char = source_tokens[i2 - 1][2]
+                
+                # determine insertion index based on script position j1
+                if j1 < len(script_words):
+                    ins_idx, split_offset, _ = script_token_info[j1]
+                else:
+                    ins_idx = len(segments)
+                    split_offset = 0
+                
+                missing_ranges.append((start_char, end_char, ins_idx, split_offset))
+
+    # 3. Merge contiguous missing ranges
+    missing_fragments = []
+    if missing_ranges:
+        missing_ranges.sort()
+        merged = [missing_ranges[0]]
+
+        for current_start, current_end, current_ins, current_offset in missing_ranges[1:]:
+            last_start, last_end, last_ins, last_offset = merged[-1]
+
+            # check gap between last_end and current_start
+            gap_text = original_text[last_end:current_start]
+            
+            # merge if:
+            # 1. Same insertion index
+            # 2. Same split offset (or very close/sequential?) 
+            #    Actually, if we merge, we keep the FIRST insertion point (last_ins, last_offset).
+            #    But we should only merge if the gap is just punctuation/whitespace.
+            #    And typically they will be at the same insertion point if they are contiguous in source
+            #    but skipped in script.
+            if current_ins == last_ins and current_offset == last_offset and not re.search(r"\w", gap_text):
+                merged[-1] = (last_start, current_end, last_ins, last_offset)
+            else:
+                merged.append((current_start, current_end, current_ins, current_offset))
+
+        for start, end, ins_idx, split_offset in merged:
+            # expand to include adjacent punctuation but not whitespace
+            while start > 0 and original_text[start - 1] in ".,;:?!\"'()[]-":
+                start -= 1
+            while end < len(original_text) and original_text[end] in ".,;:?!\"'()[]-":
+                end += 1
+
+            text = original_text[start:end].strip()
+            # filter out tiny fragments
+            if len(text) > 1 or (len(text) == 1 and text.isalnum()):
+                missing_fragments.append((text, ins_idx, split_offset))
+
+    # 4. Identify hallucinated segments
+    hallucinated_indices = []
+    for i in range(len(segments)):
+        stats = segment_stats[i]
+        if stats["total"] == 0:
+            continue
+
+        ratio = stats["matched"] / stats["total"]
+        if ratio < 0.5:  # less than 50% words matched
+            hallucinated_indices.append(i)
+
+    return ValidationResult(missing=missing_fragments, hallucinated=hallucinated_indices)
+
+
+def run_validation(
+    workdir: Path,
+    chapters: list[int] | None = None,
+    check_missing: bool = True,
+    check_hallucinated: bool = True,
+) -> dict[str, ValidationResult]:
+    """validate scripts against source text for all chapters.
+
+    returns a dict mapping chapter names to ValidationResult.
+    """
+    txt_files = sorted(workdir.glob(f"*{TXT_EXT}"))
+    if not txt_files:
+        print("no text files found in workdir!")
+        return {}
+
+    # filter to relevant chapters
+    chapters_to_check = []
+    for txt_path in txt_files:
+        try:
+            chapter_num = int(txt_path.stem.split("_")[0])
+        except ValueError:
+            continue
+        if chapters and chapter_num not in chapters:
+            continue
+        script_path = txt_path.with_suffix(SCRIPT_EXT)
+        if not script_path.exists():
+            continue
+        chapters_to_check.append(txt_path)
+
+    if not chapters_to_check:
+        print("no chapters with scripts to validate")
+        return {}
+
+    results = {}
+    total_missing = 0
+    total_hallucinated = 0
+
+    for txt_path in tqdm(chapters_to_check, desc="validating", unit="chapter"):
+        result = validate_script(txt_path)
+        results[txt_path.name] = result
+
+        if check_missing:
+            total_missing += len(result.missing)
+        if check_hallucinated:
+            total_hallucinated += len(result.hallucinated)
+
+    # print results
+    print()
+    for txt_path in chapters_to_check:
+        result = results[txt_path.name]
+        issues = []
+
+        if check_missing and result.missing:
+            issues.append(f"{len(result.missing)} missing")
+        if check_hallucinated and result.hallucinated:
+            issues.append(f"{len(result.hallucinated)} hallucinated")
+
+        if issues:
+            print(f"\n{txt_path.name}: {', '.join(issues)}")
+
+            if check_missing:
+                for i, (fragment, idx, offset) in enumerate(result.missing, 1):
+                    print(f"  [missing {i} @ {idx}+{offset}] {fragment}")
+
+            if check_hallucinated:
+                segments, _, _ = load_script(txt_path)
+                for idx in result.hallucinated:
+                    seg = segments[idx]
+                    print(f"  [hallucinated {idx}] {seg.speaker}: {seg.text}")
+        else:
+            print(f"{txt_path.name}: OK")
+
+    # summary
+    summary_parts = []
+    if check_missing:
+        summary_parts.append(f"{total_missing} missing")
+    if check_hallucinated:
+        summary_parts.append(f"{total_hallucinated} hallucinated")
+
+    if total_missing == 0 and total_hallucinated == 0:
+        print(f"\nvalidation passed: all {len(results)} chapters OK")
+    else:
+        print(f"\nvalidation found {', '.join(summary_parts)} across {len(results)} chapters")
+
+    return results
+
+
+def cmd_validate(args):
+    chapters = None
+    if args.chapters:
+        from .utils import parse_chapter_range
+        chapters = parse_chapter_range(args.chapters)
+
+    # default to checking both if neither flag specified
+    check_missing = args.missing or (not args.missing and not args.hallucinated)
+    check_hallucinated = args.hallucinated or (not args.missing and not args.hallucinated)
+
+    run_validation(Path(args.workdir), chapters, check_missing, check_hallucinated)
+
+
+
+
+DEFAULT_CONTEXT_CHARS = 500  # default characters of context before/after missing text
+DEFAULT_CONTEXT_PARAGRAPHS = 2  # default paragraphs of context before/after missing text
+
+
+def _extract_context(
+    original_text: str,
+    fragment: str,
+    context_chars: int | None = None,
+    context_paragraphs: int | None = None,
+) -> tuple[str, str]:
+    """extract context before and after a missing fragment.
+
+    if context_paragraphs is set, uses paragraph boundaries.
+    otherwise uses context_chars (default 500).
+
+    returns (context_before, context_after) as strings.
+    """
+    if context_paragraphs is not None:
+        return _extract_context_paragraphs(original_text, fragment, context_paragraphs)
+
+    # character-based extraction
+    original_norm = _normalize_text(original_text)
+    fragment_norm = _normalize_text(fragment)
+    chars = context_chars or DEFAULT_CONTEXT_CHARS
+
+    pos = original_norm.find(fragment_norm[:50])
+    if pos == -1:
+        return "", ""
+
+    start = max(0, pos - chars)
+    context_before = original_norm[start:pos].strip()
+
+    end_pos = pos + len(fragment_norm)
+    context_after = original_norm[end_pos : end_pos + chars].strip()
+
+    return context_before, context_after
+
+
+def _extract_context_paragraphs(original_text: str, fragment: str, num_paragraphs: int) -> tuple[str, str]:
+    """extract context using paragraph boundaries."""
+    paragraphs = original_text.split("\n\n")
+    fragment_norm = _normalize_text(fragment)
+
+    # find which paragraph contains the start of the fragment
+    target_idx = None
+    for i, para in enumerate(paragraphs):
+        para_norm = _normalize_text(para)
+        if fragment_norm[:50] in para_norm:
+            target_idx = i
+            break
+
+    if target_idx is None:
+        return "", ""
+
+    # extract paragraphs before
+    start_idx = max(0, target_idx - num_paragraphs)
+    context_before = "\n\n".join(paragraphs[start_idx:target_idx])
+
+    # extract paragraphs after
+    end_idx = min(len(paragraphs), target_idx + num_paragraphs + 1)
+    context_after = "\n\n".join(paragraphs[target_idx + 1 : end_idx])
+
+    return context_before.strip(), context_after.strip()
+
+
+def _attempt_merge(segments: List[ScriptSegment], index: int) -> bool:
+    """merge segment at index with next segment if speakers match.
+
+    returns True if merged (and list is shortened).
+    """
+    if index < 0 or index >= len(segments) - 1:
+        return False
+
+    s1 = segments[index]
+    s2 = segments[index + 1]
+
+    if s1.speaker == s2.speaker:
+        # merge s2 into s1
+        s1.text = s1.text.rstrip() + " " + s2.text.lstrip()
+        # keep s1's instruction as the primary one
+        segments.pop(index + 1)
+        return True
+    return False
+
+
+def run_fix(
+    workdir: Path,
+    api_base: str | None = None,
+    api_key: str | None = None,
+    model: str | None = None,
+    chapters: list[int] | None = None,
+    fix_missing: bool = True,
+    fix_hallucinated: bool = True,
+    context_chars: int | None = None,
+    context_paragraphs: int | None = None,
+    verbose: bool = False,
+) -> None:
+    """fix script issues by filling missing segments and removing hallucinated ones."""
+    cast, _ = load_cast(workdir)
+    if not cast:
+        if (workdir / CAST_FILE).exists():
+            print(f"cast file found at {workdir / CAST_FILE} but contains no characters.")
+        else:
+            print("no cast found. run 'cast' command first.")
+        return
+
+    txt_files = sorted(workdir.glob(f"*{TXT_EXT}"))
+    if not txt_files:
+        print("no text files found in workdir!")
+        return
+
+    # filter to relevant chapters
+    chapters_to_fix = []
+    for txt_path in txt_files:
+        try:
+            chapter_num = int(txt_path.stem.split("_")[0])
+        except ValueError:
+            continue
+        if chapters and chapter_num not in chapters:
+            continue
+        script_path = txt_path.with_suffix(SCRIPT_EXT)
+        if not script_path.exists():
+            continue
+        chapters_to_fix.append(txt_path)
+
+    if not chapters_to_fix:
+        print("no chapters with scripts to fix")
+        return
+
+    total_added = 0
+    total_removed = 0
+
+    for txt_path in tqdm(chapters_to_fix, desc="fixing", unit="chapter"):
+        result = validate_script(txt_path)
+
+        if not result.missing and not result.hallucinated:
+            continue
+
+        segments, completed, total = load_script(txt_path)
+        original_text = txt_path.read_text(encoding="utf-8")
+
+        # remove hallucinated segments first (in reverse order to preserve indices)
+        if fix_hallucinated and result.hallucinated:
+            print(f"\n{txt_path.name}: removing {len(result.hallucinated)} hallucinated segment(s)...")
+            for idx in sorted(result.hallucinated, reverse=True):
+                seg = segments[idx]
+                print(f"  removing [{idx}] {seg.speaker}: {seg.text}")
+                del segments[idx]
+                total_removed += 1
+            # checkpoint after removing hallucinations
+            save_script(txt_path, segments, total, total)
+
+        # re-validate to get updated missing list after hallucination removal
+        if fix_missing:
+            result = validate_script(txt_path)
+            if result.missing:
+                print(f"\n{txt_path.name}: filling {len(result.missing)} missing fragment(s)...")
+                # reload segments in case they changed
+                segments, completed, total = load_script(txt_path)
+
+                # Sort missing fragments by insertion index and offset in descending order
+                # so that insertions/splits don't affect indices of subsequent operations
+                missing_sorted = sorted(result.missing, key=lambda x: (x[1], x[2]), reverse=True)
+
+                for fragment, insertion_idx, split_offset in tqdm(missing_sorted, desc="  filling", unit="fragment", leave=False):
+                    if verbose:
+                        print(f"\n    missing fragment (@ {insertion_idx}+{split_offset}): {fragment}")
+
+                    # Determine insertion point and handle splitting
+                    target_idx = insertion_idx
+                    if split_offset > 0 and insertion_idx < len(segments):
+                        seg = segments[insertion_idx]
+                        # only split if offset is within bounds and actually splits text
+                        if split_offset < len(seg.text):
+                            from copy import deepcopy
+                            left_seg = deepcopy(seg)
+                            left_seg.text = seg.text[:split_offset].rstrip()
+                            
+                            right_seg = deepcopy(seg)
+                            right_seg.text = seg.text[split_offset:].lstrip()
+                            
+                            # update segment at insertion_idx with left part
+                            segments[insertion_idx] = left_seg
+                            # insert right part after
+                            segments.insert(insertion_idx + 1, right_seg)
+                            
+                            # we want to insert the NEW text between left and right
+                            target_idx = insertion_idx + 1
+
+                    context_before, context_after = _extract_context(
+                        original_text, fragment, context_chars, context_paragraphs
+                    )
+
+                    try:
+                        new_segments = fix_missing_segment(
+                            fragment,
+                            context_before,
+                            context_after,
+                            cast,
+                            api_base,
+                            api_key,
+                            model or "gpt-4o",
+                        )
+
+                        if new_segments:
+                            if verbose:
+                                print("    LLM returned:")
+                                for s in new_segments:
+                                    print(f"      {s.speaker}: {s.text}")
+
+                            for j, seg in enumerate(new_segments):
+                                segments.insert(target_idx + j, seg)
+                            
+                            # merge newly inserted segments with neighbors if speakers match
+                            # 1. merge last new segment with following existing segment
+                            if _attempt_merge(segments, target_idx + len(new_segments) - 1):
+                                pass # merged with next
+                            
+                            # 2. merge internal new segments (if LLM returned multiple)
+                            # iterate backwards to keep indices valid
+                            for j in range(len(new_segments) - 2, -1, -1):
+                                _attempt_merge(segments, target_idx + j)
+
+                            # 3. merge preceding existing segment with first new segment
+                            if target_idx > 0:
+                                _attempt_merge(segments, target_idx - 1)
+
+                            total_added += len(new_segments)
+                            # checkpoint after each fragment
+                            save_script(txt_path, segments, total, total)
+
+                    except Exception as e:
+                        print(f"    failed: {e}")
+
+    # summary
+    summary_parts = []
+    if fix_missing and total_added > 0:
+        summary_parts.append(f"added {total_added} segment(s)")
+    if fix_hallucinated and total_removed > 0:
+        summary_parts.append(f"removed {total_removed} segment(s)")
+
+    if summary_parts:
+        print(f"\nfix complete: {', '.join(summary_parts)}")
+    else:
+        print("\nno fixes needed")
+
+
+def cmd_fix(args):
+    chapters = None
+    if args.chapters:
+        from .utils import parse_chapter_range
+        chapters = parse_chapter_range(args.chapters)
+
+    # default to fixing both if neither flag specified
+    fix_missing = args.missing or (not args.missing and not args.hallucinated)
+    fix_hallucinated = args.hallucinated or (not args.missing and not args.hallucinated)
+
+    # context flags are mutually exclusive
+    context_chars = getattr(args, "context_chars", None)
+    context_paragraphs = getattr(args, "context_paragraphs", None)
+
+    run_fix(
+        Path(args.workdir),
+        api_base=args.api_base,
+        api_key=args.api_key,
+        model=args.model,
+        chapters=chapters,
+        fix_missing=fix_missing,
+        fix_hallucinated=fix_hallucinated,
+        context_chars=context_chars,
+        context_paragraphs=context_paragraphs,
+        verbose=args.verbose,
+    )
 
 
 def dramatize_book(
@@ -822,11 +1422,12 @@ def dramatize_book(
     tts_config: TTSConfig | None = None,
     pooled: bool = False,
     min_appearances: int = 0,
+    verbose: bool = False,
 ) -> None:
     """run full dramatization pipeline."""
-    cast = run_cast_generation(workdir, api_base, api_key, model, chapters)
+    cast = run_cast_generation(workdir, api_base, api_key, model, chapters, verbose=verbose)
     # generate scripts first to count appearances before auditions
-    run_script_generation(workdir, api_base, api_key, model, chapters)
+    run_script_generation(workdir, api_base, api_key, model, chapters, verbose=verbose)
     # now run auditions with appearance counts available
-    run_auditions(workdir, min_appearances=min_appearances)
-    run_performance(workdir, chapters, tts_config, pooled, min_appearances)
+    run_auditions(workdir, min_appearances=min_appearances, verbose=verbose)
+    run_performance(workdir, chapters, tts_config, pooled, min_appearances, verbose=verbose)

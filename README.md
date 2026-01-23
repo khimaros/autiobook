@@ -78,10 +78,16 @@ autiobook audition workdir/
 # 4. create dramatized script (using llm)
 autiobook script workdir/ --api-key sk-...
 
-# 5. perform the script (voice cloning)
+# 5. validate script against source (optional)
+autiobook validate workdir/
+
+# 6. fix any issues found (optional)
+autiobook fix workdir/ --api-key sk-...
+
+# 7. perform the script (voice cloning)
 autiobook perform workdir/
 
-# 6. export to mp3
+# 8. export to mp3
 autiobook export workdir/ -o audiobook/
 ```
 
@@ -89,6 +95,39 @@ or run the full dramatization pipeline in one go:
 
 ```bash
 autiobook dramatize workdir/ --api-key sk-...
+```
+
+### script validation and repair
+
+after generating scripts, you can validate that all source text is covered
+and detect any hallucinated content:
+
+```bash
+# check for both missing text and hallucinated segments
+autiobook validate workdir/
+
+# check only for missing text
+autiobook validate workdir/ --missing
+
+# check only for hallucinated segments
+autiobook validate workdir/ --hallucinated
+```
+
+to fix issues found during validation:
+
+```bash
+# fill missing text and remove hallucinated segments
+autiobook fix workdir/ --api-key sk-...
+
+# only fill missing text (uses LLM with surrounding context)
+autiobook fix workdir/ --missing --api-key sk-...
+
+# only remove hallucinated segments (no LLM needed)
+autiobook fix workdir/ --hallucinated
+
+# control context amount for LLM (characters or paragraphs)
+autiobook fix workdir/ --missing --context-chars 1000 --api-key sk-...
+autiobook fix workdir/ --missing --context-paragraphs 3 --api-key sk-...
 ```
 
 ### options
@@ -120,9 +159,16 @@ compatible with the [Voice](https://github.com/PaulWoitaschek/Voice) audiobook p
 ```
 workdir/
 ├── metadata.json          # book metadata
+├── cover.jpg              # book cover (if available)
+├── cast.json              # character list for dramatized mode
+├── voices/                # generated voice samples
+│   ├── Narrator.wav
+│   └── Character_Name.wav
 ├── 01_Introduction.txt    # extracted chapter text
+├── 01_Introduction.json   # dramatized script (speaker segments)
 ├── 01_Introduction.wav    # synthesized audio
 ├── 02_Chapter_One.txt
+├── 02_Chapter_One.json
 ├── 02_Chapter_One.wav
 └── ...
 ```

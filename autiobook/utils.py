@@ -76,6 +76,11 @@ def add_common_args(parser: argparse.ArgumentParser, group: str = "all"):
             help="minimum appearances for dedicated voice (others use generic Extra voices)",
         )
 
+    if group in ["all", "logging"]:
+        parser.add_argument(
+            "-v", "--verbose", action="store_true", help="enable verbose logging"
+        )
+
 
 def iter_pending_chapters(
     workdir: Path,

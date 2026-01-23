@@ -12,8 +12,10 @@ from .config import (
 from .dramatize import (
     cmd_audition,
     cmd_cast,
+    cmd_fix,
     cmd_perform,
     cmd_script,
+    cmd_validate,
     dramatize_book,
 )
 from .epub import parse_epub, save_extracted
@@ -95,6 +97,7 @@ def cmd_dramatize(args):
         tts_config=tts_config,
         pooled=args.pooled,
         min_appearances=args.min_appearances,
+        verbose=args.verbose,
     )
 
     print("done")
@@ -220,6 +223,7 @@ def main():
     p_extract = subparsers.add_parser("extract", help="extract chapter text from epub")
     p_extract.add_argument("epub", help="path to epub file")
     p_extract.add_argument("-o", "--output", required=True, help="output workdir")
+    add_common_args(p_extract, group="logging")
     p_extract.set_defaults(func=cmd_extract)
 
     # dramatize command
@@ -229,6 +233,7 @@ def main():
     add_common_args(p_dramatize, group="chapters")
     add_common_args(p_dramatize, group="tts")
     add_common_args(p_dramatize, group="cast")
+    add_common_args(p_dramatize, group="logging")
     p_dramatize.set_defaults(func=cmd_dramatize)
 
     # cast command
@@ -236,12 +241,15 @@ def main():
     p_cast.add_argument("workdir", help="path to workdir")
     add_common_args(p_cast, group="llm")
     add_common_args(p_cast, group="chapters")
+    add_common_args(p_cast, group="cast")
+    add_common_args(p_cast, group="logging")
     p_cast.set_defaults(func=cmd_cast)
 
     # audition command
     p_audition = subparsers.add_parser("audition", help="generate character voice samples")
     p_audition.add_argument("workdir", help="path to workdir")
     add_common_args(p_audition, group="cast")
+    add_common_args(p_audition, group="logging")
     p_audition.set_defaults(func=cmd_audition)
 
     # script command
@@ -249,6 +257,7 @@ def main():
     p_script.add_argument("workdir", help="path to workdir")
     add_common_args(p_script, group="llm")
     add_common_args(p_script, group="chapters")
+    add_common_args(p_script, group="logging")
     p_script.set_defaults(func=cmd_script)
 
     # perform command
@@ -257,7 +266,35 @@ def main():
     add_common_args(p_perform, group="chapters")
     add_common_args(p_perform, group="tts")
     add_common_args(p_perform, group="cast")
+    add_common_args(p_perform, group="logging")
     p_perform.set_defaults(func=cmd_perform)
+
+    # validate command
+    p_validate = subparsers.add_parser("validate", help="verify scripts match source text")
+    p_validate.add_argument("workdir", help="path to workdir")
+    p_validate.add_argument("--missing", action="store_true", help="check for missing text")
+    p_validate.add_argument("--hallucinated", action="store_true", help="check for hallucinated segments")
+    add_common_args(p_validate, group="chapters")
+    add_common_args(p_validate, group="logging")
+    p_validate.set_defaults(func=cmd_validate)
+
+    # fix command
+    p_fix = subparsers.add_parser("fix", help="fix script issues (fill missing, remove hallucinated)")
+    p_fix.add_argument("workdir", help="path to workdir")
+    p_fix.add_argument("--missing", action="store_true", help="fill missing text segments")
+    p_fix.add_argument("--hallucinated", action="store_true", help="remove hallucinated segments")
+    p_fix.add_argument(
+        "--context-chars", type=int, metavar="N",
+        help="characters of context before/after missing text (default: 500)"
+    )
+    p_fix.add_argument(
+        "--context-paragraphs", type=int, metavar="N",
+        help="paragraphs of context before/after missing text (alternative to --context-chars)"
+    )
+    add_common_args(p_fix, group="llm")
+    add_common_args(p_fix, group="chapters")
+    add_common_args(p_fix, group="logging")
+    p_fix.set_defaults(func=cmd_fix)
 
     # synthesize command
     p_synth = subparsers.add_parser("synthesize", help="convert text files to wav audio")
@@ -266,6 +303,7 @@ def main():
     add_common_args(p_synth, group="speaker")
     add_common_args(p_synth, group="instruct")
     add_common_args(p_synth, group="tts")
+    add_common_args(p_synth, group="logging")
     p_synth.set_defaults(func=cmd_synthesize)
 
     # export command
@@ -273,12 +311,14 @@ def main():
     p_export.add_argument("workdir", help="path to workdir with wav files")
     p_export.add_argument("-o", "--output", required=True, help="output directory for mp3 files")
     p_export.add_argument("-b", "--bitrate", default=DEFAULT_BITRATE, help="mp3 bitrate")
+    add_common_args(p_export, group="logging")
     p_export.set_defaults(func=cmd_export)
 
     # clean command
     p_clean = subparsers.add_parser("clean", help="remove intermediate chunk files")
     p_clean.add_argument("workdir", help="path to workdir")
     p_clean.add_argument("-n", "--dry-run", action="store_true", help="show what would be removed")
+    add_common_args(p_clean, group="logging")
     p_clean.set_defaults(func=cmd_clean)
 
     # convert command (full pipeline)
@@ -290,6 +330,7 @@ def main():
     add_common_args(p_convert, group="chapters")
     add_common_args(p_convert, group="speaker")
     add_common_args(p_convert, group="instruct")
+    add_common_args(p_convert, group="logging")
     add_common_args(p_convert, group="tts")
     p_convert.set_defaults(func=cmd_convert)
 

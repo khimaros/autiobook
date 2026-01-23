@@ -11,7 +11,7 @@ Dramatization Workflow:
 ```
 txt files → cast gen → cast.json → audition → voice samples
      ↓
-script gen (llm) → json scripts → perform (cloning) → wav files
+script gen (llm) → json scripts → validate → fix → perform (cloning) → wav files
 ```
 
 each phase is idempotent and can be run independently.
@@ -51,14 +51,39 @@ creates:
 
 skips existing wav files (idempotent).
 
-### dramatize / cast / audition / script / perform
+### dramatize / cast / audition / script / validate / fix / perform
 
 advanced workflow for multi-speaker dramatization.
 
 - `cast`: generates `cast.json` from text sample using LLM.
 - `audition`: generates `voices/Character.wav` using `Qwen3-TTS-VoiceDesign`.
 - `script`: rewrites text into `NN_Title.json` script with speaker attribution using LLM.
+- `validate`: verifies scripts match source text, reports missing and hallucinated segments.
+- `fix`: fills missing segments using LLM with context, removes hallucinated segments.
 - `perform`: synthesizes audio using `Qwen3-TTS-Base` voice cloning from scripts + voice samples.
+
+### validate
+
+compares script segments against original text to detect:
+- **missing**: text from source not present in any script segment
+- **hallucinated**: script segments with text not found in source
+
+```
+autiobook validate workdir/ [--missing] [--hallucinated]
+```
+
+### fix
+
+repairs script issues found by validation:
+- fills missing text by sending to LLM with surrounding context
+- removes hallucinated segments from script
+- checkpoints after each fix for resumability
+
+```
+autiobook fix workdir/ [--missing] [--hallucinated] --api-key sk-...
+autiobook fix workdir/ --missing --context-chars 1000  # character-based context
+autiobook fix workdir/ --missing --context-paragraphs 3  # paragraph-based context
+```
 
 ### export
 

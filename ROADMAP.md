@@ -3,6 +3,8 @@
 ```
 [@] bash end-to-end test script
 
+[x] add "fix" phase to dramatize flow to remove hallucinations and fix missing
+[x] add "validate" phase to dramatize flow to verify scripts match source text
 [x] dramatize command: pass through TTS flags (--pooled, --batch-size, etc.) and resume
 [x] script LLM prompt: narrator handles "X said" portions, characters only voice quoted content
 [x] keep chunks unless explicitly cleaned up (add "clean" command)
