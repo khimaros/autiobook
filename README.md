@@ -6,6 +6,7 @@ convert epub files to audiobooks using qwen3-tts.
 
 - python 3.12+
 - ffmpeg
+- sox
 - uv (python package manager)
 - gpu recommended (cuda or rocm)
 
@@ -23,6 +24,14 @@ make build-cpu
 ```
 
 ## usage
+
+### enter the venv
+
+```bash
+source .venv/bin/activate
+
+autiobook --help
+```
 
 ### list chapters
 
@@ -53,9 +62,8 @@ autiobook export workdir/ -o audiobook/
 
 ### dramatized conversion (llm)
 
-generate a full cast performance using openai-compatible llm and voice cloning.
-
-works with any OpenAI compatible API (including llama.cpp).
+generate a full cast performance using openai-compatible llm
+(including llama.cpp) and voice cloning.
 
 ```bash
 # 1. extract text
