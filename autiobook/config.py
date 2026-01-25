@@ -4,7 +4,17 @@ import re
 
 # epub parsing
 CONTENT_TAGS = ["p", "div", "h1", "h2", "h3", "h4", "h5", "h6", "li", "td", "th"]
-SKIP_TAGS = ["script", "style", "meta", "head", "link", "noscript", "nav", "header", "footer"]
+SKIP_TAGS = [
+    "script",
+    "style",
+    "meta",
+    "head",
+    "link",
+    "noscript",
+    "nav",
+    "header",
+    "footer",
+]
 MIN_CHAPTER_WORDS = 50
 
 # tts settings
@@ -37,22 +47,22 @@ CAST_FILE = "cast.json"
 SCRIPT_EXT = ".json"
 COVER_FILE = "cover.jpg"
 CHUNKS_DIR = "chunks"
-CHUNK_PROGRESS_FILE = "progress.json"
+SEGMENTS_DIR = "segments"
 
 DEFAULT_CAST = [
     {
-      "name": "Narrator",
-      "description": "Warm, articulate male voice; mature age; measured slow pace; authoritative yet compassionate.",
-      "audition_line": "The history of the valley wasn't written in books, but in the layers of sediment resting quietly beneath the river."
+        "name": "Narrator",
+        "description": "Warm, articulate male voice; mature age; measured slow pace; authoritative yet compassionate.",
+        "audition_line": "The history of the valley wasn't written in books, but in the layers of sediment resting quietly beneath the river.",
     },
     {
-      "name": "Extra Female",
-      "description": "Bright, expressive soprano voice; young adult; energetic pace; lively and conversational.",
-      "audition_line": "I really don't think we should be going in there without a map; honestly, it looks dangerous."
+        "name": "Extra Female",
+        "description": "Neutral, casual, female voice, young adult; lower than average pitch.",
+        "audition_line": "I really don't think we should be going in there without a map; honestly, it looks dangerous.",
     },
     {
-      "name": "Extra Male",
-      "description": "Gruff, textured baritone voice; older adult; relaxed slow speed; weary but kind.",
-      "audition_line": "Just hold the light steady for a minute. I've got to get this wire connected before the generator fails."
+        "name": "Extra Male",
+        "description": "Gruff, textured baritone voice; older adult; relaxed slow speed; weary but kind.",
+        "audition_line": "Just hold the light steady for a minute. I've got to get this wire connected before the generator fails.",
     },
 ]

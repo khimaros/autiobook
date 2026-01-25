@@ -64,7 +64,8 @@ def export_audiobook(
     workdir: Path,
     output_dir: Path,
     bitrate: str = DEFAULT_BITRATE,
-) -> list[Path]:
+    force: bool = False,
+) -> int:
     """export all chapters as mp3 files with cover art."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -79,7 +80,9 @@ def export_audiobook(
     if not cover_path.exists():
         cover_path = None
 
-    exported = []
+    newly_exported_count = 0
+    skipped_count = 0
+    chapters_to_process = 0
 
     for chapter_info in chapters:
         filename_base = chapter_info["filename_base"]
@@ -89,11 +92,11 @@ def export_audiobook(
         # skip if wav doesn't exist (not synthesized yet)
         if not wav_path.exists():
             continue
+        chapters_to_process += 1
 
         # skip if already exported (idempotent)
-        if mp3_path.exists():
-            print(f"skipping {wav_path.name} (already exported)")
-            exported.append(mp3_path)
+        if not force and mp3_path.exists():
+            skipped_count += 1
             continue
 
         print(f"exporting {wav_path.name}...")
@@ -108,6 +111,11 @@ def export_audiobook(
 
         wav_to_mp3(wav_path, mp3_path, mp3_meta, bitrate, cover_path)
         print(f"  -> {mp3_path.name}")
-        exported.append(mp3_path)
+        newly_exported_count += 1
 
-    return exported
+    if newly_exported_count == 0 and skipped_count == 0 and chapters_to_process == 0:
+        print("export: no chapters to export.")
+    elif newly_exported_count == 0 and skipped_count > 0:
+        print(f"export: all {skipped_count} chapters up to date.")
+
+    return newly_exported_count + skipped_count

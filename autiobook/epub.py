@@ -9,7 +9,14 @@ import ebooklib
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 from ebooklib import epub
 
-from .config import CONTENT_TAGS, COVER_FILE, METADATA_FILE, MIN_CHAPTER_WORDS, SKIP_TAGS, TXT_EXT
+from .config import (
+    CONTENT_TAGS,
+    COVER_FILE,
+    METADATA_FILE,
+    MIN_CHAPTER_WORDS,
+    SKIP_TAGS,
+    TXT_EXT,
+)
 
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
@@ -67,7 +74,7 @@ def extract_text_from_html(html_content: bytes) -> str:
 
     paragraphs = []
     for tag in soup.find_all(CONTENT_TAGS):
-        text = ' '.join(tag.get_text().split())
+        text = " ".join(tag.get_text().split())
         if text:
             paragraphs.append(text)
 
@@ -157,7 +164,10 @@ def parse_epub(path: Path) -> tuple[Book, bytes | None]:
         chapters.append(Chapter(index=index, title=chapter_title, text=text))
         index += 1
 
-    return Book(title=title, author=author, language=language, chapters=chapters), cover_data
+    return (
+        Book(title=title, author=author, language=language, chapters=chapters),
+        cover_data,
+    )
 
 
 def save_extracted(book: Book, workdir: Path, cover_data: bytes | None = None) -> None:

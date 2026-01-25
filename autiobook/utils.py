@@ -42,43 +42,54 @@ def add_common_args(parser: argparse.ArgumentParser, group: str = "all"):
             help="max chars per chunk (smaller = faster)",
         )
         parser.add_argument(
-            "--no-compile", action="store_true", help="disable torch.compile optimization"
+            "--no-compile",
+            action="store_true",
+            help="disable torch.compile optimization",
         )
-        parser.add_argument("--no-warmup", action="store_true", help="skip model warmup")
+        parser.add_argument(
+            "--no-warmup", action="store_true", help="skip model warmup"
+        )
         parser.add_argument(
             "--pooled",
             action="store_true",
             help="pool chunks across chapters for better batch utilization",
         )
         parser.add_argument(
-            "--greedy", action="store_true", help="use greedy decoding (faster, less varied)"
+            "--greedy",
+            action="store_true",
+            help="use greedy decoding (faster, less varied)",
         )
         parser.add_argument(
-            "--temperature", type=float, default=0.9, help="sampling temperature (lower = faster)"
+            "--temperature",
+            type=float,
+            default=0.9,
+            help="sampling temperature (lower = faster)",
         )
 
     if group in ["all", "speaker"]:
-        parser.add_argument("-s", "--speaker", default=DEFAULT_SPEAKER, help="tts voice")
+        parser.add_argument(
+            "-s", "--speaker", default=DEFAULT_SPEAKER, help="tts voice"
+        )
 
     if group in ["all", "instruct"]:
-        parser.add_argument("-i", "--instruct", help="instruction for tts (string or file path)")
+        parser.add_argument(
+            "-i", "--instruct", help="instruction for tts (string or file path)"
+        )
 
     if group in ["all", "llm"]:
         parser.add_argument("--api-base", help="openai api base url")
         parser.add_argument("--api-key", help="openai api key")
         parser.add_argument("--model", default=DEFAULT_LLM_MODEL, help="llm model name")
 
-    if group in ["all", "cast"]:
-        parser.add_argument(
-            "--min-appearances",
-            type=int,
-            default=0,
-            help="minimum appearances for dedicated voice (others use generic Extra voices)",
-        )
-
     if group in ["all", "logging"]:
         parser.add_argument(
             "-v", "--verbose", action="store_true", help="enable verbose logging"
+        )
+        parser.add_argument(
+            "-f",
+            "--force",
+            action="store_true",
+            help="ignore resume state and force processing",
         )
 
 
@@ -88,6 +99,7 @@ def iter_pending_chapters(
     source_ext: str = TXT_EXT,
     target_ext: str = WAV_EXT,
     skip_message: str = "already exists",
+    force: bool = False,
 ) -> Iterator[tuple[Path, Path]]:
     """yield (source_path, target_path) for chapters that need processing."""
     source_files = sorted(workdir.glob(f"*{source_ext}"))
@@ -103,8 +115,38 @@ def iter_pending_chapters(
         if chapters and chapter_num not in chapters:
             continue
 
-        if target_path.exists():
+        if not force and target_path.exists():
+            # Special case: if we are in a mode that supports granular resume,
+            # we might still want to yield it. But for simple commands like 'synthesize',
+            # skipping is usually what's wanted.
+            # For now, let's keep it but callers can pass force=True.
             print(f"skipping {source_path.name} ({skip_message})")
             continue
 
         yield source_path, target_path
+
+
+def get_chapters(args) -> list[int] | None:
+    """extract chapter list from args."""
+    if args.chapters:
+        return parse_chapter_range(args.chapters)
+    return None
+
+
+def get_tts_config(args):
+    """extract tts config from args."""
+    from .tts import TTSConfig
+
+    config = TTSConfig(
+        batch_size=args.batch_size,
+        chunk_size=args.chunk_size,
+        compile_model=not args.no_compile,
+        warmup=not args.no_warmup,
+        do_sample=not args.greedy,
+        temperature=args.temperature,
+    )
+
+    if hasattr(args, "speaker"):
+        config.speaker = args.speaker
+
+    return config

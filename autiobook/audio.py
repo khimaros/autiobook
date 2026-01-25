@@ -1,8 +1,15 @@
 """audio processing utilities."""
 
-import numpy as np
+from pathlib import Path
 
-from .config import SAMPLE_RATE
+import numpy as np
+import soundfile as sf
+
+from .config import (
+    SAMPLE_RATE,
+    SEGMENTS_DIR,
+    WAV_EXT,
+)
 
 
 def concatenate_audio(
@@ -36,3 +43,36 @@ def normalize_audio(audio: np.ndarray) -> np.ndarray:
         audio = audio / max_val * 0.95
 
     return audio
+
+
+def get_segments_dir(workdir: Path) -> Path:
+    """get the central segments cache directory."""
+    return workdir / SEGMENTS_DIR
+
+
+def get_segment_path(segments_dir: Path, segment_hash: str) -> Path:
+    """get the path for a segment file."""
+    return segments_dir / f"{segment_hash}{WAV_EXT}"
+
+
+def check_segment_exists(segments_dir: Path, segment_hash: str) -> bool:
+    """check if a segment exists in the cache."""
+    return get_segment_path(segments_dir, segment_hash).exists()
+
+
+def save_segment(
+    segments_dir: Path, segment_hash: str, audio: np.ndarray, sample_rate: int
+) -> None:
+    """save a segment to the central cache."""
+    segments_dir.mkdir(parents=True, exist_ok=True)
+    path = get_segment_path(segments_dir, segment_hash)
+    sf.write(str(path), audio, sample_rate)
+
+
+def load_segment(segments_dir: Path, segment_hash: str) -> np.ndarray:
+    """load a segment from the central cache."""
+    path = get_segment_path(segments_dir, segment_hash)
+    if not path.exists():
+        raise FileNotFoundError(f"segment {segment_hash} not found in {segments_dir}")
+    audio, _ = sf.read(str(path))
+    return audio.astype(np.float32)

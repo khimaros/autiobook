@@ -1,5 +1,6 @@
 /.venv/
-/workdir_test/
+/testdata_workdir/
+/testdata_audiobooks/
 __pycache__/
 *.egg-info/
 /books/

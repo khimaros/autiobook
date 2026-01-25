@@ -48,7 +48,6 @@ class Character:
     description: str  # visual/vocal description for VoiceDesign
     audition_line: str  # short text to generate the reference voice
     aliases: list[str] | None = None  # alternate names for the same character
-    appearances: int = 0  # number of speaking appearances in scripts
 
 
 @dataclass
@@ -236,11 +235,13 @@ Example output (strictly valid JSON):
         data = _parse_json_response(content)
         segments = []
         for s in data.get("segments", []):
-            segments.append(ScriptSegment(
-                speaker=s["s"],
-                text=s["t"],
-                instruction=s["i"],
-            ))
+            segments.append(
+                ScriptSegment(
+                    speaker=s["s"],
+                    text=s["t"],
+                    instruction=s["i"],
+                )
+            )
         return segments
 
     return retry_with_backoff(_call_api)
@@ -318,11 +319,13 @@ CONTEXT AFTER:
         data = _parse_json_response(content)
         segments = []
         for s in data.get("segments", []):
-            segments.append(ScriptSegment(
-                speaker=s["s"],
-                text=s["t"],
-                instruction=s["i"],
-            ))
+            segments.append(
+                ScriptSegment(
+                    speaker=s["s"],
+                    text=s["t"],
+                    instruction=s["i"],
+                )
+            )
         return segments
 
     return retry_with_backoff(_call_api)

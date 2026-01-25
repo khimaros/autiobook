@@ -3,6 +3,9 @@
 ```
 [@] bash end-to-end test script
 
+[x] global content addressable store for audio clips to avoid re-generating identical phrases
+[x] DRY tts code between audition, perform, and synthesize
+[x] hash all voice descriptions and performance segments and use that for save/resume
 [x] add "fix" phase to dramatize flow to remove hallucinations and fix missing
 [x] add "validate" phase to dramatize flow to verify scripts match source text
 [x] dramatize command: pass through TTS flags (--pooled, --batch-size, etc.) and resume
@@ -23,4 +26,5 @@
 [x] make script command idempotent with incremental JSON saves
 [x] add LLM retry logic for API errors and invalid JSON
 [x] DRY common LLM flags (api-base, api-key, model) into utils.py
+[x] DRY command line flag parsing and chapter selection logic
 ```
