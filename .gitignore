@@ -3,5 +3,6 @@ __pycache__/
 *.egg-info/
 /.mypy_cache/
 /.ruff_cache/
+.pytest_cache/
 /testdata_workdir/
 /books/

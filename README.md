@@ -97,7 +97,7 @@ autiobook extract book.epub -o workdir/
 # 2. generate cast list (using llm)
 autiobook cast workdir/ --api-key sk-...
 
-# 3. generate voice auditions (review/edit cast.json first if needed)
+# 3. generate voice auditions (review/edit characters.json first if needed)
 autiobook audition workdir/
 
 # 4. create dramatized script (using llm)
@@ -191,7 +191,7 @@ workdir/
 │   ├── NN_Title.txt
 │   └── state.json
 ├── cast/                  # character list and analysis state
-│   ├── cast.json
+│   ├── characters.json
 │   └── state.json
 ├── audition/              # character voice samples
 │   ├── Character.wav

@@ -9,7 +9,7 @@ epub file → extract → txt files → synthesize → wav files → export → 
 
 Dramatization Workflow:
 ```
-txt files → cast gen → cast.json → audition → voice samples
+txt files → cast gen → characters.json → audition → voice samples
      ↓
 script gen (llm) → json scripts → validate → fix → perform (cloning) → wav files
 ```
@@ -51,16 +51,31 @@ creates:
 - `workdir/synthesize/NN_Title.wav` - audio files
 - `workdir/synthesize/state.json` - resumability state
 
-### dramatize / cast / audition / script / validate / fix / perform
+### dramatize / cast / audition / showcase / script / validate / fix / perform
 
 advanced workflow for multi-speaker dramatization.
 
-- `cast`: generates `cast.json` from text sample using LLM.
-- `audition`: generates `voices/Character.wav` using `Qwen3-TTS-VoiceDesign`.
+- `cast`: generates `characters.json` from text sample using LLM.
+- `audition`: generates `audition/Character.wav` using `Qwen3-TTS-VoiceDesign`.
+- `showcase`: generates `showcase/Character/*.wav` emotion samples using voice cloning.
 - `script`: rewrites text into `NN_Title.json` script with speaker attribution using LLM.
 - `validate`: verifies scripts match source text, reports missing and hallucinated segments.
 - `fix`: fills missing segments using LLM with context, removes hallucinated segments.
 - `perform`: synthesizes audio using `Qwen3-TTS-Base` voice cloning from scripts + voice samples.
+
+### showcase
+
+generates emotion samples for each character voice to help vet actor voices in different situations.
+
+```
+autiobook showcase workdir/
+```
+
+creates:
+- `workdir/showcase/CharacterName/emotion.wav` - samples for each emotion
+- `workdir/showcase/state.json` - resumability state
+
+emotions generated: neutral, happy, sad, angry, fearful, surprised, whispering, shouting, sarcastic, excited, contemplative.
 
 ### validate
 
@@ -190,10 +205,18 @@ workdir/
 │   ├── NN_Title.txt
 │   └── state.json
 ├── cast/                  # character list and analysis state
-│   ├── cast.json
+│   ├── characters.json
 │   └── state.json
 ├── audition/              # character voice samples
 │   ├── Character.wav
+│   └── state.json
+├── showcase/              # emotion samples for character voices
+│   ├── Character/
+│   │   ├── neutral.wav
+│   │   ├── happy.wav
+│   │   ├── ...
+│   │   └── contemplative.wav
+│   ├── segments/          # segment cache
 │   └── state.json
 ├── script/                # dramatized scripts (speaker segments)
 │   ├── NN_Title.json

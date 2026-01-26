@@ -1,5 +1,6 @@
 """epub parsing and chapter extraction."""
 
+import hashlib
 import json
 import warnings
 from dataclasses import dataclass
@@ -104,71 +105,77 @@ def extract_title_from_html(html_content: bytes) -> str | None:
 
 def extract_cover(book: epub.EpubBook) -> bytes | None:
     """extract cover image from epub, returns image bytes or None."""
-    # try common cover item ids
-    for cover_id in ["cover", "cover-image", "coverimage"]:
-        item = book.get_item_with_id(cover_id)
-        if item and item.get_content():
+    # 1. try common IDs
+    for cid in ["cover", "cover-image", "coverimage"]:
+        if item := book.get_item_with_id(cid):
             return cast(bytes, item.get_content())
 
-    # try cover metadata reference
-    cover_meta = book.get_metadata("OPF", "cover")
-    if cover_meta:
-        cover_id_val = cover_meta[0][0] if cover_meta[0] else None
-        if cover_id_val:
-            item = book.get_item_with_id(str(cover_id_val))
-            if item and item.get_content():
-                return cast(bytes, item.get_content())
+    # 2. try OPF cover metadata
+    if cover_meta := book.get_metadata("OPF", "cover"):
+        if item := book.get_item_with_id(str(cover_meta[0][0])):
+            return cast(bytes, item.get_content())
 
-    # fallback: find first image item with 'cover' in name
-    for item in book.get_items_of_type(ebooklib.ITEM_IMAGE):
+    # 3. search images
+    images = list(book.get_items_of_type(ebooklib.ITEM_IMAGE))
+    for item in images:
         if "cover" in item.get_name().lower():
             return cast(bytes, item.get_content())
 
-    # last resort: first image
-    for item in book.get_items_of_type(ebooklib.ITEM_IMAGE):
-        return cast(bytes, item.get_content())
-
-    return None
+    return cast(bytes, images[0].get_content()) if images else None
 
 
 def parse_epub(path: Path) -> tuple[Book, bytes | None]:
     """parse an epub file and extract all chapters with metadata and cover."""
-    book = epub.read_epub(str(path), options={"ignore_ncx": True})
-    cover_data = extract_cover(book)
+    eb = epub.read_epub(str(path), options={"ignore_ncx": True})
 
-    # extract metadata
-    title_meta = book.get_metadata("DC", "title")
-    title = str(title_meta[0][0]) if title_meta and title_meta[0] else path.stem
+    def get_meta(key, default=""):
+        m = eb.get_metadata("DC", key)
+        return str(m[0][0]) if m and m[0] else default
 
-    author_meta = book.get_metadata("DC", "creator")
-    author = str(author_meta[0][0]) if author_meta and author_meta[0] else "Unknown"
+    book = Book(
+        title=get_meta("title", path.stem),
+        author=get_meta("creator", "Unknown"),
+        language=get_meta("language", "en"),
+        chapters=[],
+    )
 
-    language_meta = book.get_metadata("DC", "language")
-    language = str(language_meta[0][0]) if language_meta and language_meta[0] else "en"
-
-    # extract chapters from spine order
-    chapters = []
-    index = 1
-
-    for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
+    for item in eb.get_items_of_type(ebooklib.ITEM_DOCUMENT):
         content = cast(bytes, item.get_content())
         text = extract_text_from_html(content)
-
-        # skip short/empty chapters
         if len(text.split()) < MIN_CHAPTER_WORDS:
             continue
 
-        chapter_title = extract_title_from_html(content)
-        if not chapter_title:
-            chapter_title = f"Chapter {index}"
+        idx = len(book.chapters) + 1
+        title = extract_title_from_html(content) or f"Chapter {idx}"
+        book.chapters.append(Chapter(index=idx, title=title, text=text))
 
-        chapters.append(Chapter(index=index, title=chapter_title, text=text))
-        index += 1
+    return book, extract_cover(eb)
 
-    return (
-        Book(title=title, author=author, language=language, chapters=chapters),
-        cover_data,
-    )
+
+def ensure_extracted(epub_path: Path, workdir: Path, force: bool = False) -> None:
+    """ensure epub is extracted to workdir, skipping if already fresh."""
+    from .resume import get_command_dir
+
+    extract_dir = get_command_dir(workdir, "extract")
+    state_path = extract_dir / "state.json"
+
+    with open(epub_path, "rb") as f:
+        epub_hash = hashlib.sha256(f.read()).hexdigest()
+
+    if not force and state_path.exists():
+        try:
+            with open(state_path) as f:
+                if json.load(f).get("epub_hash") == epub_hash:
+                    if any(extract_dir.glob(f"*{TXT_EXT}")):
+                        return
+        except Exception:
+            pass
+
+    book, cover_data = parse_epub(epub_path)
+    save_extracted(book, workdir, cover_data)
+
+    with open(state_path, "w") as f:
+        json.dump({"epub_hash": epub_hash}, f, indent=2)
 
 
 def save_extracted(book: Book, workdir: Path, cover_data: bytes | None = None) -> None:

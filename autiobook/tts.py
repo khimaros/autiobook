@@ -14,10 +14,8 @@ import transformers  # type: ignore
 from tqdm import tqdm  # type: ignore
 
 from .audio import (
-    check_segment_exists,
     concatenate_audio,
     get_segments_dir,
-    load_segment,
 )
 from .config import (
     DEFAULT_MODEL,
@@ -26,9 +24,10 @@ from .config import (
     PARAGRAPH_PAUSE_MS,
     SAMPLE_RATE,
     TXT_EXT,
+    WAV_EXT,
 )
 from .epub import load_metadata
-from .pooling import AudioTask, process_pooled_tasks
+from .pooling import AudioTask, process_audio_pipeline
 from .resume import ResumeManager, compute_hash, get_command_dir, list_chapters
 
 transformers.logging.set_verbosity_error()
@@ -71,17 +70,15 @@ def setup_rocm_env():
     """set environment variables for optimal rocm performance."""
     if not is_rocm():
         return
-    # enable experimental aotriton kernels
-    os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
-    # enable flash attention on amd
-    os.environ.setdefault("FLASH_ATTENTION_TRITON_AMD_ENABLE", "TRUE")
-    # pre-allocate MIOpen workspace to avoid fallback to slower kernels
-    # 256MB should cover most GEMM operations
-    os.environ.setdefault("MIOPEN_WORKSPACE_MAX", "256000000")
-    # use immediate mode for faster kernel selection
-    os.environ.setdefault("MIOPEN_FIND_MODE", "FAST")
-    # cache compiled kernels to speed up subsequent runs
-    os.environ.setdefault("MIOPEN_USER_DB_PATH", os.path.expanduser("~/.cache/miopen"))
+    env = {
+        "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+        "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE",
+        "MIOPEN_WORKSPACE_MAX": "256000000",
+        "MIOPEN_FIND_MODE": "FAST",
+        "MIOPEN_USER_DB_PATH": os.path.expanduser("~/.cache/miopen"),
+    }
+    for k, v in env.items():
+        os.environ.setdefault(k, v)
 
 
 @dataclass
@@ -92,14 +89,13 @@ class TTSConfig:
     speaker: str = DEFAULT_SPEAKER
     language: str = "English"
     device: str = field(default_factory=get_default_device)
-    batch_size: int = 64  # batch 64 shows 7x throughput vs batch 1
-    chunk_size: int = MAX_CHUNK_SIZE  # 500 chars balances coherence and speed
-    compile_model: bool = True  # use torch.compile for faster inference
-    warmup: bool = True  # warmup model on first load
-    # generation parameters - can tune for speed vs quality
-    do_sample: bool = True  # False = greedy (faster), True = sampling (better quality)
-    temperature: float = 0.9  # lower = faster/more deterministic
-    max_new_tokens: int = 2048  # limit output length per chunk
+    batch_size: int = 64
+    chunk_size: int = MAX_CHUNK_SIZE
+    compile_model: bool = False
+    warmup: bool = True
+    do_sample: bool = True
+    temperature: float = 0.9
+    max_new_tokens: int = 2048
 
 
 class TTSEngine:
@@ -109,42 +105,28 @@ class TTSEngine:
         setup_rocm_env()
         self.config = config or TTSConfig()
         self._model = None
-        self._loaded_model_name = None  # track loaded model name
+        self._loaded_model_name = None
         self._compiled = False
-        self._sdpa_backends = None  # store backends, create context each time
 
     def _load_model(self):
         """lazy load and optimize the tts model."""
-        if (
-            self._model is not None
-            and self._loaded_model_name == self.config.model_name
-        ):
+        if self._model and self._loaded_model_name == self.config.model_name:
             return
 
-        # unload existing model if different
-        if self._model is not None:
+        if self._model:
             print(f"unloading model {self._loaded_model_name}...")
             del self._model
             torch.cuda.empty_cache()
-            self._model = None
-            self._loaded_model_name = None
 
-        from qwen_tts import Qwen3TTSModel  # type: ignore[import-untyped]
+        from qwen_tts import Qwen3TTSModel  # type: ignore
 
         # determine dtype and attention implementation
-        if "cuda" in self.config.device:
-            dtype = torch.bfloat16
-            attn_impl = "sdpa" if is_rocm() else "flash_attention_2"
-        elif "mps" in self.config.device:
-            dtype = torch.float32
-            attn_impl = "sdpa"
-        else:
-            dtype = torch.float32
-            attn_impl = "sdpa"
+        is_cuda = "cuda" in self.config.device
+        dtype = torch.bfloat16 if is_cuda else torch.float32
+        attn_impl = "sdpa" if is_rocm() or not is_cuda else "flash_attention_2"
 
         print(
-            f"loading model {self.config.model_name} on {self.config.device} "
-            f"with {dtype} and {attn_impl}..."
+            f"loading {self.config.model_name} on {self.config.device} ({dtype}, {attn_impl})..."
         )
         self._model = Qwen3TTSModel.from_pretrained(
             self.config.model_name,
@@ -154,55 +136,23 @@ class TTSEngine:
         )
         self._loaded_model_name = self.config.model_name
 
-        # setup attention backends for rocm (context created fresh each call)
-        if "cuda" in self.config.device and is_rocm():
-            try:
-                from torch.nn.attention import SDPBackend
-
-                self._sdpa_backends = [
-                    SDPBackend.FLASH_ATTENTION,
-                    SDPBackend.EFFICIENT_ATTENTION,
-                ]
-            except ImportError:
-                self._sdpa_backends = None
-        else:
-            self._sdpa_backends = None
-
-        # apply torch.compile for faster inference
-        if self.config.compile_model and "cuda" in self.config.device:
+        if self.config.compile_model and is_cuda:
             self._compile_model()
-
-        # warmup the model
         if self.config.warmup:
             self._warmup()
 
-    def _get_attn_ctx(self):
-        """create fresh attention context for each use."""
-        if self._sdpa_backends is not None:
-            from torch.nn.attention import sdpa_kernel
-
-            return sdpa_kernel(self._sdpa_backends)
-        return nullcontext()
-
     def _compile_model(self):
         """apply torch.compile to model components."""
-        if self._compiled or self._model is None:
+        if self._compiled or not self._model:
             return
-
-        print("compiling model for faster inference...")
+        print("compiling model...")
         try:
-            # compile the main talker model with reduce-overhead mode
-            # this optimizes for inference with minimal CPU overhead
-            self._model.model.talker = torch.compile(
-                self._model.model.talker,
-                mode="reduce-overhead",
-                fullgraph=False,  # allow graph breaks for compatibility
+            self._model.model.talker = torch.compile(  # type: ignore
+                self._model.model.talker, mode="reduce-overhead", fullgraph=False
             )
             self._compiled = True
-            print("model compilation complete")
         except Exception as e:
-            print(f"warning: torch.compile failed ({e}), using eager mode")
-            self._compiled = False
+            print(f"warning: torch.compile failed ({e})")
 
     def _warmup(self):
         """warmup model with a short synthesis to trigger compilation."""
@@ -210,40 +160,51 @@ class TTSEngine:
         try:
             if "VoiceDesign" in self.config.model_name:
                 self.design_voice(WARMUP_TEXT, "neutral voice")
-            elif "Base" in self.config.model_name:
-                pass
-            else:
+            elif "Base" not in self.config.model_name:
                 self.synthesize(WARMUP_TEXT)
-            print("warmup complete")
         except Exception as e:
             print(f"warning: warmup failed ({e})")
 
     def _run_inference(self, func_name: str, **kwargs) -> tuple[Any, int]:
         """helper to run inference with correct context and params."""
         self._load_model()
-        if self._model is None:
-            raise RuntimeError("failed to load model")
         func = getattr(self._model, func_name)
+        kwargs.update(
+            {
+                "language": self.config.language,
+                "non_streaming_mode": True,
+                "do_sample": self.config.do_sample,
+                "temperature": self.config.temperature,
+            }
+        )
 
-        # common args
-        kwargs.setdefault("language", self.config.language)
-        kwargs.setdefault("non_streaming_mode", True)
-        kwargs.setdefault("do_sample", self.config.do_sample)
-        kwargs.setdefault("temperature", self.config.temperature)
+        ctx: Any = nullcontext()
+        if "cuda" in self.config.device and is_rocm():
+            try:
+                from torch.nn.attention import SDPBackend, sdpa_kernel
 
-        with self._get_attn_ctx():
-            with torch.inference_mode():
-                res = func(**kwargs)
-                return cast(tuple[Any, int], res)
+                # include MATH backend as fallback for mismatched head counts
+                ctx = sdpa_kernel(
+                    [
+                        SDPBackend.FLASH_ATTENTION,
+                        SDPBackend.EFFICIENT_ATTENTION,
+                        SDPBackend.MATH,
+                    ]
+                )
+            except ImportError:
+                pass
+
+        with ctx, torch.inference_mode():
+            return cast(tuple[Any, int], func(**kwargs))
 
     def synthesize(
-        self, text: str | list[str], instruct: str = ""
+        self, text: str | list[str], instruct: str = "", speaker: str | None = None
     ) -> tuple[np.ndarray | list[np.ndarray], int]:
         """synthesize speech from text using current model."""
         wavs, sr = self._run_inference(
             "generate_custom_voice",
             text=text,
-            speaker=self.config.speaker,
+            speaker=speaker or self.config.speaker,
             instruct=instruct,
             max_new_tokens=self.config.max_new_tokens,
         )
@@ -343,7 +304,7 @@ class TTSEngine:
 
 
 def chunk_text(text: str, max_size: int = MAX_CHUNK_SIZE) -> list[str]:
-    """split text into chunks at sentence boundaries."""
+    """split text into chunks at sentence boundaries, force-splitting if needed."""
     sentences = SENTENCE_ENDINGS.split(text)
 
     chunks = []
@@ -357,10 +318,36 @@ def chunk_text(text: str, max_size: int = MAX_CHUNK_SIZE) -> list[str]:
 
         sentence_len = len(sentence)
 
+        # if current chunk + new sentence is too big, finish current chunk
         if current_length + sentence_len > max_size and current_chunk:
             chunks.append(" ".join(current_chunk))
             current_chunk = []
             current_length = 0
+
+        # if single sentence is still too big, force split it
+        if sentence_len > max_size:
+            # recursively chunk the long sentence by words or chars
+            # simple approach: split by commas or spaces
+            # for now, let's just hard split by space
+            words = sentence.split(" ")
+            current_word_chunk: List[str] = []
+            current_word_len = 0
+
+            for word in words:
+                word_len = len(word)
+                if current_word_len + word_len + 1 > max_size:
+                    chunks.append(" ".join(current_word_chunk))
+                    current_word_chunk = []
+                    current_word_len = 0
+                current_word_chunk.append(word)
+                current_word_len += word_len + 1
+
+            if current_word_chunk:
+                # add remainder to current_chunk flow
+                remainder = " ".join(current_word_chunk)
+                current_chunk.append(remainder)
+                current_length += len(remainder) + 1
+            continue
 
         current_chunk.append(sentence)
         current_length += sentence_len + 1
@@ -416,9 +403,27 @@ def _perform_synthesis(
     force: bool = False,
 ) -> None:
     """synthesize multiple chapters with pooled batching and segment caching."""
-    tasks = []
-    chapter_sequences = []
-    needs_assembly = {}  # wav_path -> manifest_hash
+    chapter_data = []
+
+    # resolve voice reference if provided (for whole book cloning)
+    voice_path: Path | None = None
+    voice_text: str | None = None
+
+    # check if we should look for a voice
+    voice_name = getattr(engine.config, "voice", None)
+    if voice_name:
+        # check audition dir
+        audition_dir = get_command_dir(pending[0][0].parent.parent, "audition")
+        p = audition_dir / f"{voice_name}{WAV_EXT}"
+        if p.exists():
+            voice_path = p
+            # try to load cast to get text
+            from .dramatize import load_cast
+
+            cast = load_cast(p.parent.parent)
+            char = next((c for c in cast if c.name == voice_name), None)
+            if char:
+                voice_text = char.audition_line
 
     for txt_path, wav_path in pending:
         text = txt_path.read_text(encoding="utf-8")
@@ -426,54 +431,26 @@ def _perform_synthesis(
         chunks = [c for c in chunks if c.strip()]
 
         segments_dir = get_segments_dir(wav_path.parent)
-
-        chapter_hashes = []
+        tasks = []
         for chunk in chunks:
-            chunk_hash = compute_hash({"text": chunk, "instruct": instruct})
-            chapter_hashes.append(chunk_hash)
+            # include voice in hash if present
+            hash_data = {"text": chunk, "instruct": instruct}
+            if voice_path:
+                hash_data["voice_path"] = str(voice_path)
 
-            if force or not check_segment_exists(segments_dir, chunk_hash):
-                tasks.append(
-                    AudioTask(
-                        text=chunk,
-                        segment_hash=chunk_hash,
-                        segments_dir=segments_dir,
-                        instruct=instruct,
-                    )
+            chunk_hash = compute_hash(hash_data)
+            tasks.append(
+                AudioTask(
+                    text=chunk,
+                    segment_hash=chunk_hash,
+                    segments_dir=segments_dir,
+                    instruct=instruct,
+                    voice_ref_audio=voice_path,
+                    voice_ref_text=voice_text,
                 )
-
-        manifest_hash = compute_hash(chapter_hashes)
-        chapter_sequences.append(
-            (wav_path, chapter_hashes, segments_dir, manifest_hash)
-        )
-
-        if force or not wav_path.exists():
-            needs_assembly[wav_path] = manifest_hash
-        elif resume and not resume.is_fresh(str(wav_path), manifest_hash):
-            needs_assembly[wav_path] = manifest_hash
-
-    if tasks:
-        process_pooled_tasks(engine, tasks, desc="synthesizing chapters", force=force)
-        # Any chapter whose segments were regenerated must be re-assembled
-        for task in tasks:
-            for wav_path, hashes, seg_dir, manifest_hash in chapter_sequences:
-                if task.segment_hash in hashes:
-                    needs_assembly[wav_path] = manifest_hash
-
-    # Assemble all chapters
-    for wav_path, hashes, seg_dir, manifest_hash in chapter_sequences:
-        if wav_path not in needs_assembly:
-            continue
-
-        try:
-            audio_segments = [load_segment(seg_dir, h) for h in hashes]
-            combined = concatenate_audio(
-                audio_segments, SAMPLE_RATE, PARAGRAPH_PAUSE_MS
             )
-            sf.write(str(wav_path), combined, SAMPLE_RATE)
-            if resume:
-                resume.update(str(wav_path), manifest_hash)
-                resume.save()
-            print(f"  -> {wav_path.name}")
-        except Exception as e:
-            print(f"failed to assemble {wav_path.name}: {e}")
+        chapter_data.append((wav_path, tasks))
+
+    process_audio_pipeline(
+        engine, chapter_data, resume=resume, desc="synthesizing chapters", force=force
+    )

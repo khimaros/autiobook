@@ -5,25 +5,21 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, cast
+from typing import List, Optional, cast
 
 import soundfile as sf  # type: ignore
 from tqdm import tqdm  # type: ignore
 
 from .audio import (
-    check_segment_exists,
-    concatenate_audio,
     get_segments_dir,
-    load_segment,
 )
 from .config import (
     BASE_MODEL,
     CAST_FILE,
     DEFAULT_CAST,
-    PARAGRAPH_PAUSE_MS,
-    SAMPLE_RATE,
     SCRIPT_EXT,
     TXT_EXT,
+    SAMPLE_RATE,
     VOICE_DESIGN_MODEL,
     WAV_EXT,
 )
@@ -36,7 +32,7 @@ from .llm import (
     process_script_chunk,
     split_text_smart,
 )
-from .pooling import AudioTask, process_pooled_tasks
+from .pooling import AudioTask, process_audio_pipeline
 from .resume import ResumeManager, compute_hash, get_command_dir, list_chapters
 from .tts import (
     TTSConfig,
@@ -146,6 +142,29 @@ def load_script(script_path: Path) -> List[ScriptSegment]:
     return [ScriptSegment(**s) for s in cast(dict, data).get("segments", [])]
 
 
+def _find_existing_character(
+    c: Character, cast_map: dict[str, Character], alias_map: dict[str, str]
+) -> tuple[Optional[Character], Optional[str]]:
+    """find an existing character that matches the given one."""
+    key = c.name.lower()
+
+    # 1. name is an alias
+    if key in alias_map:
+        return cast_map[alias_map[key]], c.name
+
+    # 2. any of character's aliases match existing
+    if c.aliases:
+        for alias in c.aliases:
+            a_low = alias.lower()
+            if a_low in cast_map:
+                return cast_map[a_low], c.name
+            if a_low in alias_map:
+                return cast_map[alias_map[a_low]], c.name
+
+    # 3. exact match
+    return cast_map.get(key), None
+
+
 def _merge_character_into_cast(
     c: Character,
     cast_map: dict[str, Character],
@@ -153,102 +172,106 @@ def _merge_character_into_cast(
     verbose: bool = False,
 ) -> str:
     """merge a character into the cast, returns 'added', 'updated', or 'merged'."""
-    key = c.name.lower()
-    existing = None
-    merge_source = (
-        None  # name of the character being merged into existing (if different)
-    )
-
-    # 1. Check if this name is an alias of an existing character
-    if key in alias_map:
-        canonical_key = alias_map[key]
-        existing = cast_map[canonical_key]
-        merge_source = c.name
-
-    # 2. Check if any of this character's aliases match an existing character
-    elif c.aliases:
-        for alias in c.aliases:
-            alias_lower = alias.lower()
-            if alias_lower in cast_map:
-                existing = cast_map[alias_lower]
-                merge_source = c.name
-                break
-            if alias_lower in alias_map:
-                existing = cast_map[alias_map[alias_lower]]
-                merge_source = c.name
-                break
-
-    # 3. Check exact match
-    if not existing and key in cast_map:
-        existing = cast_map[key]
+    existing, merge_source = _find_existing_character(c, cast_map, alias_map)
 
     if existing:
         updates = []
-        changed = False
-
-        # Calculate new aliases
         new_aliases = set(existing.aliases or [])
         if c.aliases:
             new_aliases.update(c.aliases)
-
         if merge_source:
             new_aliases.add(merge_source)
             new_aliases.discard(existing.name)
 
         sorted_aliases = sorted(new_aliases) if new_aliases else None
-
-        # Check for alias changes
         if sorted_aliases != existing.aliases:
-            if verbose:
-                old_aliases = set(existing.aliases or [])
-                added = set(sorted_aliases or []) - old_aliases
-                if added:
-                    updates.append(f"aliases (+{', '.join(added)})")
-                else:
-                    updates.append("aliases")
-            else:
-                updates.append("aliases")
-
             existing.aliases = sorted_aliases
-            changed = True
+            updates.append("aliases")
 
-        # Check for description changes (always update if different)
-        old_desc = existing.description
-        if c.description and c.description != old_desc:
+        if c.description and c.description != existing.description:
             existing.description = c.description
-            changed = True
             updates.append("description")
 
-        # Logging
-        if verbose:
-            if merge_source:
-                # Merge message
-                msg = f"  merged '{c.name}' into '{existing.name}'"
-                if updates:
-                    msg += f" ({', '.join(updates)})"
-                print(msg)
-            elif changed:
-                # Update message
-                print(f"  updated '{existing.name}': {', '.join(updates)}")
+        if verbose and updates:
+            msg = f"  {'merged' if merge_source else 'updated'} '{existing.name}'"
+            print(f"{msg} ({', '.join(updates)})")
 
-            # Show description diff if it changed
-            if "description" in updates:
-                if old_desc:
-                    print(f"    old description: {old_desc}")
-                print(f"    new description: {existing.description}")
-
-        return "merged" if merge_source else ("updated" if changed else "unchanged")
+        return "merged" if merge_source else ("updated" if updates else "unchanged")
 
     # new character
     if verbose:
         print(f"  added new character: '{c.name}'")
-        if c.description:
-            print(f"    description: {c.description}")
-    cast_map[key] = c
+    cast_map[c.name.lower()] = c
     if c.aliases:
         for alias in c.aliases:
-            alias_map[alias.lower()] = key
+            alias_map[alias.lower()] = c.name.lower()
     return "added"
+
+
+def _get_chapters_to_analyze(
+    chapter_map: dict[int, Path],
+    chapters: list[int] | None,
+    resume: ResumeManager,
+    force: bool,
+) -> tuple[list[int], dict[int, str]]:
+    """identify which chapters need analysis and compute their hashes."""
+    chapters_to_process = []
+    chapter_hashes = {}
+    candidate_chapters = chapters if chapters else sorted(chapter_map.keys())
+
+    for num in candidate_chapters:
+        if num not in chapter_map:
+            continue
+        txt_path = chapter_map[num]
+        text = txt_path.read_text(encoding="utf-8")
+        text_hash = compute_hash(text)
+        chapter_hashes[num] = text_hash
+        if force or not resume.is_fresh(str(num), text_hash):
+            chapters_to_process.append(num)
+
+    return chapters_to_process, chapter_hashes
+
+
+def _process_cast_batch(
+    batch_chapters: list[int],
+    chapter_map: dict[int, Path],
+    cast_map: dict[str, Character],
+    alias_map: dict[str, str],
+    api_base: str | None,
+    api_key: str | None,
+    model: str | None,
+    verbose: bool,
+) -> int:
+    """process a single batch of chapters for cast generation."""
+    full_sample = ""
+    for num in batch_chapters:
+        txt_path = chapter_map[num]
+        full_sample += f"\n--- Chapter {txt_path.stem} ---\n"
+        full_sample += txt_path.read_text(encoding="utf-8")[:2000]
+
+    # format current cast for context
+    current_cast = list(cast_map.values())
+    summary = "\n".join(
+        f"- {c.name}: {c.description}"
+        + (f" (also known as: {', '.join(c.aliases)})" if c.aliases else "")
+        for c in current_cast
+    )
+
+    batch_cast = generate_cast(
+        full_sample, api_base, api_key, model or "gpt-4o", existing_cast_summary=summary
+    )
+
+    added, updated, merged = 0, 0, 0
+    for c in batch_cast:
+        result = _merge_character_into_cast(c, cast_map, alias_map, verbose=verbose)
+        if result == "added":
+            added += 1
+        elif result == "updated":
+            updated += 1
+        elif result == "merged":
+            merged += 1
+
+    return len(batch_cast)
 
 
 def run_cast_generation(
@@ -261,7 +284,6 @@ def run_cast_generation(
     force: bool = False,
 ) -> List[Character]:
     """analyze book and generate cast list."""
-
     existing_cast = load_cast(workdir)
     resume = ResumeManager.for_command(workdir, "cast", force=force)
 
@@ -271,7 +293,6 @@ def run_cast_generation(
         print("no extracted text files found!")
         return existing_cast
 
-    # map chapter numbers to files
     chapter_map = {}
     for txt_path in txt_files:
         try:
@@ -280,125 +301,51 @@ def run_cast_generation(
         except ValueError:
             continue
 
-    all_chapter_nums = sorted(chapter_map.keys())
-
-    # Identify which chapters need processing
-    chapters_to_process = []
-    chapter_hashes = {}  # Store hashes for later update
-
-    candidate_chapters = chapters if chapters else all_chapter_nums
-
-    for num in candidate_chapters:
-        if num not in chapter_map:
-            continue
-
-        txt_path = chapter_map[num]
-        text = txt_path.read_text(encoding="utf-8")
-        # Hash the input text to ensure we re-analyze if text changes
-        text_hash = compute_hash(text)
-        chapter_hashes[num] = text_hash
-
-        if force or not resume.is_fresh(str(num), text_hash):
-            chapters_to_process.append(num)
-
+    chapters_to_process, chapter_hashes = _get_chapters_to_analyze(
+        chapter_map, chapters, resume, force
+    )
     if not chapters_to_process:
-        print(f"cast: all {len(candidate_chapters)} chapters up to date.")
+        print(f"cast: all {len(chapters or chapter_map)} chapters up to date.")
         return existing_cast
 
     print(f"cast: analyzing {len(chapters_to_process)} chapters...")
 
-    # build lookup maps from existing cast
     cast_map = {c.name.lower(): c for c in existing_cast}
-    alias_map = {}
-    for c in existing_cast:
-        if c.aliases:
-            for alias in c.aliases:
-                alias_map[alias.lower()] = c.name.lower()
+    alias_map = {
+        a.lower(): c.name.lower() for c in existing_cast if c.aliases for a in c.aliases
+    }
 
-    # track stats across all batches
-    added_count = 0
-    updated_count = 0
-    merged_count = 0
-    total_processed = 0
-
-    final_cast = existing_cast
-
-    # process in batches to avoid overwhelming the LLM
     batch_size = 3
-    num_batches = (len(chapters_to_process) + batch_size - 1) // batch_size
-
     for batch_start in range(0, len(chapters_to_process), batch_size):
         batch_chapters = chapters_to_process[batch_start : batch_start + batch_size]
-        batch_num = batch_start // batch_size + 1
-
-        # collect samples for this batch
-        full_sample = ""
-        for num in batch_chapters:
-            txt_path = chapter_map[num]
-            text = txt_path.read_text(encoding="utf-8")
-            full_sample += f"\n--- Chapter {txt_path.stem} ---\n"
-            full_sample += text[:2000]
-
-        # format current cast for context (include aliases)
-        current_cast = list(cast_map.values())
-        summary = ""
-        if current_cast:
-            lines = []
-            for c in current_cast:
-                line = f"- {c.name}: {c.description}"
-                if c.aliases:
-                    line += f" (also known as: {', '.join(c.aliases)})"
-                lines.append(line)
-            summary = "\n".join(lines)
-
         print(
-            f"  batch {batch_num}/{num_batches}: chapters {batch_chapters} "
-            f"({len(current_cast)} characters known)..."
+            f"  batch {batch_start // batch_size + 1}: chapters {batch_chapters} "
+            f"({len(cast_map)} characters known)..."
         )
 
-        batch_cast = generate_cast(
-            full_sample,
+        _process_cast_batch(
+            batch_chapters,
+            chapter_map,
+            cast_map,
+            alias_map,
             api_base,
             api_key,
-            model or "gpt-4o",
-            existing_cast_summary=summary,
+            model,
+            verbose,
         )
-        total_processed += len(batch_cast)
 
-        # merge batch results into cast
-        for c in batch_cast:
-            result = _merge_character_into_cast(c, cast_map, alias_map, verbose=verbose)
-            if result == "added":
-                added_count += 1
-            elif result == "updated":
-                updated_count += 1
-            elif result == "merged":
-                merged_count += 1
-
-        # update analyzed chapters in resume manager
         for num in batch_chapters:
             resume.update(str(num), chapter_hashes[num])
         resume.save()
 
         final_cast = list(cast_map.values())
-
-        # ensure Narrator is at top if present
         narrator = next((c for c in final_cast if c.name.lower() == "narrator"), None)
         if narrator:
             final_cast.remove(narrator)
             final_cast.insert(0, narrator)
-
         save_cast(workdir, final_cast)
 
-    print(
-        f"processed {total_processed} character mentions from {len(chapters_to_process)} chapters."
-    )
-    print(
-        f"stats: {added_count} added, {updated_count} updated, {merged_count} merged (aliases)."
-    )
-    print(f"final cast: {len(final_cast)} characters.")
-
-    return final_cast
+    return list(cast_map.values())
 
 
 def run_auditions(
@@ -555,23 +502,18 @@ def run_script_generation(
         chunks = split_text_smart(text)
         total_chunks = len(chunks)
 
-        # Intermediate state file
-        chunks_file = script_path.with_suffix(".chunks.json")
-
-        existing_chunks = []
-        if not force and chunks_file.exists():
-            try:
-                with open(chunks_file, encoding="utf-8") as f:
-                    data = json.load(f)
-                    if data.get("input_hash") == input_hash:
-                        # Load partially completed chunks
-                        for chunk_data in data.get("chunks", []):
-                            chunk_segs = [ScriptSegment(**s) for s in chunk_data]
-                            existing_chunks.append(chunk_segs)
-            except Exception:
-                pass
-
-        completed_chunks = len(existing_chunks)
+        # Load partial progress from state
+        current_segments = []
+        completed_chunks = 0
+        partial = resume.get_partial(str(chapter_num))
+        if (
+            not force
+            and partial
+            and partial.get("hash") == input_hash
+            and script_path.exists()
+        ):
+            completed_chunks = partial.get("chunks_done", 0)
+            current_segments = load_script(script_path)
 
         if completed_chunks > 0:
             status = f"resuming at chunk {completed_chunks + 1}"
@@ -581,8 +523,6 @@ def run_script_generation(
         print(
             f"  [{i + 1}/{len(to_process)}] {txt_path.name}: {status} ({total_chunks} chunks)"
         )
-
-        current_chunks = list(existing_chunks)
 
         for j in tqdm(
             range(completed_chunks, total_chunks),
@@ -602,49 +542,30 @@ def run_script_generation(
                         f"      chunk {j + 1}: generated {len(chunk_segments)} segments. "
                         f"Speakers: {', '.join(sorted(speakers))}"
                     )
-                current_chunks.append(chunk_segments)
+                current_segments.extend(chunk_segments)
+                save_script(script_path, current_segments)
 
-                # Save intermediate progress
-                with open(chunks_file, "w", encoding="utf-8") as f:
-                    json.dump(
-                        {
-                            "input_hash": input_hash,
-                            "chunks": [
-                                [
-                                    {
-                                        "speaker": s.speaker,
-                                        "text": s.text,
-                                        "instruction": s.instruction,
-                                    }
-                                    for s in c
-                                ]
-                                for c in current_chunks
-                            ],
-                        },
-                        f,
-                        indent=2,
-                        ensure_ascii=False,
-                    )
+                # Save intermediate progress to state
+                resume.set_partial(
+                    str(chapter_num),
+                    {
+                        "hash": input_hash,
+                        "chunks_done": j + 1,
+                    },
+                )
+                resume.save()
 
             except Exception as e:
                 print(f"\n    chunk {j + 1} FAILED: {e}")
                 return False
 
-        # Flatten and save final script
-        all_segments = [s for chunk in current_chunks for s in chunk]
-        save_script(script_path, all_segments)
-
-        # Mark as done
+        # Mark as done (this also clears partial state)
         resume.update(str(chapter_num), input_hash)
         resume.save()
 
-        # Cleanup
-        if chunks_file.exists():
-            chunks_file.unlink()
-
-        total_segments += len(all_segments)
+        total_segments += len(current_segments)
         chapters_processed += 1
-        print(f"    -> {len(all_segments)} segments")
+        print(f"    -> {len(current_segments)} segments")
 
     print(f"done: {chapters_processed} chapters, {total_segments} total segments")
 
@@ -733,124 +654,77 @@ def _perform_pooled(
     force: bool = False,
 ) -> None:
     """synthesize chapters using unified pooled batching and segment caching."""
-    tasks = []
-    chapter_sequences = []  # (wav_path, list_of_segment_hashes)
-    needs_assembly = {}  # wav_path -> manifest_hash
-
     # Pre-calculate character hashes for stable identification
-    char_hashes = {}
-    for name, char in cast_map.items():
-        char_hashes[name] = compute_hash(
+    char_hashes = {
+        name: compute_hash(
             {
                 "name": char.name,
                 "description": char.description,
                 "audition_line": char.audition_line,
             }
         )
+        for name, char in cast_map.items()
+    }
 
-    # We need a segments dir. Assuming all pending chapters belong to the same project structure.
-    # We can derive it from the first chapter's path.
+    chapter_data = []
     segments_dir = get_segments_dir(pending[0][1].parent)
-
-    print(f"analyzing {len(pending)} chapters for pending segments...")
 
     for txt_path, wav_path in pending:
         segments = load_script(txt_path)
         if not segments:
             continue
 
-        chapter_hashes = []
-
+        chapter_tasks = []
         for segment in segments:
             char_opt = cast_map.get(segment.speaker) or cast_map.get("Narrator")
             char_name = char_opt.name if char_opt else ""
             char_hash = char_hashes.get(char_name, "")
 
-            # Identify the voice ref audio
-            ref_audio_path = None
-            ref_text = None
-            if char_opt:
-                ref_audio_path = voices_dir / f"{char_opt.name}{WAV_EXT}"
-                ref_text = char_opt.audition_line
+            ref_audio_path = (
+                voices_dir / f"{char_opt.name}{WAV_EXT}" if char_opt else None
+            )
+            ref_text = char_opt.audition_line if char_opt else None
 
-            # Segment hash input
             seg_data = {
                 "text": segment.text,
                 "speaker": segment.speaker,
                 "instruction": segment.instruction,
                 "char_hash": char_hash,
             }
-            seg_hash = compute_hash(seg_data)
 
-            # Check length and chunk if necessary
-            if len(segment.text) > engine.config.chunk_size:
-                text_chunks = [
+            text_chunks = (
+                [
                     c
                     for c in chunk_text(segment.text, engine.config.chunk_size)
                     if c.strip()
                 ]
-            else:
-                text_chunks = [segment.text]
+                if len(segment.text) > engine.config.chunk_size
+                else [segment.text]
+            )
 
             for i, chunk in enumerate(text_chunks):
-                # Unique hash for this chunk
-                if len(text_chunks) > 1:
-                    chunk_hash = compute_hash(
-                        {**seg_data, "chunk_idx": i, "chunk_text": chunk}
+                chunk_hash = (
+                    compute_hash({**seg_data, "chunk_idx": i, "chunk_text": chunk})
+                    if len(text_chunks) > 1
+                    else compute_hash(seg_data)
+                )
+
+                chapter_tasks.append(
+                    AudioTask(
+                        text=chunk,
+                        segment_hash=chunk_hash,
+                        segments_dir=segments_dir,
+                        voice_ref_audio=ref_audio_path,
+                        voice_ref_text=ref_text,
+                        instruct=segment.instruction
+                        or (char_opt.description if char_opt else ""),
                     )
-                else:
-                    chunk_hash = seg_hash
+                )
+        chapter_data.append((wav_path, chapter_tasks))
 
-                chapter_hashes.append(chunk_hash)
-
-                if force or not check_segment_exists(segments_dir, chunk_hash):
-                    tasks.append(
-                        AudioTask(
-                            text=chunk,
-                            segment_hash=chunk_hash,
-                            segments_dir=segments_dir,
-                            voice_ref_audio=ref_audio_path,
-                            voice_ref_text=ref_text,
-                            instruct=segment.instruction
-                            or (
-                                char_opt.description if char_opt else ""
-                            ),  # fallback instruct
-                        )
-                    )
-
-        manifest_hash = compute_hash(chapter_hashes)
-        chapter_sequences.append((wav_path, chapter_hashes, manifest_hash))
-
-        if force or not wav_path.exists():
-            needs_assembly[wav_path] = manifest_hash
-        elif resume and not resume.is_fresh(str(wav_path), manifest_hash):
-            needs_assembly[wav_path] = manifest_hash
-
-    if tasks:
-        process_pooled_tasks(engine, tasks, desc="performing segments", force=force)
-        # Any chapter whose segments were regenerated must be re-assembled
-        for task in tasks:
-            for wav_path, hashes, manifest_hash in chapter_sequences:
-                if task.segment_hash in hashes:
-                    needs_assembly[wav_path] = manifest_hash
-
-    # Assemble chapters
-    for wav_path, hashes, manifest_hash in chapter_sequences:
-        if wav_path not in needs_assembly:
-            continue
-
-        try:
-            audio_segments = [load_segment(segments_dir, h) for h in hashes]
-            combined = concatenate_audio(
-                audio_segments, SAMPLE_RATE, PARAGRAPH_PAUSE_MS
-            )
-            sf.write(str(wav_path), combined, SAMPLE_RATE)
-            if resume:
-                resume.update(str(wav_path), manifest_hash)
-                resume.save()
-            print(f"  -> {wav_path.name}")
-        except Exception as e:
-            print(f"failed to assemble {wav_path.name}: {e}")
+    process_audio_pipeline(
+        engine, chapter_data, resume=resume, desc="performing segments", force=force
+    )
 
 
 # CLI Command Wrappers
@@ -1284,6 +1158,84 @@ def _attempt_merge(segments: List[ScriptSegment], index: int) -> bool:
     return False
 
 
+def _remove_hallucinations(
+    segments: List[ScriptSegment], hallucinated_indices: List[int]
+) -> int:
+    """remove segments identified as hallucinations."""
+    removed = 0
+    for idx in sorted(hallucinated_indices, reverse=True):
+        seg = segments[idx]
+        print(f"  removing [{idx}] {seg.speaker}: {seg.text}")
+        del segments[idx]
+        removed += 1
+    return removed
+
+
+def _fill_missing_fragments(
+    segments: List[ScriptSegment],
+    missing: list[tuple[str, int, int]],
+    original_text: str,
+    cast: List[Character],
+    api_base: str | None,
+    api_key: str | None,
+    model: str | None,
+    context_chars: int | None,
+    context_paragraphs: int | None,
+    verbose: bool,
+) -> int:
+    """fill missing text fragments using LLM."""
+    added = 0
+    # Sort descending so insertions don't invalidate subsequent indices
+    for fragment, insertion_idx, split_offset in sorted(
+        missing, key=lambda x: (x[1], x[2]), reverse=True
+    ):
+        if verbose:
+            print(
+                f"\n    missing fragment (@ {insertion_idx}+{split_offset}): {fragment}"
+            )
+
+        target_idx = insertion_idx
+        if split_offset > 0 and insertion_idx < len(segments):
+            seg = segments[insertion_idx]
+            if split_offset < len(seg.text):
+                from copy import deepcopy
+
+                left_seg, right_seg = deepcopy(seg), deepcopy(seg)
+                left_seg.text = seg.text[:split_offset].rstrip()
+                right_seg.text = seg.text[split_offset:].lstrip()
+                segments[insertion_idx] = left_seg
+                segments.insert(insertion_idx + 1, right_seg)
+                target_idx = insertion_idx + 1
+
+        context_before, context_after = _extract_context(
+            original_text, fragment, context_chars, context_paragraphs
+        )
+
+        try:
+            new_segs = fix_missing_segment(
+                fragment,
+                context_before,
+                context_after,
+                cast,
+                api_base,
+                api_key,
+                model or "gpt-4o",
+            )
+            if new_segs:
+                for j, s in enumerate(new_segs):
+                    segments.insert(target_idx + j, s)
+                # merge neighbors
+                _attempt_merge(segments, target_idx + len(new_segs) - 1)
+                for j in range(len(new_segs) - 2, -1, -1):
+                    _attempt_merge(segments, target_idx + j)
+                if target_idx > 0:
+                    _attempt_merge(segments, target_idx - 1)
+                added += len(new_segs)
+        except Exception as e:
+            print(f"    failed: {e}")
+    return added
+
+
 def run_fix(
     workdir: Path,
     api_base: str | None = None,
@@ -1297,158 +1249,61 @@ def run_fix(
     verbose: bool = False,
 ) -> None:
     """fix script issues by filling missing segments and removing hallucinated ones."""
-
     cast = load_cast(workdir)
-    if not cast:
-        if (get_command_dir(workdir, "cast") / CAST_FILE).exists():
-            print("cast file found but contains no characters.")
-        else:
-            print("no cast found. run 'cast' command first.")
-        return
-
-    extract_dir = get_command_dir(workdir, "extract")
-    script_dir = get_command_dir(workdir, "script")
-
+    extract_dir, script_dir = (
+        get_command_dir(workdir, "extract"),
+        get_command_dir(workdir, "script"),
+    )
     txt_files = sorted(extract_dir.glob(f"*{TXT_EXT}"))
-    if not txt_files:
-        print("no text files found in extract/!")
-        return
 
-    # filter to relevant chapters
-    chapters_to_fix = []
+    total_added, total_removed = 0, 0
     for txt_path in txt_files:
         try:
-            chapter_num = int(txt_path.stem.split("_")[0])
+            num = int(txt_path.stem.split("_")[0])
         except ValueError:
             continue
-        if chapters and chapter_num not in chapters:
+        if chapters and num not in chapters:
             continue
         script_path = script_dir / (txt_path.stem + SCRIPT_EXT)
         if not script_path.exists():
             continue
-        chapters_to_fix.append((txt_path, script_path))
 
-    if not chapters_to_fix:
-        print("no chapters with scripts to fix")
-        return
-
-    total_added = 0
-    total_removed = 0
-
-    for txt_path, script_path in tqdm(chapters_to_fix, desc="fixing", unit="chapter"):
         result = validate_script(txt_path, script_path)
-
         if not result.missing and not result.hallucinated:
             continue
 
         segments = load_script(script_path)
-        original_text = txt_path.read_text(encoding="utf-8")
-
-        # remove hallucinated segments first (in reverse order to preserve indices)
         if fix_hallucinated and result.hallucinated:
             print(
-                f"\n{txt_path.name}: removing {len(result.hallucinated)} hallucinated segment(s)..."
+                f"\n{txt_path.name}: removing {len(result.hallucinated)} hallucination(s)..."
             )
-            for idx in sorted(result.hallucinated, reverse=True):
-                seg = segments[idx]
-                print(f"  removing [{idx}] {seg.speaker}: {seg.text}")
-                del segments[idx]
-                total_removed += 1
-            # checkpoint after removing hallucinations
+            total_removed += _remove_hallucinations(segments, result.hallucinated)
             save_script(script_path, segments)
 
-        # re-validate to get updated missing list after hallucination removal
         if fix_missing:
-            result = validate_script(txt_path, script_path)
+            result = validate_script(txt_path, script_path)  # re-validate
             if result.missing:
                 print(
                     f"\n{txt_path.name}: filling {len(result.missing)} missing fragment(s)..."
                 )
-                # reload segments in case they changed
-                segments = load_script(script_path)
-
-                # Sort missing fragments by insertion index and offset in descending order
-                # so that insertions/splits don't affect indices of subsequent operations
-                missing_sorted = sorted(
-                    result.missing, key=lambda x: (x[1], x[2]), reverse=True
+                total_added += _fill_missing_fragments(
+                    segments,
+                    result.missing,
+                    txt_path.read_text(encoding="utf-8"),
+                    cast,
+                    api_base,
+                    api_key,
+                    model,
+                    context_chars,
+                    context_paragraphs,
+                    verbose,
                 )
+                save_script(script_path, segments)
 
-                for fragment, insertion_idx, split_offset in tqdm(
-                    missing_sorted, desc="  filling", unit="fragment", leave=False
-                ):
-                    if verbose:
-                        print(
-                            f"\n    missing fragment (@ {insertion_idx}+{split_offset}): {fragment}"
-                        )
-
-                    # Determine insertion point and handle splitting
-                    target_idx = insertion_idx
-                    if split_offset > 0 and insertion_idx < len(segments):
-                        seg = segments[insertion_idx]
-                        # only split if offset is within bounds and actually splits text
-                        if split_offset < len(seg.text):
-                            from copy import deepcopy
-
-                            left_seg = deepcopy(seg)
-                            left_seg.text = seg.text[:split_offset].rstrip()
-
-                            right_seg = deepcopy(seg)
-                            right_seg.text = seg.text[split_offset:].lstrip()
-
-                            # update segment at insertion_idx with left part
-                            segments[insertion_idx] = left_seg
-                            # insert right part after
-                            segments.insert(insertion_idx + 1, right_seg)
-
-                            # we want to insert the NEW text between left and right
-                            target_idx = insertion_idx + 1
-
-                    context_before, context_after = _extract_context(
-                        original_text, fragment, context_chars, context_paragraphs
-                    )
-
-                    try:
-                        new_segments = fix_missing_segment(
-                            fragment,
-                            context_before,
-                            context_after,
-                            cast,
-                            api_base,
-                            api_key,
-                            model or "gpt-4o",
-                        )
-
-                        if new_segments:
-                            if verbose:
-                                print("    LLM returned:")
-                                for s in new_segments:
-                                    print(f"      {s.speaker}: {s.text}")
-
-                            for j, seg in enumerate(new_segments):
-                                segments.insert(target_idx + j, seg)
-
-                            # merge newly inserted segments with neighbors if speakers match
-                            # 1. merge last new segment with following existing segment
-                            if _attempt_merge(
-                                segments, target_idx + len(new_segments) - 1
-                            ):
-                                pass  # merged with next
-
-                            # 2. merge internal new segments (if LLM returned multiple)
-                            # iterate backwards to keep indices valid
-                            for j in range(len(new_segments) - 2, -1, -1):
-                                _attempt_merge(segments, target_idx + j)
-
-                            # 3. merge preceding existing segment with first new segment
-                            if target_idx > 0:
-                                _attempt_merge(segments, target_idx - 1)
-
-                            total_added += len(new_segments)
-                            # checkpoint after each fragment
-                            save_script(script_path, segments)
-
-                    except Exception as e:
-                        print(f"    failed: {e}")
+    if total_added > 0 or total_removed > 0:
+        print(f"\nfix: added {total_added}, removed {total_removed} segment(s)")
+    else:
+        print("fix: no issues found.")
 
     # summary
     summary_parts = []

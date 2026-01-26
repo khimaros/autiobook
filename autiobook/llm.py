@@ -65,6 +65,57 @@ def get_client(api_base: Optional[str] = None, api_key: Optional[str] = None) ->
     )
 
 
+def _parse_json_response(content: str) -> dict | list:
+    """parse JSON from LLM response, handling markdown code blocks."""
+    content = content.strip()
+    if content.startswith("```json"):
+        content = content[7:]
+    elif content.startswith("```"):
+        content = content[3:]
+    if content.endswith("```"):
+        content = content[:-3]
+    return cast(dict | list, json.loads(content.strip()))
+
+
+def _query_llm_json(
+    system_prompt: str,
+    user_prompt: str,
+    model: str,
+    api_base: Optional[str] = None,
+    api_key: Optional[str] = None,
+    wrapper_keys: List[str] | None = None,
+) -> dict | list:
+    """internal helper to query LLM and return JSON data."""
+    client = get_client(api_base, api_key)
+
+    def _call():
+        res = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            response_format={"type": "json_object"},
+        )
+        content = res.choices[0].message.content
+        if not content:
+            raise RuntimeError("llm returned empty content")
+
+        data = _parse_json_response(content)
+
+        if isinstance(data, dict) and wrapper_keys:
+            for key in wrapper_keys:
+                if key in data:
+                    return data[key]
+            # fallback: first list value
+            for v in data.values():
+                if isinstance(v, list):
+                    return v
+        return data
+
+    return cast(dict | list, retry_with_backoff(_call))
+
+
 def generate_cast(
     text_sample: str,
     api_base: Optional[str] = None,
@@ -73,11 +124,7 @@ def generate_cast(
     existing_cast_summary: Optional[str] = None,
 ) -> List[Character]:
     """analyze text to identify characters and generate voice descriptions."""
-    client = get_client(api_base, api_key)
-
-    context_str = ""
-    if existing_cast_summary:
-        context_str = f"\nExisting Cast:\n{existing_cast_summary}\n"
+    context_str = f"\nExisting Cast:\n{existing_cast_summary}\n" if existing_cast_summary else ""
 
     prompt = f"""
 Identify book characters. Output NEW or UPDATED profiles.
@@ -93,59 +140,20 @@ Existing Cast:
 JSON: {{"c":[{{"n":"Narrator","d":"...","a":"...","al":[]}}]}}
 """
 
-    def _call_api() -> List[Character]:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": text_sample},
-            ],
-            response_format={"type": "json_object"},
+    data = _query_llm_json(
+        prompt, text_sample, model, api_base, api_key, wrapper_keys=["c", "characters"]
+    )
+
+    return [
+        Character(
+            name=str(c.get("n", c.get("name", ""))),
+            description=str(c.get("d", c.get("description", ""))),
+            audition_line=str(c.get("a", c.get("audition_line", ""))),
+            aliases=c.get("al", c.get("aliases")),
         )
-
-        content = response.choices[0].message.content
-        if not content:
-            raise RuntimeError("llm returned empty content")
-        data = _parse_json_response(content)
-
-        # handle potential wrapper keys
-        if isinstance(data, dict):
-            if "c" in data:
-                data = data["c"]
-            elif "characters" in data:
-                data = data["characters"]
-            else:
-                for key, value in data.items():
-                    if isinstance(value, list):
-                        data = value
-                        break
-
-        characters = []
-        for c in data:
-            if not isinstance(c, dict):
-                continue
-            characters.append(
-                Character(
-                    name=str(c.get("n", c.get("name", ""))),
-                    description=str(c.get("d", c.get("description", ""))),
-                    audition_line=str(c.get("a", c.get("audition_line", ""))),
-                    aliases=c.get("al", c.get("aliases")) or None,
-                )
-            )
-        return characters
-
-    return retry_with_backoff(_call_api)
-
-
-def _parse_json_response(content: str) -> dict | list:
-    """parse JSON from LLM response, handling markdown code blocks."""
-    try:
-        return cast(dict | list, json.loads(content))
-    except json.JSONDecodeError:
-        if "```json" in content:
-            content = content.split("```json")[1].split("```")[0].strip()
-            return cast(dict | list, json.loads(content))
-        raise
+        for c in cast(list, data)
+        if isinstance(c, dict)
+    ]
 
 
 def split_text_smart(text: str, max_words: int = 1500) -> List[str]:
@@ -173,14 +181,13 @@ def split_text_smart(text: str, max_words: int = 1500) -> List[str]:
 
 def process_script_chunk(
     text_chunk: str,
-    cast: List[Character],
+    characters_list: List[Character],
     api_base: Optional[str] = None,
     api_key: Optional[str] = None,
     model: str = DEFAULT_LLM_MODEL,
 ) -> List[ScriptSegment]:
     """convert a text chunk into dramatized script segments."""
-    client = get_client(api_base, api_key)
-    cast_str = _format_cast_list(cast)
+    cast_str = _format_cast_list(characters_list)
 
     prompt = f"""
 Convert text to JSON script.
@@ -196,44 +203,25 @@ Example: "Hi," John said. ->
 {{"seg":[{{"s":"John","t":"Hi.","i":"warm"}},{{"s":"Narrator","t":"John said.","i":"narrative"}}]}}
 """
 
-    def _call_api() -> List[ScriptSegment]:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": text_chunk},
-            ],
-            response_format={"type": "json_object"},
+    data = _query_llm_json(
+        prompt, text_chunk, model, api_base, api_key, wrapper_keys=["seg", "segments"]
+    )
+
+    return [
+        ScriptSegment(
+            speaker=s["s"],
+            text=s["t"],
+            instruction=s["i"],
         )
-
-        content = response.choices[0].message.content
-        if not content:
-            raise RuntimeError("llm returned empty content")
-        data = _parse_json_response(content)
-        segments = []
-        seg_list = []
-        if isinstance(data, dict):
-            seg_list = data.get("seg", data.get("segments", []))
-        elif isinstance(data, list):
-            seg_list = data
-
-        for s in seg_list:
-            segments.append(
-                ScriptSegment(
-                    speaker=s["s"],
-                    text=s["t"],
-                    instruction=s["i"],
-                )
-            )
-        return segments
-
-    return retry_with_backoff(_call_api)
+        for s in cast(list, data)
+        if isinstance(s, dict)
+    ]
 
 
-def _format_cast_list(cast: List[Character]) -> str:
+def _format_cast_list(characters_list: List[Character]) -> str:
     """format cast list for LLM prompts."""
     cast_info = []
-    for c in cast:
+    for c in characters_list:
         if c.aliases:
             cast_info.append(f"{c.name} (also known as: {', '.join(c.aliases)})")
         else:
@@ -245,14 +233,13 @@ def fix_missing_segment(
     missing_text: str,
     context_before: str,
     context_after: str,
-    cast: List[Character],
+    characters_list: List[Character],
     api_base: Optional[str] = None,
     api_key: Optional[str] = None,
     model: str = DEFAULT_LLM_MODEL,
 ) -> List[ScriptSegment]:
     """convert a missing text fragment into script segments using surrounding context."""
-    client = get_client(api_base, api_key)
-    cast_str = _format_cast_list(cast)
+    cast_str = _format_cast_list(characters_list)
 
     prompt = f"""
 Convert ONLY "MISSING TEXT" to JSON segments.
@@ -279,35 +266,16 @@ CONTEXT AFTER:
 {context_after}
 """
 
-    def _call_api() -> List[ScriptSegment]:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": user_content},
-            ],
-            response_format={"type": "json_object"},
+    data = _query_llm_json(
+        prompt, user_content, model, api_base, api_key, wrapper_keys=["seg", "segments"]
+    )
+
+    return [
+        ScriptSegment(
+            speaker=s["s"],
+            text=s["t"],
+            instruction=s["i"],
         )
-
-        content = response.choices[0].message.content
-        if not content:
-            raise RuntimeError("llm returned empty content")
-        data = _parse_json_response(content)
-        segments = []
-        seg_list = []
-        if isinstance(data, dict):
-            seg_list = data.get("seg", data.get("segments", []))
-        elif isinstance(data, list):
-            seg_list = data
-
-        for s in seg_list:
-            segments.append(
-                ScriptSegment(
-                    speaker=s["s"],
-                    text=s["t"],
-                    instruction=s["i"],
-                )
-            )
-        return segments
-
-    return retry_with_backoff(_call_api)
+        for s in cast(list, data)
+        if isinstance(s, dict)
+    ]

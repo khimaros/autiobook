@@ -43,11 +43,59 @@ TXT_EXT = ".txt"
 WAV_EXT = ".wav"
 MP3_EXT = ".mp3"
 METADATA_FILE = "metadata.json"
-CAST_FILE = "cast.json"
+CAST_FILE = "characters.json"
 SCRIPT_EXT = ".json"
 COVER_FILE = "cover.jpg"
 SEGMENTS_DIR = "segments"
 STATE_FILE = "state.json"
+
+# showcase emotions: (instruction, sample_line) for each emotion
+SHOWCASE_EMOTIONS = {
+    "neutral": (
+        "speaks calmly and clearly",
+        "I suppose we should get started then.",
+    ),
+    "happy": (
+        "speaks joyfully and warmly, with a smile",
+        "This is exactly what I was hoping for!",
+    ),
+    "sad": (
+        "speaks with sorrow and melancholy",
+        "I never thought it would end this way.",
+    ),
+    "angry": (
+        "speaks with frustration and intensity",
+        "How could you possibly think that was acceptable?",
+    ),
+    "fearful": (
+        "speaks with fear and anxiety, voice trembling",
+        "Did you hear that? Something is out there.",
+    ),
+    "surprised": (
+        "speaks with astonishment and wonder",
+        "Wait, you're saying this has been here the whole time?",
+    ),
+    "whispering": (
+        "whispers softly and secretively",
+        "Keep quiet and follow me. We can't let them hear us.",
+    ),
+    "shouting": (
+        "shouts emphatically and loudly",
+        "Everyone get back! It's not safe here!",
+    ),
+    "sarcastic": (
+        "speaks with dry irony and sarcasm",
+        "Oh wonderful, another brilliant plan that definitely won't fail.",
+    ),
+    "excited": (
+        "speaks with enthusiasm and high energy",
+        "You have to see this! I've never seen anything like it!",
+    ),
+    "contemplative": (
+        "speaks thoughtfully and reflectively, with pauses",
+        "Perhaps there's more to this than we first realized.",
+    ),
+}
 
 DEFAULT_CAST = [
     {

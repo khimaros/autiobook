@@ -50,6 +50,15 @@ echo "--- test: audition ---"
 autiobook audition "$WORKDIR" || die "audition command failed"
 
 echo ""
+echo "--- test: showcase ---"
+autiobook showcase "$WORKDIR" || die "showcase command failed"
+
+# verify showcase output
+showcase_dirs=$(find "$WORKDIR/showcase" -mindepth 1 -maxdepth 1 -type d | wc -l)
+[[ $showcase_dirs -gt 0 ]] || die "no showcase directories created"
+echo "generated showcase for $showcase_dirs character(s)"
+
+echo ""
 echo "--- test: script ---"
 autiobook script "${LLM_FLAGS[@]}" "$WORKDIR" || die "script command failed"
 
@@ -91,6 +100,8 @@ autiobook extract "$TEST_EPUB" -o "$WORKDIR" || die "idempotent extract failed"
 autiobook cast "${LLM_FLAGS[@]}" "$WORKDIR" || die "idempotent cast failed"
 # run audition again, should skip existing
 autiobook audition "$WORKDIR" || die "idempotent audition failed"
+# run showcase again, should skip existing
+autiobook showcase "$WORKDIR" || die "idempotent showcase failed"
 # run script again, should skip existing
 autiobook script "${LLM_FLAGS[@]}" "$WORKDIR" || die "idempotent script failed"
 # run perform again, should skip existing

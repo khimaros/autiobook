@@ -1,5 +1,7 @@
 # ROADMAP
 
+[@] showcase command: generate emotion samples for each character voice
+[@] chapter-ordered segment scheduling with early assembly
 [x] refactor dramatize/convert commands to DRY flags and improve output directory inference
 [x] improve LLM prompts for smaller models
 ```
