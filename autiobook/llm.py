@@ -80,7 +80,14 @@ def _parse_json_response(content: str) -> dict | list:
         content = content[3:]
     if content.endswith("```"):
         content = content[:-3]
-    return cast(dict | list, json.loads(content.strip()))
+
+    content = content.strip()
+    try:
+        return cast(dict | list, json.loads(content))
+    except json.JSONDecodeError:
+        # handle trailing garbage (extra data) from some LLMs
+        obj, _ = json.JSONDecoder().raw_decode(content)
+        return cast(dict | list, obj)
 
 
 def _query_llm_json(
