@@ -36,6 +36,17 @@ class HTTPTTSConfig:
     compile_model: bool = False
 
 
+def _get_json(url: str) -> dict:
+    """GET url, return parsed json response."""
+    try:
+        with urllib.request.urlopen(url, timeout=TTS_HTTP_TIMEOUT) as resp:
+            parsed: dict = json.loads(resp.read())
+            return parsed
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode(errors="replace")
+        raise RuntimeError(f"http {e.code}: {error_body}") from e
+
+
 def _post_json(url: str, body: dict) -> bytes:
     """send json post request, return response bytes."""
     data = json.dumps(body).encode()
@@ -114,6 +125,19 @@ class HTTPTTSEngine:
 
     def _voices_url(self) -> str:
         return f"{self.config.api_base}/audio/voices"
+
+    def list_voices(self) -> list[str]:
+        """fetch available preset voices for the configured model."""
+        url = self._voices_url()
+        if self.config.model:
+            url = f"{url}?model={self.config.model}"
+        resp = _get_json(url)
+        # response shape: {model_name: [voice, ...]} or {"voices": [...]}
+        if isinstance(resp, dict):
+            for v in resp.values():
+                if isinstance(v, list):
+                    return [str(x) for x in v]
+        return []
 
     def _synthesize_one(
         self, text: str, voice: str = "", instruct: str = ""

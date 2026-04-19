@@ -3,6 +3,7 @@
 ```
 [ ] audition command: add --audition-line flag to override per-character audition lines
 
+[x] rename phases: audition→emote (per-emotion variants) and introduce→audition (per-character base); emote reuses audition seed
 [x] fix_missing_segment: prevent LLM from grabbing text from context instead of MISSING TEXT
 [x] fix nested HTML tag duplication in extract_text_from_html (div containing p tags)
 [x] make temperature optional for tts/llm (no default; only send when explicitly set)

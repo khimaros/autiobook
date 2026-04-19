@@ -70,6 +70,8 @@ class AudioTask:
     voice_ref_audio: Optional[Path] = None
     voice_ref_text: Optional[str] = None
     instruct: str = ""
+    # preset-voice mode: use backend voice_id + instruct (no clone, no ref audio)
+    preset_voice: Optional[str] = None
     chapter_idx: int = 0  # for chapter-ordered scheduling
     metadata: Optional[dict[str, Any]] = None  # arbitrary metadata for callbacks
 
@@ -91,7 +93,12 @@ class ChapterState:
 def _log_verbose_tasks(batch: list[AudioTask]) -> None:
     """print voice and text for each task in the batch."""
     for t in batch:
-        voice = t.voice_ref_audio.stem if t.voice_ref_audio else "(default)"
+        if t.preset_voice:
+            voice = f"preset:{t.preset_voice}"
+        elif t.voice_ref_audio:
+            voice = t.voice_ref_audio.stem
+        else:
+            voice = "(default)"
         text = t.text.strip()
         tqdm.write(f"perform: [{voice}] {text}")
 
@@ -104,6 +111,7 @@ def _run_synthesis(engine: Any, batch: list[AudioTask]) -> list[np.ndarray]:
     ref_audio = batch[0].voice_ref_audio
     ref_text = batch[0].voice_ref_text
     instruct = batch[0].instruct
+    preset_voice = batch[0].preset_voice
 
     original_size = len(texts)
     padded = False
@@ -117,7 +125,9 @@ def _run_synthesis(engine: Any, batch: list[AudioTask]) -> list[np.ndarray]:
         padded = True
 
     def _call():
-        if ref_audio:
+        if preset_voice:
+            w, _ = engine.synthesize(texts, instruct, speaker=preset_voice)
+        elif ref_audio:
             w, _ = engine.clone_voice(texts, ref_audio, ref_text)
         else:
             w, _ = engine.synthesize(texts, instruct)
@@ -414,8 +424,10 @@ def _try_assemble_ready_chapters(
         _assemble_chapter(ch, resume)
 
 
-def _get_voice_key(task: AudioTask) -> tuple[str | None, str | None]:
+def _get_voice_key(task: AudioTask) -> tuple:
     """get the voice grouping key for a task."""
+    if task.preset_voice:
+        return ("preset", task.preset_voice, task.instruct)
     return (
         str(task.voice_ref_audio) if task.voice_ref_audio else None,
         task.voice_ref_text,

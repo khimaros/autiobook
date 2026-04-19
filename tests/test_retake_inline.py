@@ -1,4 +1,4 @@
-"""tests for inline callback quality guard used during introduce/audition.
+"""tests for inline callback quality guard used during audition/emote.
 
 we patch `categorize_audio` to avoid brittle signal crafting — intent of
 these tests is the retry/save/save logic, not the DSP heuristics themselves
@@ -14,13 +14,13 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
+from autiobook.audition import run_audition
 from autiobook.callback import (
     CALLBACK_MAX_ATTEMPTS,
     generate_with_callback,
 )
 from autiobook.config import SAMPLE_RATE, WAV_EXT
-from autiobook.dramatize import run_auditions
-from autiobook.introduce import run_introduce
+from autiobook.dramatize import run_emotes
 
 # sentinel arrays: first sample tags "good" vs "bad" for _fake_categorize
 _CLEAN = np.full(SAMPLE_RATE, 0.1, dtype=np.float32)
@@ -94,7 +94,7 @@ class TestGenerateWithCallback:
 
 
 @pytest.fixture
-def audition_workdir():
+def cast_workdir():
     with tempfile.TemporaryDirectory() as tmpdir:
         workdir = Path(tmpdir)
         cast_dir = workdir / "cast"
@@ -114,8 +114,8 @@ def audition_workdir():
         yield workdir
 
 
-class TestAuditionCallback:
-    def test_callback_triggers_retry_on_bad_output(self, audition_workdir):
+class TestEmoteCallback:
+    def test_callback_triggers_retry_on_bad_output(self, cast_workdir):
         engine = MagicMock()
         engine.config = SimpleNamespace(seed=7)
         # alternate bad, good per call
@@ -129,27 +129,27 @@ class TestAuditionCallback:
 
         with patch("autiobook.callback.categorize_audio", _fake_categorize):
             with patch("autiobook.dramatize.create_tts_engine", return_value=engine):
-                run_auditions(audition_workdir, callback=True)
+                run_emotes(cast_workdir, callback=True)
 
         from autiobook.config import VOICE_EMOTIONS
 
         assert engine.design_voice.call_count == 2 * len(VOICE_EMOTIONS)
         assert engine.config.seed == 7 + len(VOICE_EMOTIONS)
 
-    def test_without_callback_accepts_bad_output(self, audition_workdir):
+    def test_without_callback_accepts_bad_output(self, cast_workdir):
         engine = MagicMock()
         engine.config = SimpleNamespace(seed=7)
         engine.design_voice = MagicMock(return_value=(_bad(), SAMPLE_RATE))
 
         with patch("autiobook.dramatize.create_tts_engine", return_value=engine):
-            run_auditions(audition_workdir, callback=False)
+            run_emotes(cast_workdir, callback=False)
 
         from autiobook.config import VOICE_EMOTIONS
 
         assert engine.design_voice.call_count == len(VOICE_EMOTIONS)
         assert engine.config.seed == 7
 
-    def test_callback_raises_when_quality_never_passes(self, audition_workdir):
+    def test_callback_raises_when_quality_never_passes(self, cast_workdir):
         engine = MagicMock()
         engine.config = SimpleNamespace(seed=1)
         engine.design_voice = MagicMock(return_value=(_bad(), SAMPLE_RATE))
@@ -157,11 +157,11 @@ class TestAuditionCallback:
         with patch("autiobook.callback.categorize_audio", _fake_categorize):
             with patch("autiobook.dramatize.create_tts_engine", return_value=engine):
                 with pytest.raises(RuntimeError, match="failed audio quality"):
-                    run_auditions(audition_workdir, callback=True)
+                    run_emotes(cast_workdir, callback=True)
 
 
 class TestIntroduceCallback:
-    def test_callback_triggers_retry_on_bad_output(self, audition_workdir):
+    def test_callback_triggers_retry_on_bad_output(self, cast_workdir):
         engine = MagicMock()
         engine.config = SimpleNamespace(seed=7)
         counter = {"n": 0}
@@ -173,20 +173,20 @@ class TestIntroduceCallback:
         engine.design_voice = MagicMock(side_effect=design)
 
         with patch("autiobook.callback.categorize_audio", _fake_categorize):
-            with patch("autiobook.introduce.create_tts_engine", return_value=engine):
-                run_introduce(audition_workdir, callback=True)
+            with patch("autiobook.audition.create_tts_engine", return_value=engine):
+                run_audition(cast_workdir, callback=True)
 
         # one character → two design calls (bad, then clean)
         assert engine.design_voice.call_count == 2
         assert engine.config.seed == 8
 
-    def test_without_callback_accepts_bad_output(self, audition_workdir):
+    def test_without_callback_accepts_bad_output(self, cast_workdir):
         engine = MagicMock()
         engine.config = SimpleNamespace(seed=7)
         engine.design_voice = MagicMock(return_value=(_bad(), SAMPLE_RATE))
 
-        with patch("autiobook.introduce.create_tts_engine", return_value=engine):
-            run_introduce(audition_workdir, callback=False)
+        with patch("autiobook.audition.create_tts_engine", return_value=engine):
+            run_audition(cast_workdir, callback=False)
 
         assert engine.design_voice.call_count == 1
         assert engine.config.seed == 7
@@ -238,7 +238,7 @@ class TestForensicArchival:
                     engine,
                     label="Alice/happy",
                     reject_dir=reject_dir,
-                    metadata={"phase": "audition"},
+                    metadata={"phase": "emote"},
                 )
             wavs = list(reject_dir.glob(f"*{WAV_EXT}"))
             sidecars = list(reject_dir.glob("*.json"))
@@ -246,11 +246,11 @@ class TestForensicArchival:
             assert len(sidecars) == 2
             # verify metadata merge: phase + seed + attempt
             data = json.loads(sidecars[0].read_text())
-            assert data["metadata"]["phase"] == "audition"
+            assert data["metadata"]["phase"] == "emote"
             assert "seed" in data["metadata"]
             assert "attempt" in data["metadata"]
 
-    def test_audition_callback_archives_to_rejected_dir(self, audition_workdir):
+    def test_emote_callback_archives_to_rejected_dir(self, cast_workdir):
         engine = MagicMock()
         engine.config = SimpleNamespace(seed=7)
         counter = {"n": 0}
@@ -263,15 +263,15 @@ class TestForensicArchival:
 
         with patch("autiobook.callback.categorize_audio", _fake_categorize):
             with patch("autiobook.dramatize.create_tts_engine", return_value=engine):
-                run_auditions(audition_workdir, callback=True)
+                run_emotes(cast_workdir, callback=True)
 
         from autiobook.config import REJECTED_DIR, VOICE_EMOTIONS
 
-        reject_dir = audition_workdir / "audition" / REJECTED_DIR
+        reject_dir = cast_workdir / "emote" / REJECTED_DIR
         wavs = list(reject_dir.glob(f"*{WAV_EXT}"))
         assert len(wavs) == len(VOICE_EMOTIONS)
         sidecars = list(reject_dir.glob("*.json"))
         data = json.loads(sidecars[0].read_text())
-        assert data["metadata"]["phase"] == "audition"
+        assert data["metadata"]["phase"] == "emote"
         assert data["metadata"]["character"] == "Alice"
         assert "instruct" in data["metadata"]

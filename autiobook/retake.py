@@ -119,7 +119,7 @@ def save_reject(
 
 
 def get_reject_dir(workdir: Path, phase: str) -> Path:
-    """reject dir for a given phase (audition, perform, synthesize)."""
+    """reject dir for a given phase (emote, perform, synthesize)."""
     return get_command_dir(workdir, phase) / REJECTED_DIR
 
 

@@ -1,7 +1,7 @@
-"""introduce/audition quality checks — the casting equivalent of retake.
+"""audition/emote quality checks — the casting equivalent of retake.
 
 mirrors retake.py: same heuristics (categorize_audio), same --dry-run/--prune
-surface, but scans voice-sample wavs in introduce/ (base files) and audition/
+surface, but scans voice-sample wavs in audition/ (base files) and emote/
 (per-emotion variants) rather than chapter segment caches. invoked inline
 during generation (via --callback) or as a post-hoc scan via the `callback`
 subcommand.
@@ -86,10 +86,10 @@ def _scan_dir(root: Path) -> list[SegmentMetrics]:
 
 
 def find_offenders(workdir: Path) -> dict[str, list[SegmentMetrics]]:
-    """scan introduce/ and audition/ wavs. returns {phase: [offenders]}."""
+    """scan audition/ and emote/ wavs. returns {phase: [offenders]}."""
     return {
-        "introduce": _scan_dir(get_command_dir(workdir, "introduce")),
         "audition": _scan_dir(get_command_dir(workdir, "audition")),
+        "emote": _scan_dir(get_command_dir(workdir, "emote")),
     }
 
 
@@ -100,7 +100,7 @@ def run_callback(
     prune: bool = False,
     dry_run: bool = False,
 ) -> None:
-    """scan introduce/audition wavs, delete offenders, and regenerate via generators.
+    """scan audition/emote wavs, delete offenders, and regenerate via generators.
 
     mirrors retake: dry-run reports only, prune deletes but skips regen.
     """
@@ -140,22 +140,22 @@ def run_callback(
 
     print(f"callback: deleted {total} wav(s); regenerating...")
 
-    # introduce base files live in introduce/; audition variants in audition/.
+    # audition base files live in audition/; emote variants in emote/.
     # deleting them means the run_* generators see resume-state fresh but file
     # missing, and regen.
-    if offenders["introduce"]:
-        from .introduce import run_introduce
-
-        run_introduce(workdir, verbose=verbose, config=design_config, callback=True)
-
     if offenders["audition"]:
-        from .dramatize import run_auditions
+        from .audition import run_audition
 
-        run_auditions(workdir, verbose=verbose, config=design_config, callback=True)
+        run_audition(workdir, verbose=verbose, config=design_config, callback=True)
+
+    if offenders["emote"]:
+        from .dramatize import run_emotes
+
+        run_emotes(workdir, verbose=verbose, config=design_config, callback=True)
 
 
 def cmd_callback(args):
-    """post-hoc quality scan for introduce/audition samples."""
+    """post-hoc quality scan for audition/emote samples."""
     from .utils import get_design_config
 
     run_callback(

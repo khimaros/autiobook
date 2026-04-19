@@ -9,7 +9,7 @@ epub file → extract → txt files → synthesize → wav files → retake → 
 
 Dramatization Workflow:
 ```
-txt files → cast gen → characters.json → audition → voice samples
+txt files → cast gen → characters.json → audition → emote → voice samples
      ↓
 script gen (llm) → json scripts → revise → perform (cloning) → wav files → retake
 ```
@@ -51,28 +51,28 @@ creates:
 - `workdir/synthesize/NN_Title.wav` - audio files
 - `workdir/synthesize/state.json` - resumability state
 
-### dramatize / cast / introduce / audition / script / revise / perform / callback
+### dramatize / cast / audition / emote / script / revise / perform / callback
 
 dramatize accepts `--strict` as a rollup for `--revise --retake --callback`; convert accepts `--strict` as a rollup for `--retake`.
 
 
-advanced workflow for multi-speaker dramatization. pipeline order: cast → introduce → audition → script → revise → perform → retake.
+advanced workflow for multi-speaker dramatization. pipeline order: cast → audition → emote → script → revise → perform → retake.
 
 - `cast`: generates `characters.json` from text sample using LLM.
-- `introduce`: generates `introduce/Character.wav` using `Qwen3-TTS-VoiceDesign` with the character description only (no emotion hints). this is the canonical per-character voice identity and serves as a fallback ref clip during perform when an emotion variant is missing. `--callback` validates inline.
-- `audition`: generates `audition/Character__emotion.wav` per emotion using `Qwen3-TTS-VoiceDesign` with the description plus an emotion instruct. these are the per-emotion ref clips that perform clones from. reuses the per-character seed recorded by introduce so every variant rides the same voice trajectory; a changed introduce seed invalidates the audition via the task hash. `--callback` validates inline.
-- `callback`: post-hoc audio quality scan for `introduce/` and `audition/` wavs (base files and per-emotion variants); deletes offenders and regenerates (mirrors `retake` for chapter segments). `--dry-run` reports only; `--prune` deletes without regenerating.
+- `audition`: generates `audition/Character.wav` using `Qwen3-TTS-VoiceDesign` with the character description only (no emotion hints). this is the canonical per-character voice identity and serves as a fallback ref clip during perform when an emotion variant is missing. `--callback` validates inline.
+- `emote`: generates `emote/Character__emotion.wav` per emotion using `Qwen3-TTS-VoiceDesign` with the description plus an emotion instruct. these are the per-emotion ref clips that perform clones from. reuses the per-character seed recorded by audition so every variant rides the same voice trajectory; a changed audition seed invalidates the emote via the task hash. `--callback` validates inline.
+- `callback`: post-hoc audio quality scan for `audition/` and `emote/` wavs (base files and per-emotion variants); deletes offenders and regenerates (mirrors `retake` for chapter segments). `--dry-run` reports only; `--prune` deletes without regenerating.
 - `script`: rewrites text into `NN_Title.json` script with speaker attribution using LLM. Supports `--validate` for iterative fixing of missing or hallucinated segments during generation.
 - `revise`: review and repair scripts. compares script to source, then fills missing segments via LLM and removes hallucinated segments. `--dry-run` reports without modifying; `--prune` strips hallucinations but skips LLM fix-missing.
 - `perform`: synthesizes audio using `Qwen3-TTS-Base` voice cloning from scripts + voice samples.
 
-### introduce / audition
+### audition / emote
 
-`introduce` produces one base file per character (`introduce/{name}.wav`) using `design_voice` with the character description, tracked in `introduce/state.json`. `audition` then produces per-emotion variants (`audition/{name}__{emotion}.wav`) using `design_voice` with the description plus an emotion instruction, tracked in `audition/state.json` keyed `{name}/{emotion}`. audition reads the seed recorded in `introduce/state.json` for each character and reuses it, so the base file and all emotion variants stay on the same voice trajectory; that seed also feeds the audition task hash, so bumping an introduce seed forces re-audition. both phases honor `--callback` and archive rejected takes to `{phase}/rejected/`.
+`audition` produces one base file per character (`audition/{name}.wav`) using `design_voice` with the character description, tracked in `audition/state.json`. `emote` then produces per-emotion variants (`emote/{name}__{emotion}.wav`) using `design_voice` with the description plus an emotion instruction, tracked in `emote/state.json` keyed `{name}/{emotion}`. emote reads the seed recorded in `audition/state.json` for each character and reuses it, so the base file and all emotion variants stay on the same voice trajectory; that seed also feeds the emote task hash, so bumping an audition seed forces re-emote. both phases honor `--callback` and archive rejected takes to `{phase}/rejected/`.
 
 ```
-autiobook introduce workdir/
 autiobook audition workdir/
+autiobook emote workdir/
 ```
 
 emotions generated: neutral, happy, sad, angry, fearful, surprised, whispering, shouting, sarcastic, excited, contemplative.
@@ -199,10 +199,10 @@ workdir/
 ├── cast/                  # character list and analysis state
 │   ├── characters.json
 │   └── state.json
-├── introduce/             # per-character base voices (description only)
+├── audition/              # per-character base voices (description only)
 │   ├── Character.wav
 │   └── state.json
-├── audition/              # per-emotion voice variants
+├── emote/                 # per-emotion voice variants
 │   ├── Character__neutral.wav
 │   ├── Character__happy.wav
 │   ├── ...

@@ -398,9 +398,9 @@ def _perform_synthesis(
     # check if we should look for a voice
     voice_name = getattr(engine.config, "voice", None)
     if voice_name:
-        # look in introduce/ for the per-character base voice
+        # look in audition/ for the per-character base voice
         workdir = pending[0][0].parent.parent
-        p = get_command_dir(workdir, "introduce") / f"{voice_name}{WAV_EXT}"
+        p = get_command_dir(workdir, "audition") / f"{voice_name}{WAV_EXT}"
         if p.exists():
             voice_path = p
             # try to load cast to get text

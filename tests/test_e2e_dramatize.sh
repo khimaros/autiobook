@@ -44,22 +44,22 @@ echo "--- test: cast ---"
 autiobook cast "$WORKDIR" || die "cast command failed"
 
 echo ""
-echo "--- test: introduce ---"
-autiobook introduce "$WORKDIR" || die "introduce command failed"
-
-# verify introduce output (base voice files have no emotion suffix)
-intro_count=$(find "$WORKDIR/introduce" -maxdepth 1 -name "*.wav" | wc -l)
-[[ $intro_count -gt 0 ]] || die "no introduce wavs created"
-echo "introduced $intro_count character(s)"
-
-echo ""
 echo "--- test: audition ---"
 autiobook audition "$WORKDIR" || die "audition command failed"
 
-# verify audition output (per-emotion variants have __ suffix)
-audition_count=$(find "$WORKDIR/audition" -maxdepth 1 -name "*__*.wav" | wc -l)
-[[ $audition_count -gt 0 ]] || die "no audition emotion wavs created"
-echo "auditioned $audition_count emotion variant(s)"
+# verify audition output (base voice files have no emotion suffix)
+intro_count=$(find "$WORKDIR/audition" -maxdepth 1 -name "*.wav" | wc -l)
+[[ $intro_count -gt 0 ]] || die "no audition wavs created"
+echo "auditioned $intro_count character(s)"
+
+echo ""
+echo "--- test: emote ---"
+autiobook emote "$WORKDIR" || die "emote command failed"
+
+# verify emote output (per-emotion variants have __ suffix)
+emote_count=$(find "$WORKDIR/emote" -maxdepth 1 -name "*__*.wav" | wc -l)
+[[ $emote_count -gt 0 ]] || die "no emote emotion wavs created"
+echo "emoted $emote_count emotion variant(s)"
 
 echo ""
 echo "--- test: script ---"
@@ -101,10 +101,10 @@ echo "--- test: idempotency ---"
 autiobook extract "$TEST_EPUB" -o "$WORKDIR" || die "idempotent extract failed"
 # run cast again, should skip existing
 autiobook cast "$WORKDIR" || die "idempotent cast failed"
-# run introduce again, should skip existing
-autiobook introduce "$WORKDIR" || die "idempotent introduce failed"
 # run audition again, should skip existing
 autiobook audition "$WORKDIR" || die "idempotent audition failed"
+# run emote again, should skip existing
+autiobook emote "$WORKDIR" || die "idempotent emote failed"
 # run script again, should skip existing
 autiobook script "$WORKDIR" || die "idempotent script failed"
 # run perform again, should skip existing

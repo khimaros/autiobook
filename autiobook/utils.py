@@ -164,7 +164,7 @@ def add_common_args(parser: argparse.ArgumentParser, group: str = "all"):
         g.add_argument(
             "--tts-design-model",
             default="",
-            help="tts model for voice design (audition)",
+            help="tts model for voice design (emote)",
         )
         g.add_argument(
             "--tts-clone-model",
@@ -213,7 +213,7 @@ def add_common_args(parser: argparse.ArgumentParser, group: str = "all"):
         )
         g.add_argument(
             "--speaker",
-            help="cloned speaker (name from introduce/)",
+            help="cloned speaker (name from audition/)",
         )
         g.add_argument(
             "-i", "--instruct", help="instruction for tts (string or file path)"
@@ -392,7 +392,9 @@ def _build_local_config(args, model: str):
 
 def get_tts_config(args):
     """extract tts config for synthesis/general use."""
-    default = BASE_MODEL if (hasattr(args, "speaker") and args.speaker) else DEFAULT_MODEL
+    default = (
+        BASE_MODEL if (hasattr(args, "speaker") and args.speaker) else DEFAULT_MODEL
+    )
     model = _resolve_tts_model(args, default)
 
     if getattr(args, "api_base", None):

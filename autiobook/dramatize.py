@@ -378,7 +378,7 @@ def run_cast_generation(
     return list(cast_map.values())
 
 
-def _audition_tasks(
+def _emote_tasks(
     char: Character,
     audition_line: str | None,
 ) -> list[tuple[str, str, str, str]]:
@@ -393,7 +393,7 @@ def _audition_tasks(
     return tasks
 
 
-def run_auditions(
+def run_emotes(
     workdir: Path,
     cast: List[Character] | None = None,
     verbose: bool = False,
@@ -401,16 +401,22 @@ def run_auditions(
     audition_line: str | None = None,
     config: Any = None,
     callback: bool = False,
+    preset_voices: bool = False,
 ) -> None:
-    """generate voice samples for cast with emotion variants."""
+    """generate voice samples for cast with emotion variants.
+
+    when preset_voices=True, uses backend voice ids (from audition/voices.json)
+    and the `instructions` feature to synthesize emotion variants for inspection
+    only; perform does not read these wavs in preset mode.
+    """
 
     if cast is None:
         cast = load_cast(workdir)
 
-    voices_dir = get_command_dir(workdir, "audition")
-    resume = ResumeManager.for_command(workdir, "audition", force=force)
+    voices_dir = get_command_dir(workdir, "emote")
+    resume = ResumeManager.for_command(workdir, "emote", force=force)
 
-    from .introduce import recorded_seed
+    from .audition import recorded_seed
 
     if not cast:
         cast_path = get_command_dir(workdir, "cast") / CAST_FILE
@@ -426,6 +432,15 @@ def run_auditions(
             "run 'cast' to generate full cast."
         )
 
+    preset_map: dict[str, str] = {}
+    if preset_voices:
+        from .casting import load_voices
+
+        preset_map = load_voices(workdir)
+        if not preset_map:
+            print("emote: --preset-voices set but no audition/voices.json; skipping")
+            return
+
     if config is None:
         from .tts import TTSConfig
 
@@ -433,7 +448,7 @@ def run_auditions(
     engine = create_tts_engine(config)
 
     print(
-        f"generating auditions for {len(cast)} characters "
+        f"generating emotes for {len(cast)} characters "
         f"({len(VOICE_EMOTIONS)} emotions each)..."
     )
 
@@ -441,11 +456,15 @@ def run_auditions(
     skipped_count = 0
 
     for char in tqdm(cast, desc="casting voices"):
-        tasks = _audition_tasks(char, audition_line)
+        tasks = _emote_tasks(char, audition_line)
 
-        # reuse the per-character seed recorded by introduce so all of a
+        voice_id = preset_map.get(char.name) if preset_voices else None
+        if preset_voices and not voice_id:
+            continue
+
+        # reuse the per-character seed recorded by audition so all of a
         # character's ref clips (base + emotion variants) ride the same
-        # trajectory. a changed introduce seed forces re-audition via the hash.
+        # trajectory. a changed audition seed forces re-emote via the hash.
         intro_seed = recorded_seed(workdir, char.name)
         if intro_seed > 0:
             engine.config.seed = intro_seed
@@ -453,12 +472,20 @@ def run_auditions(
         for filename, resume_key, text, instruct in tasks:
             wav_path = voices_dir / f"{filename}{WAV_EXT}"
 
+            # in preset mode, drop the character description from instruct
+            # (the voice_id supplies the character identity).
+            emote_instruct = instruct
+            if preset_voices:
+                _, _, emotion_only = instruct.partition("; ")
+                emote_instruct = emotion_only or instruct
+
             task_data = {
                 "name": char.name,
                 "description": char.description,
                 "text": text,
-                "instruct": instruct,
-                "introduce_seed": intro_seed,
+                "instruct": emote_instruct,
+                "audition_seed": intro_seed,
+                "voice_id": voice_id or "",
             }
             task_hash = compute_hash(task_data)
 
@@ -473,6 +500,11 @@ def run_auditions(
             if verbose:
                 tqdm.write(f"  {resume_key}: '{text[:60]}'")
 
+            def _generate():
+                if preset_voices:
+                    return engine.synthesize(text, emote_instruct, speaker=voice_id)
+                return engine.design_voice(text=text, instruct=emote_instruct)
+
             try:
                 if callback:
                     from .callback import generate_with_callback
@@ -480,21 +512,21 @@ def run_auditions(
 
                     character, _, emotion = resume_key.partition("/")
                     audio, sr = generate_with_callback(
-                        lambda: engine.design_voice(text=text, instruct=instruct),
+                        _generate,
                         engine,
                         label=resume_key,
                         verbose=verbose,
-                        reject_dir=get_reject_dir(workdir, "audition"),
+                        reject_dir=get_reject_dir(workdir, "emote"),
                         metadata={
-                            "phase": "audition",
+                            "phase": "emote",
                             "character": character,
                             "emotion": emotion,
                             "text": text,
-                            "instruct": instruct,
+                            "instruct": emote_instruct,
                         },
                     )
                 else:
-                    audio, sr = engine.design_voice(text=text, instruct=instruct)
+                    audio, sr = _generate()
                 sf.write(str(wav_path), audio, sr)
                 from .audio import wav_sha256
 
@@ -504,7 +536,7 @@ def run_auditions(
                     task_hash,
                     character=character,
                     emotion=emotion,
-                    prompt=instruct,
+                    prompt=emote_instruct,
                     audition_line=text,
                     seed=int(getattr(config, "seed", 0) or 0),
                     wav_sha256=wav_sha256(wav_path),
@@ -517,9 +549,9 @@ def run_auditions(
 
     resume.save()
     if generated_count == 0 and skipped_count > 0:
-        print(f"audition: all {skipped_count} samples up to date.")
+        print(f"emote: all {skipped_count} samples up to date.")
     else:
-        print(f"audition: {generated_count} generated, {skipped_count} skipped")
+        print(f"emote: {generated_count} generated, {skipped_count} skipped")
 
 
 def _resolve_emotion(instruction: str) -> str:
@@ -859,12 +891,12 @@ def run_performance(
             for alias in c.aliases:
                 cast_map[alias] = c
 
-    voices_dir = get_command_dir(workdir, "audition")
+    voices_dir = get_command_dir(workdir, "emote")
     script_dir = get_command_dir(workdir, "script")
     perform_dir = get_command_dir(workdir, "perform")
 
     if not any(voices_dir.glob(f"*{WAV_EXT}")):
-        msg = "no voices found. run 'audition' command first."
+        msg = "no voices found. run 'emote' command first."
         print(msg)
         raise RuntimeError(msg)
 
@@ -933,18 +965,24 @@ def _perform_pooled(
         for name, char in cast_map.items()
     }
 
-    introduce_dir = get_command_dir(voices_dir.parent, "introduce")
+    audition_dir = get_command_dir(voices_dir.parent, "audition")
 
-    # load audition state so we can tie each perform chunk to the exact ref
-    # wav bytes that produced it: any regeneration of the audition (new seed,
+    # preset-voice mode: audition/voices.json assigns each character a backend
+    # voice_id. perform skips cloning and speaks via voice_id + instructions.
+    from .casting import load_voices
+
+    preset_voices = load_voices(voices_dir.parent)
+
+    # load emote state so we can tie each perform chunk to the exact ref
+    # wav bytes that produced it: any regeneration of the emote (new seed,
     # swapped file) changes this sha and invalidates cached perform segments.
-    audition_resume = ResumeManager.for_command(voices_dir.parent, "audition")
-    audition_shas: dict[tuple[str, str], str] = {}
-    for key, entry in audition_resume.state.items():
+    emote_resume = ResumeManager.for_command(voices_dir.parent, "emote")
+    emote_shas: dict[tuple[str, str], str] = {}
+    for key, entry in emote_resume.state.items():
         if isinstance(entry, dict) and "wav_sha256" in entry:
             char_key, _, emo_key = key.partition("/")
             if char_key and emo_key:
-                audition_shas[(char_key, emo_key)] = str(entry["wav_sha256"])
+                emote_shas[(char_key, emo_key)] = str(entry["wav_sha256"])
 
     chapter_data = []
     segments_dir = get_segments_dir(pending[0][1].parent)
@@ -964,40 +1002,59 @@ def _perform_pooled(
             char_name = char_opt.name if char_opt else ""
             char_hash = char_hashes.get(char_name, "")
 
-            # select emotion-variant audition clip
+            # select emotion variant
             emotion = _resolve_emotion(segment.instruction)
-            emotion_file = (
-                f"{char_opt.name}{EMOTION_SEP}{emotion}{WAV_EXT}" if char_opt else None
-            )
-            ref_audio_path = voices_dir / emotion_file if emotion_file else None
-            # fall back to introduce base if emotion variant missing
-            used_introduce_base = False
-            if ref_audio_path and not ref_audio_path.exists() and char_opt:
-                ref_audio_path = introduce_dir / f"{char_opt.name}{WAV_EXT}"
-                used_introduce_base = True
+            preset_voice_id = preset_voices.get(char_name) if preset_voices else None
+            emotion_instruct, _ = VOICE_EMOTIONS.get(emotion, ("", ""))
 
-            # ref_text must match what's spoken in the reference clip
-            if used_introduce_base:
-                ref_text = char_opt.audition_line if char_opt else None
+            if preset_voice_id:
+                # preset mode: no ref audio, just voice_id + emotion instruction
+                ref_audio_path = None
+                ref_text = None
+                ref_wav_sha = ""
+                seg_data = {
+                    "text": segment.text,
+                    "speaker": segment.speaker,
+                    "emotion": emotion,
+                    "char_hash": char_hash,
+                    "preset_voice": preset_voice_id,
+                    "instruct": emotion_instruct,
+                }
             else:
-                _, ref_text_default = VOICE_EMOTIONS.get(emotion, ("", ""))
-                ref_text = ref_text_default or (
-                    char_opt.audition_line if char_opt else None
+                emotion_file = (
+                    f"{char_opt.name}{EMOTION_SEP}{emotion}{WAV_EXT}"
+                    if char_opt
+                    else None
                 )
+                ref_audio_path = voices_dir / emotion_file if emotion_file else None
+                # fall back to audition base if emotion variant missing
+                used_audition_base = False
+                if ref_audio_path and not ref_audio_path.exists() and char_opt:
+                    ref_audio_path = audition_dir / f"{char_opt.name}{WAV_EXT}"
+                    used_audition_base = True
 
-            ref_wav_sha = audition_shas.get((char_name, emotion), "")
-            if not ref_wav_sha and ref_audio_path and ref_audio_path.exists():
-                from .audio import wav_sha256
+                # ref_text must match what's spoken in the reference clip
+                if used_audition_base:
+                    ref_text = char_opt.audition_line if char_opt else None
+                else:
+                    _, ref_text_default = VOICE_EMOTIONS.get(emotion, ("", ""))
+                    ref_text = ref_text_default or (
+                        char_opt.audition_line if char_opt else None
+                    )
 
-                ref_wav_sha = wav_sha256(ref_audio_path)
+                ref_wav_sha = emote_shas.get((char_name, emotion), "")
+                if not ref_wav_sha and ref_audio_path and ref_audio_path.exists():
+                    from .audio import wav_sha256
 
-            seg_data = {
-                "text": segment.text,
-                "speaker": segment.speaker,
-                "emotion": emotion,
-                "char_hash": char_hash,
-                "ref_wav_sha": ref_wav_sha,
-            }
+                    ref_wav_sha = wav_sha256(ref_audio_path)
+
+                seg_data = {
+                    "text": segment.text,
+                    "speaker": segment.speaker,
+                    "emotion": emotion,
+                    "char_hash": char_hash,
+                    "ref_wav_sha": ref_wav_sha,
+                }
 
             text_chunks = (
                 [
@@ -1023,6 +1080,8 @@ def _perform_pooled(
                         segments_dir=segments_dir,
                         voice_ref_audio=ref_audio_path,
                         voice_ref_text=ref_text,
+                        instruct=(emotion_instruct if preset_voice_id else ""),
+                        preset_voice=preset_voice_id,
                         metadata={
                             "script_idx": script_idx,
                             "chunk_idx": i,
@@ -1064,11 +1123,11 @@ def cmd_cast(args):
     )
 
 
-def cmd_audition(args):
+def cmd_emote(args):
     from .utils import get_design_config
 
     config = get_design_config(args)
-    run_auditions(
+    run_emotes(
         Path(args.workdir),
         verbose=args.verbose,
         force=args.force,
@@ -1731,6 +1790,9 @@ def dramatize_book(
     redo_phase: str | None = None,
     retake: bool = False,
     callback: bool = False,
+    emotions: bool = False,
+    preset_voices: bool = False,
+    directed: bool = False,
 ) -> None:
     """run full dramatization pipeline."""
     before = dir_mtime(get_command_dir(workdir, "cast"))
@@ -1746,27 +1808,42 @@ def dramatize_book(
     )
     _step_if_changed(step, "cast", get_command_dir(workdir, "cast"), before)
 
-    from .introduce import run_introduce
+    from .audition import run_audition
 
-    before = dir_mtime(get_command_dir(workdir, "introduce"))
-    run_introduce(
-        workdir,
-        verbose=verbose,
-        force=force or redo_phase == "introduce",
-        config=design_config,
-        callback=callback,
-    )
-    _step_if_changed(step, "introduce", get_command_dir(workdir, "introduce"), before)
+    audition_config = design_config
+    if preset_voices:
+        from .config import DEFAULT_MODEL
+        from .tts_http import HTTPTTSConfig
+
+        audition_config = HTTPTTSConfig(
+            api_base=api_base or "",
+            model=DEFAULT_MODEL,
+        )
 
     before = dir_mtime(get_command_dir(workdir, "audition"))
-    run_auditions(
+    run_audition(
         workdir,
         verbose=verbose,
         force=force or redo_phase == "audition",
-        config=design_config,
+        config=audition_config,
         callback=callback,
+        preset_voices=preset_voices,
+        directed=directed,
     )
     _step_if_changed(step, "audition", get_command_dir(workdir, "audition"), before)
+
+    if emotions:
+        emote_config = audition_config if preset_voices else design_config
+        before = dir_mtime(get_command_dir(workdir, "emote"))
+        run_emotes(
+            workdir,
+            verbose=verbose,
+            force=force or redo_phase == "emote",
+            config=emote_config,
+            callback=callback,
+            preset_voices=preset_voices,
+        )
+        _step_if_changed(step, "emote", get_command_dir(workdir, "emote"), before)
 
     before = dir_mtime(get_command_dir(workdir, "script"))
     run_script_generation(

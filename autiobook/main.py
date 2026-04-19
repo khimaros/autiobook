@@ -139,17 +139,13 @@ def cmd_dramatize(args):
     clone_config = get_clone_config(args)
 
     step = getattr(args, "step", False)
-    phases = [
-        "extract",
-        "cast",
-        "introduce",
-        "audition",
-        "script",
-        "revise",
-        "perform",
-        "retake",
-        "export",
-    ]
+    emotions = getattr(args, "emotions", False)
+    preset_voices = getattr(args, "preset_voices", False)
+    directed = getattr(args, "directed", False)
+    phases = ["extract", "cast", "audition"]
+    if emotions:
+        phases.append("emote")
+    phases.extend(["script", "revise", "perform", "retake", "export"])
 
     # --strict rolls up all validation checks
     strict = getattr(args, "strict", False)
@@ -176,6 +172,9 @@ def cmd_dramatize(args):
             redo_phase=redo_phase,
             retake=retake,
             callback=callback,
+            emotions=emotions,
+            preset_voices=preset_voices,
+            directed=directed,
         )
 
     _run_pipeline(args, process_fn, "dramatize", phases=phases)
@@ -323,16 +322,16 @@ def _cmd_cast(args):
     cmd_cast(args)
 
 
-def _cmd_introduce(args):
-    from .introduce import cmd_introduce
-
-    cmd_introduce(args)
-
-
 def _cmd_audition(args):
-    from .dramatize import cmd_audition
+    from .audition import cmd_audition
 
     cmd_audition(args)
+
+
+def _cmd_emote(args):
+    from .dramatize import cmd_emote
+
+    cmd_emote(args)
 
 
 def _cmd_script(args):
@@ -420,7 +419,7 @@ def main():
                     ("--callback",),
                     {
                         "action": "store_true",
-                        "help": "validate introduce/audition wavs inline; re-audition bad takes",
+                        "help": "validate audition/emote wavs inline; re-emote bad takes",
                     },
                 ),
                 (
@@ -428,6 +427,30 @@ def main():
                     {
                         "action": "store_true",
                         "help": "enable all validation checks (--revise --retake --callback)",
+                    },
+                ),
+                (
+                    ("--emotions",),
+                    {
+                        "action": "store_true",
+                        "help": "also run the emote phase (per-emotion voice variants); "
+                        "disabled by default",
+                    },
+                ),
+                (
+                    ("--preset-voices",),
+                    {
+                        "action": "store_true",
+                        "help": "use preset backend voices for audition; perform then "
+                        "uses voice ids + emotion instructions (no cloning)",
+                    },
+                ),
+                (
+                    ("--directed",),
+                    {
+                        "action": "store_true",
+                        "help": "interactive casting loop during audition "
+                        "(combine with --preset-voices)",
                     },
                 ),
             ],
@@ -449,8 +472,8 @@ def main():
                 (("--description",), {"help": "voice description (prompt)"}),
             ],
         ),
-        "introduce": (
-            _cmd_introduce,
+        "audition": (
+            _cmd_audition,
             "generate per-character base voice (description only)",
             [("tts_engine",), ("cast",), ("runtime",)],
             [
@@ -463,13 +486,28 @@ def main():
                     ("--callback",),
                     {
                         "action": "store_true",
-                        "help": "validate new voice wavs inline and re-audition bad takes",
+                        "help": "validate new voice wavs inline and re-emote bad takes",
+                    },
+                ),
+                (
+                    ("--preset-voices",),
+                    {
+                        "action": "store_true",
+                        "help": "use preset voices from the http backend (requires --api-base)",
+                    },
+                ),
+                (
+                    ("--directed",),
+                    {
+                        "action": "store_true",
+                        "help": "interactive casting loop: audition voices and pick one "
+                        "per character (combine with --preset-voices)",
                     },
                 ),
             ],
         ),
-        "audition": (
-            _cmd_audition,
+        "emote": (
+            _cmd_emote,
             "generate per-emotion voice variants for each character",
             [("tts_engine",), ("cast",), ("runtime",)],
             [
@@ -482,14 +520,14 @@ def main():
                     ("--callback",),
                     {
                         "action": "store_true",
-                        "help": "validate new voice wavs inline and re-audition bad takes",
+                        "help": "validate new voice wavs inline and re-emote bad takes",
                     },
                 ),
             ],
         ),
         "callback": (
             _cmd_callback,
-            "review and re-audition corrupted introduce/audition wavs",
+            "review and re-emote corrupted audition/emote wavs",
             [("tts_engine",), ("cast",), ("runtime",)],
             [
                 (("workdir",), {"help": "path to workdir"}),

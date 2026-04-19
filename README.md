@@ -102,10 +102,10 @@ autiobook extract book.epub -o workdir/
 autiobook cast workdir/ --api-key sk-...
 
 # 3. generate base voice per character (review/edit characters.json first if needed)
-autiobook introduce workdir/
+autiobook audition workdir/
 
 # 4. generate per-emotion voice variants
-autiobook audition workdir/
+autiobook emote workdir/
 
 # 5. create dramatized script (using llm)
 autiobook script workdir/ --api-key sk-...
@@ -153,7 +153,7 @@ autiobook revise workdir/ --prune
 
 ### voice and segment quality checks
 
-- `callback` scans `introduce/` and `audition/` wavs for silent/clipped/noisy
+- `callback` scans `audition/` and `emote/` wavs for silent/clipped/noisy
   takes and re-generates them with a bumped seed.
 - `retake` does the same for `perform/` and `synthesize/` segments.
 - `locate` looks up which segment wav backs a given audio time position
@@ -218,10 +218,10 @@ workdir/
 ├── cast/                  # character list and analysis state
 │   ├── characters.json
 │   └── state.json
-├── introduce/             # per-character base voices (description only)
+├── audition/              # per-character base voices (description only)
 │   ├── Character.wav
 │   └── state.json
-├── audition/              # per-emotion voice variants
+├── emote/                 # per-emotion voice variants
 │   ├── Character__neutral.wav
 │   ├── Character__happy.wav
 │   ├── ...
