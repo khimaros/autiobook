@@ -75,7 +75,9 @@ class ResumeManager:
         self.force = force
 
     @classmethod
-    def for_command(cls, workdir: Path, command: str, force: bool = False) -> "ResumeManager":
+    def for_command(
+        cls, workdir: Path, command: str, force: bool = False
+    ) -> "ResumeManager":
         """create a resume manager for a specific command."""
         state_path = get_command_dir(workdir, command) / STATE_FILE
         return cls(state_path, force=force)
@@ -85,11 +87,17 @@ class ResumeManager:
         if self.force:
             return False
         val = self.state.get(str(key))
-        return isinstance(val, dict) and val.get("hash") == current_hash and val.get("done", False)
+        return (
+            isinstance(val, dict)
+            and val.get("hash") == current_hash
+            and val.get("done", False)
+        )
 
-    def update(self, key: str, current_hash: str):
-        """mark key as fully complete."""
-        self.state[str(key)] = {"hash": current_hash, "done": True}
+    def update(self, key: str, current_hash: str, **extra: Any):
+        """mark key as fully complete. extra kwargs are stored alongside."""
+        entry: Dict[str, Any] = {"hash": current_hash, "done": True}
+        entry.update(extra)
+        self.state[str(key)] = entry
         self.dirty = True
 
     def get_partial(self, key: str) -> Dict[str, Any] | None:

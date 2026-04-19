@@ -16,7 +16,9 @@ def run_design(
     """add a new character to the cast or update existing one."""
     cast = load_cast(workdir)
     cast_map = {c.name.lower(): c for c in cast}
-    alias_map = {a.lower(): c.name.lower() for c in cast if c.aliases for a in c.aliases}
+    alias_map = {
+        a.lower(): c.name.lower() for c in cast if c.aliases for a in c.aliases
+    }
 
     # default values if not provided (though args are required in CLI)
     new_char = Character(

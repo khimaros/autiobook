@@ -9,14 +9,12 @@ description = "convert epub files to audiobooks using qwen3-tts"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "qwen-tts>=0.0.4",
     "ebooklib>=0.18",
     "beautifulsoup4>=4.12",
     "pydub>=0.25",
     "soundfile>=0.12",
     "lxml>=5.0",
     "tqdm>=4.66",
-    "litellm>=1.40.0",
     "python-dotenv>=1.0.0",
     "mutagen>=1.47",
 ]
@@ -30,15 +28,21 @@ dev = [
     "ruff>=0.4",
     "mypy>=1.10",
 ]
+local = [
+    "qwen-tts>=0.0.4",
+]
 cpu = [
+    "autiobook[local]",
     "torch",
     "torchaudio",
 ]
 gpu = [
+    "autiobook[local]",
     "torch",
     "torchaudio",
 ]
 rocm-gfx1151 = [
+    "autiobook[local]",
     "torch",
     "torchaudio",
     "pytorch-triton-rocm",
@@ -109,3 +113,12 @@ select = ["E", "F", "W", "I"]
 python_version = "3.12"
 warn_return_any = true
 warn_unused_configs = true
+
+[[tool.mypy.overrides]]
+module = [
+    "torch",
+    "torch.*",
+    "huggingface_hub",
+    "qwen_tts",
+]
+ignore_missing_imports = true

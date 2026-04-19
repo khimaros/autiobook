@@ -8,20 +8,24 @@ convert epub files to audiobooks using qwen3-tts.
 - ffmpeg
 - sox
 - uv (python package manager)
-- gpu recommended (cuda or rocm)
+- gpu recommended (cuda or rocm) if running tts locally
+- or an openai-compatible tts endpoint (no local gpu required)
 
 ## installation
 
 ```bash
-# cuda gpu (default)
+# cuda gpu (default, includes local tts)
 make build-cuda
 
-# amd rocm gpu (gfx1151)
+# amd rocm gpu (gfx1151, includes local tts)
 make build-rocm
 
-# cpu only
+# cpu only (includes local tts)
 make build-cpu
 ```
+
+local tts extras are optional. to drive an openai-compatible tts endpoint
+instead, install without the `[local]` extra and set `--api-base` / `OPENAI_BASE_URL`.
 
 ## usage
 
@@ -65,7 +69,7 @@ creates:
 convert text files to wav audio.
 
 ```
-autiobook synthesize workdir/ -s Ryan
+autiobook synthesize workdir/ -s ryan
 ```
 
 creates:
@@ -87,7 +91,7 @@ creates:
 
 ### dramatized conversion (llm)
 
-generate a full cast performance using openai-compatible llm
+generate a full cast performance using an openai-compatible llm
 (including llama.cpp) and voice cloning.
 
 ```bash
@@ -97,17 +101,17 @@ autiobook extract book.epub -o workdir/
 # 2. generate cast list (using llm)
 autiobook cast workdir/ --api-key sk-...
 
-# 3. generate voice auditions (review/edit characters.json first if needed)
+# 3. generate base voice per character (review/edit characters.json first if needed)
+autiobook introduce workdir/
+
+# 4. generate per-emotion voice variants
 autiobook audition workdir/
 
-# 4. create dramatized script (using llm)
+# 5. create dramatized script (using llm)
 autiobook script workdir/ --api-key sk-...
 
-# 5. validate script against source (optional)
-autiobook validate workdir/
-
-# 6. fix any issues found (optional)
-autiobook fix workdir/ --api-key sk-...
+# 6. review and repair script (optional; --dry-run to only report)
+autiobook revise workdir/ --api-key sk-...
 
 # 7. perform the script (voice cloning)
 autiobook perform workdir/
@@ -119,48 +123,65 @@ autiobook export workdir/
 or run the full dramatization pipeline in one go:
 
 ```bash
-autiobook dramatize workdir/ --api-key sk-...
+autiobook dramatize book.epub --api-key sk-...
+
+# pause after each phase for examination
+autiobook dramatize book.epub --step
+
+# re-run the last completed phase
+autiobook dramatize book.epub --redo
+
+# enable all inline quality checks (script revise + voice/segment retake)
+autiobook dramatize book.epub --strict
 ```
 
-### script validation and repair
+### script revision
 
-after generating scripts, you can validate that all source text is covered
-and detect any hallucinated content:
+after generating scripts, `revise` reviews them against the source text,
+detecting missing or hallucinated segments and repairing them via llm:
 
 ```bash
-# check for both missing text and hallucinated segments
-autiobook validate workdir/
+# review and repair: fill missing text, remove hallucinated segments
+autiobook revise workdir/ --api-key sk-...
 
-# check only for missing text
-autiobook validate workdir/ --missing
+# only review; don't modify scripts
+autiobook revise workdir/ --dry-run
 
-# check only for hallucinated segments
-autiobook validate workdir/ --hallucinated
+# local cleanup only: strip hallucinations, skip the llm fix-missing pass
+autiobook revise workdir/ --prune
 ```
 
-to fix issues found during validation:
+### voice and segment quality checks
+
+- `callback` scans `introduce/` and `audition/` wavs for silent/clipped/noisy
+  takes and re-generates them with a bumped seed.
+- `retake` does the same for `perform/` and `synthesize/` segments.
+- `locate` looks up which segment wav backs a given audio time position
+  (useful for debugging a glitch you heard in the output).
 
 ```bash
-# fill missing text and remove hallucinated segments
-autiobook fix workdir/ --api-key sk-...
-
-# only fill missing text (uses LLM with surrounding context)
-autiobook fix workdir/ --missing --api-key sk-...
-
-# only remove hallucinated segments (no LLM needed)
-autiobook fix workdir/ --hallucinated
-
-# control context amount for LLM (characters or paragraphs)
-autiobook fix workdir/ --missing --context-chars 1000 --api-key sk-...
-autiobook fix workdir/ --missing --context-paragraphs 3 --api-key sk-...
+autiobook callback workdir/
+autiobook retake workdir/
+autiobook locate workdir/perform/NN_Title.wav 00:12:34
 ```
 
 ### options
 
-- `-o, --output DIR` - output directory
-- `-s, --speaker NAME` - tts voice (default: Ryan)
+- `-o, --output DIR` - workdir for intermediate files (default: `<epub>_output/`)
+- `-s, --voice NAME` - tts voice for `synthesize` (default: ryan)
 - `-c, --chapters RANGE` - chapter selection (e.g., 1-5, 3,7,10)
+- `--tts-model`, `--tts-design-model`, `--tts-clone-model` - override tts models
+- `--api-base`, `--api-key` - openai-compatible endpoint (defaults to `$OPENAI_BASE_URL` / `$OPENAI_API_KEY`)
+- `--llm-model` - llm model name
+- `--m4b` - export as a single m4b with chapter markers
 - `-v, --verbose` - verbose output
+- `-f, --force` - ignore resume state
+
+environment variables (also loadable from `.env`; see `.env.example`):
+`OPENAI_API_KEY`, `OPENAI_BASE_URL`, `AUTIOBOOK_LLM_MODEL`,
+`AUTIOBOOK_TTS_CLONE_MODEL`, `AUTIOBOOK_TTS_INSTRUCT_MODEL`,
+`AUTIOBOOK_TTS_DESIGN_MODEL`, `AUTIOBOOK_SEED`,
+`AUTIOBOOK_LLM_THINKING_BUDGET`, `AUTIOBOOK_CAST_BATCH_SIZE`.
 
 ### available voices
 
@@ -168,7 +189,8 @@ Vivian, Ryan, Sunny, Aria, Bella, Nova, Echo, Finn, Atlas
 
 ## output
 
-creates one mp3 file per chapter in `workdir/export/`:
+creates one mp3 file per chapter in `workdir/export/` (or a single `.m4b`
+with chapter markers when `--m4b` is passed):
 
 ```
 workdir/export/
@@ -176,6 +198,9 @@ workdir/export/
 ├── 02_Chapter_One.mp3
 └── ...
 ```
+
+`perform/` and `synthesize/` also emit `.srt` and `.vtt` subtitles alongside
+each chapter wav (with speaker labels for dramatized output).
 
 compatible with the [Voice](https://github.com/PaulWoitaschek/Voice) audiobook player for android.
 
@@ -193,18 +218,29 @@ workdir/
 ├── cast/                  # character list and analysis state
 │   ├── characters.json
 │   └── state.json
-├── audition/              # character voice samples
+├── introduce/             # per-character base voices (description only)
 │   ├── Character.wav
+│   └── state.json
+├── audition/              # per-emotion voice variants
+│   ├── Character__neutral.wav
+│   ├── Character__happy.wav
+│   ├── ...
 │   └── state.json
 ├── script/                # dramatized scripts (speaker segments)
 │   ├── NN_Title.json
 │   └── state.json
 ├── perform/               # dramatized audio performance
 │   ├── NN_Title.wav
+│   ├── NN_Title.wav.timing.json  # per-chunk start/end offsets + metadata
+│   ├── NN_Title.srt       # subtitles (with speaker labels)
+│   ├── NN_Title.vtt       # webvtt subtitles
 │   ├── segments/          # segment cache
 │   └── state.json
 ├── synthesize/            # standard mono-voice audio
 │   ├── NN_Title.wav
+│   ├── NN_Title.wav.timing.json
+│   ├── NN_Title.srt
+│   ├── NN_Title.vtt
 │   ├── segments/          # segment cache
 │   └── state.json
 └── export/                # final mp3 output

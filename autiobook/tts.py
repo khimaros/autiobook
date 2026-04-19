@@ -1,24 +1,21 @@
 """tts engine wrapper for qwen3-tts with rocm optimizations."""
 
+from __future__ import annotations
+
 import os
-import re
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, List, cast
+from typing import Any, cast
 
 import numpy as np
 import soundfile as sf  # type: ignore
-import torch
-import transformers  # type: ignore
 from tqdm import tqdm  # type: ignore
 
-from .audio import (
-    concatenate_audio,
-    get_segments_dir,
-)
+from .audio import concatenate_audio, get_segments_dir
 from .config import (
     DEFAULT_MODEL,
+    DEFAULT_SEED,
     DEFAULT_SPEAKER,
     MAX_CHUNK_SIZE,
     PARAGRAPH_PAUSE_MS,
@@ -29,17 +26,33 @@ from .config import (
 from .epub import load_metadata
 from .pooling import AudioTask, process_audio_pipeline
 from .resume import ResumeManager, compute_hash, get_command_dir, list_chapters
+from .utils import chunk_text  # re-exported for backwards compat
 
-transformers.logging.set_verbosity_error()
+try:
+    import torch
+    import transformers  # type: ignore
 
-SENTENCE_ENDINGS = re.compile(r"(?<=[.!?])\s+")
+    transformers.logging.set_verbosity_error()
+    _HAS_LOCAL = True
+except ModuleNotFoundError:
+    _HAS_LOCAL = False
 
 # warmup text for model compilation
 WARMUP_TEXT = "Hello, this is a warmup."
 
 
+def _require_local():
+    """raise a clear error if local tts dependencies are missing."""
+    if not _HAS_LOCAL:
+        raise RuntimeError(
+            "local tts dependencies not installed. install with: pip install autiobook[local]"
+        )
+
+
 def get_default_device() -> str:
     """get default device (cuda/rocm if available, else cpu)."""
+    if not _HAS_LOCAL:
+        return "cpu"
     has_cuda = torch.cuda.is_available()
     has_rocm = hasattr(torch.version, "hip") and torch.version.hip is not None
 
@@ -48,7 +61,9 @@ def get_default_device() -> str:
         if device_count > 0:
             device_type = "cuda"
         else:
-            print("WARNING: CUDA/ROCm libraries detected but no devices found. Fallback to CPU.")
+            print(
+                "WARNING: CUDA/ROCm libraries detected but no devices found. Fallback to CPU."
+            )
             device_type = "cpu"
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         device_type = "mps"
@@ -61,6 +76,8 @@ def get_default_device() -> str:
 
 def is_rocm() -> bool:
     """check if running on rocm."""
+    if not _HAS_LOCAL:
+        return False
     return hasattr(torch.version, "hip") and torch.version.hip is not None
 
 
@@ -92,14 +109,16 @@ class TTSConfig:
     compile_model: bool = False
     warmup: bool = True
     do_sample: bool = True
-    temperature: float = 0.9
+    temperature: float | None = None
     max_new_tokens: int = 2048
+    seed: int = DEFAULT_SEED
 
 
 class TTSEngine:
     """wrapper for qwen3-tts model with rocm optimizations."""
 
     def __init__(self, config: TTSConfig | None = None):
+        _require_local()
         setup_rocm_env()
         self.config = config or TTSConfig()
         self._model = None
@@ -123,7 +142,9 @@ class TTSEngine:
         dtype = torch.bfloat16 if is_cuda else torch.float32
         attn_impl = "sdpa" if is_rocm() or not is_cuda else "flash_attention_2"
 
-        print(f"loading {self.config.model_name} on {self.config.device} ({dtype}, {attn_impl})...")
+        print(
+            f"loading {self.config.model_name} on {self.config.device} ({dtype}, {attn_impl})..."
+        )
         self._model = Qwen3TTSModel.from_pretrained(
             self.config.model_name,
             device_map=self.config.device,
@@ -170,9 +191,10 @@ class TTSEngine:
                 "language": self.config.language,
                 "non_streaming_mode": True,
                 "do_sample": self.config.do_sample,
-                "temperature": self.config.temperature,
             }
         )
+        if self.config.temperature is not None:
+            kwargs["temperature"] = self.config.temperature
 
         ctx: Any = nullcontext()
         if "cuda" in self.config.device and is_rocm():
@@ -189,6 +211,9 @@ class TTSEngine:
                 )
             except ImportError:
                 pass
+
+        if self.config.seed > 0:
+            torch.manual_seed(self.config.seed)
 
         with ctx, torch.inference_mode():
             return cast(tuple[Any, int], func(**kwargs))
@@ -299,94 +324,59 @@ class TTSEngine:
         )
 
 
-def chunk_text(text: str, max_size: int = MAX_CHUNK_SIZE) -> list[str]:
-    """split text into chunks at sentence boundaries, force-splitting if needed."""
-    sentences = SENTENCE_ENDINGS.split(text)
-
-    chunks = []
-    current_chunk: List[str] = []
-    current_length = 0
-
-    for sentence in sentences:
-        sentence = sentence.strip()
-        if not sentence:
-            continue
-
-        sentence_len = len(sentence)
-
-        # if current chunk + new sentence is too big, finish current chunk
-        if current_length + sentence_len > max_size and current_chunk:
-            chunks.append(" ".join(current_chunk))
-            current_chunk = []
-            current_length = 0
-
-        # if single sentence is still too big, force split it
-        if sentence_len > max_size:
-            # recursively chunk the long sentence by words or chars
-            # simple approach: split by commas or spaces
-            # for now, let's just hard split by space
-            words = sentence.split(" ")
-            current_word_chunk: List[str] = []
-            current_word_len = 0
-
-            for word in words:
-                word_len = len(word)
-                if current_word_len + word_len + 1 > max_size:
-                    chunks.append(" ".join(current_word_chunk))
-                    current_word_chunk = []
-                    current_word_len = 0
-                current_word_chunk.append(word)
-                current_word_len += word_len + 1
-
-            if current_word_chunk:
-                # add remainder to current_chunk flow
-                remainder = " ".join(current_word_chunk)
-                current_chunk.append(remainder)
-                current_length += len(remainder) + 1
-            continue
-
-        current_chunk.append(sentence)
-        current_length += sentence_len + 1
-
-    if current_chunk:
-        chunks.append(" ".join(current_chunk))
-
-    return chunks
-
-
 def synthesize_chapters(
     workdir: Path,
-    config: TTSConfig | None = None,
+    config: Any = None,
     chapters: list[int] | None = None,
     instruct: str = "",
     pooled: bool = False,
     force: bool = False,
+    retake: bool = False,
+    only_hashes: set[str] | None = None,
 ) -> None:
     """synthesize audio for chapters in workdir."""
+    from .tts_http import HTTPTTSConfig
+
+    if not isinstance(config, HTTPTTSConfig):
+        _require_local()
     extract_dir = get_command_dir(workdir, "extract")
     synth_dir = get_command_dir(workdir, "synthesize")
 
     # check if any source files exist
     if not any(extract_dir.glob(f"*{TXT_EXT}")):
-        print("synthesize: no text files found in extract/!")
-        return
+        msg = "synthesize: no text files found in extract/!"
+        print(msg)
+        raise RuntimeError(msg)
 
-    engine = TTSEngine(config)
+    from .utils import create_tts_engine
+
+    engine = create_tts_engine(config)
     metadata = load_metadata(workdir)
     pending = [
         (s, t)
-        for _, s, t in list_chapters(metadata, extract_dir, synth_dir, chapters_filter=chapters)
+        for _, s, t in list_chapters(
+            metadata, extract_dir, synth_dir, chapters_filter=chapters
+        )
     ]
 
     if not pending:
-        print("synthesize: no chapters to process.")
-        return
+        msg = "synthesize: no chapters to process."
+        print(msg)
+        raise RuntimeError(msg)
 
     # resume manager for assembly
     resume = ResumeManager.for_command(workdir, "synthesize", force=force)
 
     # pooled and single-chapter now use the same underlying segment-based logic
-    _perform_synthesis(engine, pending, instruct, resume=resume, force=force)
+    _perform_synthesis(
+        engine,
+        pending,
+        instruct,
+        resume=resume,
+        force=force,
+        retake=retake,
+        only_hashes=only_hashes,
+    )
 
 
 def _perform_synthesis(
@@ -395,6 +385,8 @@ def _perform_synthesis(
     instruct: str = "",
     resume: ResumeManager | None = None,
     force: bool = False,
+    retake: bool = False,
+    only_hashes: set[str] | None = None,
 ) -> None:
     """synthesize multiple chapters with pooled batching and segment caching."""
     chapter_data = []
@@ -406,15 +398,15 @@ def _perform_synthesis(
     # check if we should look for a voice
     voice_name = getattr(engine.config, "voice", None)
     if voice_name:
-        # check audition dir
-        audition_dir = get_command_dir(pending[0][0].parent.parent, "audition")
-        p = audition_dir / f"{voice_name}{WAV_EXT}"
+        # look in introduce/ for the per-character base voice
+        workdir = pending[0][0].parent.parent
+        p = get_command_dir(workdir, "introduce") / f"{voice_name}{WAV_EXT}"
         if p.exists():
             voice_path = p
             # try to load cast to get text
             from .dramatize import load_cast
 
-            cast = load_cast(p.parent.parent)
+            cast = load_cast(workdir)
             char = next((c for c in cast if c.name == voice_name), None)
             if char:
                 voice_text = char.audition_line
@@ -446,5 +438,11 @@ def _perform_synthesis(
         chapter_data.append((wav_path, tasks))
 
     process_audio_pipeline(
-        engine, chapter_data, resume=resume, desc="synthesizing chapters", force=force
+        engine,
+        chapter_data,
+        resume=resume,
+        desc="synthesizing chapters",
+        force=force,
+        retake=retake,
+        only_hashes=only_hashes,
     )

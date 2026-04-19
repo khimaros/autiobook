@@ -5,7 +5,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, cast
+from typing import Any, List, Optional, cast
 
 import soundfile as sf  # type: ignore
 from tqdm import tqdm  # type: ignore
@@ -15,13 +15,18 @@ from .audio import (
 )
 from .config import (
     BASE_MODEL,
+    CAST_BATCH_SIZE,
     CAST_FILE,
     DEFAULT_CAST,
     DEFAULT_LLM_MODEL,
     DEFAULT_THINKING_BUDGET,
+    EMOTION_SEP,
+    RETAINED_SPEAKERS,
     SCRIPT_EXT,
     TXT_EXT,
+    VALIDATION_MAX_RETRIES,
     VOICE_DESIGN_MODEL,
+    VOICE_EMOTIONS,
     WAV_EXT,
 )
 from .epub import load_metadata
@@ -35,12 +40,11 @@ from .llm import (
 )
 from .pooling import AudioTask, process_audio_pipeline
 from .resume import ResumeManager, compute_hash, get_command_dir, list_chapters
-from .tts import (
-    TTSConfig,
-    TTSEngine,
-    chunk_text,
-)
-from .utils import get_chapters, get_tts_config
+from .utils import chunk_text, create_tts_engine, dir_mtime, get_chapters
+
+
+class ValidationError(RuntimeError):
+    """validation failed for script generation."""
 
 
 def save_cast(workdir: Path, cast: List[Character]) -> None:
@@ -176,36 +180,53 @@ def _merge_character_into_cast(
     existing, merge_source = _find_existing_character(c, cast_map, alias_map)
 
     if existing:
-        updates = []
-        new_aliases = set(existing.aliases or [])
+        diff_parts: list[str] = []
+        # exclude canonical name from alias comparison — the LLM sometimes emits
+        # the canonical name as its own alias, which is cleanup noise, not a diff.
+        canon_low = existing.name.casefold()
+        old_aliases = {a for a in (existing.aliases or []) if a.casefold() != canon_low}
+        new_aliases = set(old_aliases)
         if c.aliases:
-            new_aliases.update(c.aliases)
-        if merge_source:
+            new_aliases.update(a for a in c.aliases if a.casefold() != canon_low)
+        if merge_source and merge_source.casefold() != canon_low:
             new_aliases.add(merge_source)
-            new_aliases.discard(existing.name)
 
-        sorted_aliases = sorted(new_aliases) if new_aliases else None
-        if sorted_aliases != existing.aliases:
-            existing.aliases = sorted_aliases
-            updates.append("aliases")
+        added_aliases = sorted(new_aliases - old_aliases)
+        if new_aliases != set(existing.aliases or []):
+            existing.aliases = sorted(new_aliases) if new_aliases else None
+        if added_aliases:
+            diff_parts.append("+aliases: " + ", ".join(repr(a) for a in added_aliases))
 
         if c.description and c.description != existing.description:
+            diff_parts.append(
+                f"description: {existing.description!r} -> {c.description!r}"
+            )
             existing.description = c.description
-            updates.append("description")
 
-        if verbose and updates:
-            msg = f"  {'merged' if merge_source else 'updated'} '{existing.name}'"
-            print(f"{msg} ({', '.join(updates)})")
+        if verbose and diff_parts:
+            label = "merged" if merge_source else "updated"
+            print(f"  {label} '{existing.name}':")
+            for part in diff_parts:
+                print(f"    {part}")
 
-        return "merged" if merge_source else ("updated" if updates else "unchanged")
+        return "merged" if merge_source else ("updated" if diff_parts else "unchanged")
 
-    # new character
+    # new character: drop any aliases that duplicate the canonical name
+    canon_low = c.name.casefold()
+    clean_aliases = (
+        [a for a in c.aliases if a.casefold() != canon_low] if c.aliases else []
+    )
+    c.aliases = clean_aliases or None
     if verbose:
-        print(f"  added new character: '{c.name}'")
+        alias_str = (
+            f" (aliases: {', '.join(repr(a) for a in clean_aliases)})"
+            if clean_aliases
+            else ""
+        )
+        print(f"  added new character: '{c.name}'{alias_str}")
     cast_map[c.name.lower()] = c
-    if c.aliases:
-        for alias in c.aliases:
-            alias_map[alias.lower()] = c.name.lower()
+    for alias in clean_aliases:
+        alias_map[alias.lower()] = c.name.lower()
     return "added"
 
 
@@ -249,7 +270,7 @@ def _process_cast_batch(
     for num in batch_chapters:
         txt_path = chapter_map[num]
         full_sample += f"\n--- Chapter {txt_path.stem} ---\n"
-        full_sample += txt_path.read_text(encoding="utf-8")[:2000]
+        full_sample += txt_path.read_text(encoding="utf-8")
 
     # format current cast for context
     current_cast = list(cast_map.values())
@@ -319,9 +340,11 @@ def run_cast_generation(
     print(f"cast: analyzing {len(chapters_to_process)} chapters...")
 
     cast_map = {c.name.lower(): c for c in existing_cast}
-    alias_map = {a.lower(): c.name.lower() for c in existing_cast if c.aliases for a in c.aliases}
+    alias_map = {
+        a.lower(): c.name.lower() for c in existing_cast if c.aliases for a in c.aliases
+    }
 
-    batch_size = 3
+    batch_size = CAST_BATCH_SIZE
     for batch_start in range(0, len(chapters_to_process), batch_size):
         batch_chapters = chapters_to_process[batch_start : batch_start + batch_size]
         print(
@@ -355,20 +378,39 @@ def run_cast_generation(
     return list(cast_map.values())
 
 
+def _audition_tasks(
+    char: Character,
+    audition_line: str | None,
+) -> list[tuple[str, str, str, str]]:
+    """build (filename_base, resume_key, text, instruct) for each emotion variant."""
+    tasks = []
+    for emotion, (emotion_instruct, sample_line) in VOICE_EMOTIONS.items():
+        filename = f"{char.name}{EMOTION_SEP}{emotion}"
+        resume_key = f"{char.name}/{emotion}"
+        instruct = f"{char.description}; {emotion_instruct}"
+        text = audition_line or sample_line
+        tasks.append((filename, resume_key, text, instruct))
+    return tasks
+
+
 def run_auditions(
     workdir: Path,
     cast: List[Character] | None = None,
     verbose: bool = False,
     force: bool = False,
     audition_line: str | None = None,
+    config: Any = None,
+    callback: bool = False,
 ) -> None:
-    """generate voice samples for cast."""
+    """generate voice samples for cast with emotion variants."""
 
     if cast is None:
         cast = load_cast(workdir)
 
     voices_dir = get_command_dir(workdir, "audition")
     resume = ResumeManager.for_command(workdir, "audition", force=force)
+
+    from .introduce import recorded_seed
 
     if not cast:
         cast_path = get_command_dir(workdir, "cast") / CAST_FILE
@@ -379,52 +421,235 @@ def run_auditions(
         return
 
     if len(cast) <= 3 and cast[0].name == "Narrator":
-        print("warning: using default cast (Narrator + Extras). run 'cast' to generate full cast.")
+        print(
+            "warning: using default cast (Narrator + Extras). "
+            "run 'cast' to generate full cast."
+        )
 
-    engine = TTSEngine(TTSConfig(model_name=VOICE_DESIGN_MODEL))
+    if config is None:
+        from .tts import TTSConfig
 
-    print(f"generating auditions for {len(cast)} characters...")
+        config = TTSConfig(model_name=VOICE_DESIGN_MODEL)
+    engine = create_tts_engine(config)
+
+    print(
+        f"generating auditions for {len(cast)} characters "
+        f"({len(VOICE_EMOTIONS)} emotions each)..."
+    )
 
     generated_count = 0
     skipped_count = 0
 
     for char in tqdm(cast, desc="casting voices"):
-        wav_path = voices_dir / f"{char.name}{WAV_EXT}"
+        tasks = _audition_tasks(char, audition_line)
 
-        # use override line if provided, otherwise per-character line
-        line = audition_line if audition_line else char.audition_line
+        # reuse the per-character seed recorded by introduce so all of a
+        # character's ref clips (base + emotion variants) ride the same
+        # trajectory. a changed introduce seed forces re-audition via the hash.
+        intro_seed = recorded_seed(workdir, char.name)
+        if intro_seed > 0:
+            engine.config.seed = intro_seed
 
-        # input data for this character's voice
-        char_data = {
-            "name": char.name,
-            "description": char.description,
-            "audition_line": line,
-        }
-        char_hash = compute_hash(char_data)
+        for filename, resume_key, text, instruct in tasks:
+            wav_path = voices_dir / f"{filename}{WAV_EXT}"
 
-        if not force and wav_path.exists() and resume.is_fresh(char.name, char_hash):
-            skipped_count += 1
+            task_data = {
+                "name": char.name,
+                "description": char.description,
+                "text": text,
+                "instruct": instruct,
+                "introduce_seed": intro_seed,
+            }
+            task_hash = compute_hash(task_data)
+
+            if (
+                not force
+                and wav_path.exists()
+                and resume.is_fresh(resume_key, task_hash)
+            ):
+                skipped_count += 1
+                continue
+
             if verbose:
-                tqdm.write(f"  skipping {char.name} (up to date)")
-            continue
+                tqdm.write(f"  {resume_key}: '{text[:60]}'")
 
-        if verbose:
-            tqdm.write(f"  generating {char.name}: '{line}'")
+            try:
+                if callback:
+                    from .callback import generate_with_callback
+                    from .retake import get_reject_dir
 
-        try:
-            audio, sr = engine.design_voice(text=line, instruct=char.description)
-            sf.write(str(wav_path), audio, sr)
-            resume.update(char.name, char_hash)
-            resume.save()
-            generated_count += 1
-        except Exception as e:
-            print(f"failed to generate voice for {char.name}: {e}")
+                    character, _, emotion = resume_key.partition("/")
+                    audio, sr = generate_with_callback(
+                        lambda: engine.design_voice(text=text, instruct=instruct),
+                        engine,
+                        label=resume_key,
+                        verbose=verbose,
+                        reject_dir=get_reject_dir(workdir, "audition"),
+                        metadata={
+                            "phase": "audition",
+                            "character": character,
+                            "emotion": emotion,
+                            "text": text,
+                            "instruct": instruct,
+                        },
+                    )
+                else:
+                    audio, sr = engine.design_voice(text=text, instruct=instruct)
+                sf.write(str(wav_path), audio, sr)
+                from .audio import wav_sha256
+
+                character, _, emotion = resume_key.partition("/")
+                resume.update(
+                    resume_key,
+                    task_hash,
+                    character=character,
+                    emotion=emotion,
+                    prompt=instruct,
+                    audition_line=text,
+                    seed=int(getattr(config, "seed", 0) or 0),
+                    wav_sha256=wav_sha256(wav_path),
+                )
+                resume.save()
+                generated_count += 1
+            except Exception as e:
+                print(f"failed to generate {resume_key}: {e}")
+                raise
 
     resume.save()
     if generated_count == 0 and skipped_count > 0:
-        print("audition: all voices up to date.")
+        print(f"audition: all {skipped_count} samples up to date.")
     else:
         print(f"audition: {generated_count} generated, {skipped_count} skipped")
+
+
+def _resolve_emotion(instruction: str) -> str:
+    """map a segment instruction to the closest known emotion key."""
+    if not instruction:
+        return "neutral"
+    key = instruction.strip().lower()
+    if key in VOICE_EMOTIONS:
+        return key
+    # fuzzy: check if any emotion key is a substring or vice versa
+    for emotion in VOICE_EMOTIONS:
+        if emotion in key or key in emotion:
+            return emotion
+    return "neutral"
+
+
+def _format_segments_for_log(segments: List[ScriptSegment]) -> str:
+    """format segments for logging."""
+    lines = []
+    for i, seg in enumerate(segments):
+        lines.append(f"[{i}] {seg.speaker}: {seg.text}")
+        if seg.instruction:
+            lines.append(f"     instruction: {seg.instruction}")
+    return "\n".join(lines)
+
+
+def process_script_chunk_with_validation(
+    text_chunk: str,
+    characters_list: List[Character],
+    api_base: Optional[str] = None,
+    api_key: Optional[str] = None,
+    model: str = DEFAULT_LLM_MODEL,
+    thinking_budget: int = DEFAULT_THINKING_BUDGET,
+    verbose: bool = False,
+) -> List[ScriptSegment]:
+    """convert text chunk to script segments with iterative validation/fixing."""
+    from .utils import log
+
+    segments = process_script_chunk(
+        text_chunk,
+        characters_list,
+        api_base,
+        api_key,
+        model,
+        thinking_budget,
+    )
+
+    log(
+        "VALIDATION_START",
+        f"validating {len(segments)} segments",
+        {
+            "source_text": text_chunk,
+            "segments": _format_segments_for_log(segments),
+        },
+    )
+
+    total = VALIDATION_MAX_RETRIES + 1
+    for attempt in range(1, total):
+        result = validate_chunk(text_chunk, segments)
+        if not result.missing and not result.hallucinated:
+            log("VALIDATION_OK", f"passed on attempt {attempt}/{total}")
+            if attempt > 1:
+                print(f"    revise: attempt {attempt}/{total}: passed")
+            return segments
+
+        detail = format_validation_failure(result, segments, text_chunk)
+        log(
+            "VALIDATION_FAILED",
+            f"attempt {attempt}/{total}",
+            {
+                "missing_count": str(len(result.missing)),
+                "hallucinated_count": str(len(result.hallucinated)),
+                "details": detail,
+                "current_segments": _format_segments_for_log(segments),
+            },
+        )
+
+        print(
+            f"    revise: attempt {attempt}/{total}: "
+            f"{len(result.missing)} missing, "
+            f"{len(result.hallucinated)} hallucinated; fixing..."
+        )
+        for line in detail.split("\n"):
+            print(f"      {line}")
+
+        if result.hallucinated:
+            _remove_hallucinations(segments, result.hallucinated)
+            continue
+
+        if result.missing:
+            _fill_missing_fragments(
+                segments,
+                result.missing,
+                text_chunk,
+                characters_list,
+                api_base,
+                api_key,
+                model,
+                verbose,
+                thinking_budget,
+            )
+
+    # final validation
+    result = validate_chunk(text_chunk, segments)
+    if result.missing or result.hallucinated:
+        detail = format_validation_failure(result, segments, text_chunk)
+        log(
+            "VALIDATION_FINAL_FAILURE",
+            f"failed after {total} attempts",
+            {
+                "missing_count": str(len(result.missing)),
+                "hallucinated_count": str(len(result.hallucinated)),
+                "details": detail,
+                "final_segments": _format_segments_for_log(segments),
+                "source_text": text_chunk,
+            },
+        )
+        print(
+            f"    revise: attempt {total}/{total}: "
+            f"{len(result.missing)} missing, "
+            f"{len(result.hallucinated)} hallucinated; giving up"
+        )
+        for line in detail.split("\n"):
+            print(f"      {line}")
+        raise ValidationError(
+            f"validation failed after {VALIDATION_MAX_RETRIES} iterative fix attempts"
+        )
+
+    print(f"    revise: attempt {total}/{total}: passed")
+    return segments
 
 
 def run_script_generation(
@@ -436,9 +661,13 @@ def run_script_generation(
     verbose: bool = False,
     force: bool = False,
     thinking_budget: int = DEFAULT_THINKING_BUDGET,
+    revise: bool = False,
 ) -> bool:
-    """generate dramatized scripts for chapters incrementally."""
+    """generate dramatized scripts for chapters incrementally.
 
+    if revise=True, each chunk is reviewed against source text and
+    retried with feedback on validation failures.
+    """
     cast = load_cast(workdir)
     # Cast hash for dependency tracking
     # Only name and aliases affect the script generation prompt
@@ -458,10 +687,11 @@ def run_script_generation(
 
     if not cast:
         if (get_command_dir(workdir, "cast") / CAST_FILE).exists():
-            print("cast file found but contains no characters.")
+            msg = "cast file found but contains no characters."
         else:
-            print("no cast found. run 'cast' command first.")
-        return False
+            msg = "no cast found. run 'cast' command first."
+        print(msg)
+        raise RuntimeError(msg)
 
     # collect chapters to process
     txt_files = sorted(extract_dir.glob(f"*{TXT_EXT}"))
@@ -484,7 +714,11 @@ def run_script_generation(
 
         script_path = script_dir / (txt_path.stem + SCRIPT_EXT)
 
-        if not force and script_path.exists() and resume.is_fresh(str(chapter_num), input_hash):
+        if (
+            not force
+            and script_path.exists()
+            and resume.is_fresh(str(chapter_num), input_hash)
+        ):
             completed_count += 1
         else:
             to_process.append((chapter_num, txt_path, script_path, text, input_hash))
@@ -493,12 +727,16 @@ def run_script_generation(
         print(f"script: all {completed_count + len(to_process)} chapters up to date.")
         return True
 
-    print(f"script: {len(to_process)} chapters to process, {completed_count} already complete")
+    print(
+        f"script: {len(to_process)} chapters to process, {completed_count} already complete"
+    )
 
     total_segments = 0
     chapters_processed = 0
 
-    for i, (chapter_num, txt_path, script_path, text, input_hash) in enumerate(to_process):
+    for i, (chapter_num, txt_path, script_path, text, input_hash) in enumerate(
+        to_process
+    ):
         chunks = split_text_smart(text)
         total_chunks = len(chunks)
 
@@ -506,7 +744,12 @@ def run_script_generation(
         current_segments = []
         completed_chunks = 0
         partial = resume.get_partial(str(chapter_num))
-        if not force and partial and partial.get("hash") == input_hash and script_path.exists():
+        if (
+            not force
+            and partial
+            and partial.get("hash") == input_hash
+            and script_path.exists()
+        ):
             completed_chunks = partial.get("chunks_done", 0)
             current_segments = load_script(script_path)
 
@@ -515,7 +758,9 @@ def run_script_generation(
         else:
             status = "starting"
 
-        print(f"  [{i + 1}/{len(to_process)}] {txt_path.name}: {status} ({total_chunks} chunks)")
+        print(
+            f"  [{i + 1}/{len(to_process)}] {txt_path.name}: {status} ({total_chunks} chunks)"
+        )
 
         for j in tqdm(
             range(completed_chunks, total_chunks),
@@ -524,16 +769,27 @@ def run_script_generation(
             initial=completed_chunks,
             total=total_chunks,
         ):
-            chunk_text = chunks[j]
+            chunk_text_str = chunks[j]
             try:
-                chunk_segments = process_script_chunk(
-                    chunk_text,
-                    cast,
-                    api_base,
-                    api_key,
-                    model or DEFAULT_LLM_MODEL,
-                    thinking_budget,
-                )
+                if revise:
+                    chunk_segments = process_script_chunk_with_validation(
+                        chunk_text_str,
+                        cast,
+                        api_base,
+                        api_key,
+                        model or DEFAULT_LLM_MODEL,
+                        thinking_budget,
+                        verbose=verbose,
+                    )
+                else:
+                    chunk_segments = process_script_chunk(
+                        chunk_text_str,
+                        cast,
+                        api_base,
+                        api_key,
+                        model or DEFAULT_LLM_MODEL,
+                        thinking_budget,
+                    )
                 if verbose:
                     speakers = set(s.speaker for s in chunk_segments)
                     tqdm.write(
@@ -559,7 +815,7 @@ def run_script_generation(
                     import traceback
 
                     traceback.print_exc()
-                return False
+                raise
 
         # Mark as done (this also clears partial state)
         resume.update(str(chapter_num), input_hash)
@@ -577,20 +833,23 @@ def run_script_generation(
 def run_performance(
     workdir: Path,
     chapters: list[int] | None = None,
-    config: TTSConfig | None = None,
+    config: Any = None,
     pooled: bool = False,
     verbose: bool = False,
     force: bool = False,
+    retake: bool = False,
+    only_hashes: set[str] | None = None,
 ) -> None:
     """synthesize audio from scripts with segment-level resume."""
 
     cast = load_cast(workdir)
     if not cast:
         if (get_command_dir(workdir, "cast") / CAST_FILE).exists():
-            print("cast file found but contains no characters.")
+            msg = "cast file found but contains no characters."
         else:
-            print("no cast found. run 'cast' command first.")
-        return
+            msg = "no cast found. run 'cast' command first."
+        print(msg)
+        raise RuntimeError(msg)
 
     # build cast map including aliases
     cast_map = {}
@@ -605,23 +864,15 @@ def run_performance(
     perform_dir = get_command_dir(workdir, "perform")
 
     if not any(voices_dir.glob(f"*{WAV_EXT}")):
-        print("no voices found. run 'audition' command first.")
-        return
+        msg = "no voices found. run 'audition' command first."
+        print(msg)
+        raise RuntimeError(msg)
 
-    # use provided config but override model to BASE_MODEL for voice cloning
     if config is None:
+        from .tts import TTSConfig
+
         config = TTSConfig(model_name=BASE_MODEL)
-    else:
-        config = TTSConfig(
-            model_name=BASE_MODEL,
-            batch_size=config.batch_size,
-            chunk_size=config.chunk_size,
-            compile_model=config.compile_model,
-            warmup=config.warmup,
-            do_sample=config.do_sample,
-            temperature=config.temperature,
-        )
-    engine = TTSEngine(config)
+    engine = create_tts_engine(config)
 
     # Collect all pending chapters first
     metadata = load_metadata(workdir)
@@ -637,23 +888,37 @@ def run_performance(
         )
     ]
     if not pending:
-        print("perform: no scripts found.")
-        return
+        msg = "perform: no scripts found."
+        print(msg)
+        raise RuntimeError(msg)
 
     # resume manager for assembly
     resume = ResumeManager.for_command(workdir, "perform", force=force)
 
     # always use pooled strategy for best performance/caching
-    _perform_pooled(engine, pending, voices_dir, cast_map, resume=resume, force=force)
+    _perform_pooled(
+        engine,
+        pending,
+        voices_dir,
+        cast_map,
+        resume=resume,
+        force=force,
+        verbose=verbose,
+        retake=retake,
+        only_hashes=only_hashes,
+    )
 
 
 def _perform_pooled(
-    engine: TTSEngine,
+    engine: Any,
     pending: list[tuple[Path, Path]],
     voices_dir: Path,
     cast_map: dict[str, Character],
     resume: ResumeManager | None = None,
     force: bool = False,
+    verbose: bool = False,
+    retake: bool = False,
+    only_hashes: set[str] | None = None,
 ) -> None:
     """synthesize chapters using unified pooled batching and segment caching."""
     # Pre-calculate character hashes for stable identification
@@ -668,6 +933,19 @@ def _perform_pooled(
         for name, char in cast_map.items()
     }
 
+    introduce_dir = get_command_dir(voices_dir.parent, "introduce")
+
+    # load audition state so we can tie each perform chunk to the exact ref
+    # wav bytes that produced it: any regeneration of the audition (new seed,
+    # swapped file) changes this sha and invalidates cached perform segments.
+    audition_resume = ResumeManager.for_command(voices_dir.parent, "audition")
+    audition_shas: dict[tuple[str, str], str] = {}
+    for key, entry in audition_resume.state.items():
+        if isinstance(entry, dict) and "wav_sha256" in entry:
+            char_key, _, emo_key = key.partition("/")
+            if char_key and emo_key:
+                audition_shas[(char_key, emo_key)] = str(entry["wav_sha256"])
+
     chapter_data = []
     segments_dir = get_segments_dir(pending[0][1].parent)
 
@@ -677,23 +955,56 @@ def _perform_pooled(
             continue
 
         chapter_tasks = []
-        for segment in segments:
+        for script_idx, segment in enumerate(segments):
+            # skip retained segments (section markers, chapter numbers, etc.)
+            if segment.speaker in RETAINED_SPEAKERS:
+                continue
+
             char_opt = cast_map.get(segment.speaker) or cast_map.get("Narrator")
             char_name = char_opt.name if char_opt else ""
             char_hash = char_hashes.get(char_name, "")
 
-            ref_audio_path = voices_dir / f"{char_opt.name}{WAV_EXT}" if char_opt else None
-            ref_text = char_opt.audition_line if char_opt else None
+            # select emotion-variant audition clip
+            emotion = _resolve_emotion(segment.instruction)
+            emotion_file = (
+                f"{char_opt.name}{EMOTION_SEP}{emotion}{WAV_EXT}" if char_opt else None
+            )
+            ref_audio_path = voices_dir / emotion_file if emotion_file else None
+            # fall back to introduce base if emotion variant missing
+            used_introduce_base = False
+            if ref_audio_path and not ref_audio_path.exists() and char_opt:
+                ref_audio_path = introduce_dir / f"{char_opt.name}{WAV_EXT}"
+                used_introduce_base = True
+
+            # ref_text must match what's spoken in the reference clip
+            if used_introduce_base:
+                ref_text = char_opt.audition_line if char_opt else None
+            else:
+                _, ref_text_default = VOICE_EMOTIONS.get(emotion, ("", ""))
+                ref_text = ref_text_default or (
+                    char_opt.audition_line if char_opt else None
+                )
+
+            ref_wav_sha = audition_shas.get((char_name, emotion), "")
+            if not ref_wav_sha and ref_audio_path and ref_audio_path.exists():
+                from .audio import wav_sha256
+
+                ref_wav_sha = wav_sha256(ref_audio_path)
 
             seg_data = {
                 "text": segment.text,
                 "speaker": segment.speaker,
-                "instruction": segment.instruction,
+                "emotion": emotion,
                 "char_hash": char_hash,
+                "ref_wav_sha": ref_wav_sha,
             }
 
             text_chunks = (
-                [c for c in chunk_text(segment.text, engine.config.chunk_size) if c.strip()]
+                [
+                    c
+                    for c in chunk_text(segment.text, engine.config.chunk_size)
+                    if c.strip()
+                ]
                 if len(segment.text) > engine.config.chunk_size
                 else [segment.text]
             )
@@ -712,13 +1023,26 @@ def _perform_pooled(
                         segments_dir=segments_dir,
                         voice_ref_audio=ref_audio_path,
                         voice_ref_text=ref_text,
-                        instruct=segment.instruction or (char_opt.description if char_opt else ""),
+                        metadata={
+                            "script_idx": script_idx,
+                            "chunk_idx": i,
+                            "script_path": str(txt_path),
+                            "speaker": segment.speaker,
+                            "emotion": emotion,
+                        },
                     )
                 )
         chapter_data.append((wav_path, chapter_tasks))
 
     process_audio_pipeline(
-        engine, chapter_data, resume=resume, desc="performing segments", force=force
+        engine,
+        chapter_data,
+        resume=resume,
+        desc="performing segments",
+        force=force,
+        verbose=verbose,
+        retake=retake,
+        only_hashes=only_hashes,
     )
 
 
@@ -741,19 +1065,28 @@ def cmd_cast(args):
 
 
 def cmd_audition(args):
+    from .utils import get_design_config
+
+    config = get_design_config(args)
     run_auditions(
         Path(args.workdir),
         verbose=args.verbose,
         force=args.force,
         audition_line=getattr(args, "audition_line", None),
+        config=config,
+        callback=getattr(args, "callback", False),
     )
 
 
 def cmd_script(args):
+    from .utils import Logger
+
     chapters = get_chapters(args)
+    workdir = Path(args.workdir)
+    Logger.init(workdir)
 
     run_script_generation(
-        Path(args.workdir),
+        workdir,
         api_base=args.api_base,
         api_key=args.api_key,
         model=args.model,
@@ -761,12 +1094,15 @@ def cmd_script(args):
         verbose=args.verbose,
         force=args.force,
         thinking_budget=args.thinking_budget,
+        revise=getattr(args, "revise", False),
     )
 
 
 def cmd_perform(args):
+    from .utils import get_clone_config
+
     chapters = get_chapters(args)
-    config = get_tts_config(args)
+    config = get_clone_config(args)
 
     run_performance(
         Path(args.workdir),
@@ -775,6 +1111,7 @@ def cmd_perform(args):
         args.pooled,
         verbose=args.verbose,
         force=args.force,
+        retake=getattr(args, "retake", False),
     )
 
 
@@ -801,7 +1138,9 @@ def _tokenize_with_positions(text: str) -> List[tuple[str, int, int]]:
     return tokens
 
 
-def _find_text_in_source(needle: str, haystack: str, start_pos: int = 0) -> tuple[int, int] | None:
+def _find_text_in_source(
+    needle: str, haystack: str, start_pos: int = 0
+) -> tuple[int, int] | None:
     """find needle in haystack using token alignment.
 
     returns (start, end) positions in the original haystack, or None if not found.
@@ -818,7 +1157,9 @@ def _find_text_in_source(needle: str, haystack: str, start_pos: int = 0) -> tupl
         return None
     haystack_words = [t[0] for t in haystack_tokens]
 
-    matcher = difflib.SequenceMatcher(None, needle_words, haystack_words, autojunk=False)
+    matcher = difflib.SequenceMatcher(
+        None, needle_words, haystack_words, autojunk=False
+    )
     # find the best match for the needle words in the haystack
     match = matcher.find_longest_match(0, len(needle_words), 0, len(haystack_words))
 
@@ -835,61 +1176,58 @@ def _find_text_in_source(needle: str, haystack: str, start_pos: int = 0) -> tupl
 class ValidationResult:
     """result of script validation for a chapter."""
 
-    missing: list[tuple[str, int, int]]  # (text, insertion_index, split_offset)
+    missing: list[
+        tuple[str, int, int, str]
+    ]  # (text, insertion_index, split_offset, full_line)
     hallucinated: list[int]  # indices of segments not found in source
 
 
-def validate_script(txt_path: Path, script_path: Path) -> ValidationResult:
-    """validate that script segments match the source text using fuzzy diffing.
+def validate_chunk(source_text: str, segments: List[ScriptSegment]) -> ValidationResult:
+    """validate that segments match source text for a single chunk.
 
-    uses difflib to align normalized words between source and script.
-    identifies missing text (source words not in script) and hallucinated
-    segments (segments with low word match ratio).
+    returns ValidationResult with missing text fragments and hallucinated segment indices.
     """
-    segments = load_script(script_path)
+    return _validate_segments(source_text, segments)
+
+
+def _validate_segments(
+    source_text: str, segments: List[ScriptSegment]
+) -> ValidationResult:
+    """core validation logic shared by validate_chunk and validate_script."""
     if not segments:
         return ValidationResult(
-            missing=[(f"no script found for {txt_path.name}", 0, 0)], hallucinated=[]
+            missing=[("no segments provided", 0, 0, "")], hallucinated=[]
         )
 
-    original_text = txt_path.read_text(encoding="utf-8")
-
-    # 1. Tokenize source and script
-    source_tokens = _tokenize_with_positions(original_text)
+    source_tokens = _tokenize_with_positions(source_text)
     source_words = [t[0] for t in source_tokens]
 
     script_words = []
     script_token_info = []  # (seg_idx, start, end)
-
     segment_stats = {}  # seg_idx -> {'total': 0, 'matched': 0}
 
     for i, seg in enumerate(segments):
-        # use the same tokenizer for segments
         seg_tokens = _tokenize_with_positions(seg.text)
         segment_stats[i] = {"total": len(seg_tokens), "matched": 0}
         for t in seg_tokens:
             script_words.append(t[0])
             script_token_info.append((i, t[1], t[2]))
 
-    # 2. Diff
     matcher = difflib.SequenceMatcher(None, source_words, script_words, autojunk=False)
     opcodes = matcher.get_opcodes()
 
-    missing_ranges = []  # list of (start_char, end_char, insertion_index, split_offset)
+    missing_ranges = []
 
     for tag, i1, i2, j1, j2 in opcodes:
         if tag == "equal":
-            # record matches for hallucination detection
             for j in range(j1, j2):
                 seg_idx = script_token_info[j][0]
                 segment_stats[seg_idx]["matched"] += 1
         elif tag in ("delete", "replace"):
-            # source words i1:i2 are missing (or replaced)
             if i1 < i2:
                 start_char = source_tokens[i1][1]
                 end_char = source_tokens[i2 - 1][2]
 
-                # determine insertion index based on script position j1
                 if j1 < len(script_words):
                     ins_idx, split_offset, _ = script_token_info[j1]
                 else:
@@ -898,25 +1236,18 @@ def validate_script(txt_path: Path, script_path: Path) -> ValidationResult:
 
                 missing_ranges.append((start_char, end_char, ins_idx, split_offset))
 
-    # 3. Merge contiguous missing ranges
+    # merge contiguous missing ranges
     missing_fragments = []
     if missing_ranges:
         missing_ranges.sort()
         merged = [missing_ranges[0]]
 
-        for current_start, current_end, current_ins, current_offset in missing_ranges[1:]:
+        for current_start, current_end, current_ins, current_offset in missing_ranges[
+            1:
+        ]:
             last_start, last_end, last_ins, last_offset = merged[-1]
+            gap_text = source_text[last_end:current_start]
 
-            # check gap between last_end and current_start
-            gap_text = original_text[last_end:current_start]
-
-            # merge if:
-            # 1. Same insertion index
-            # 2. Same split offset (or very close/sequential?)
-            #    Actually, if we merge, we keep the FIRST insertion point (last_ins, last_offset).
-            #    But we should only merge if the gap is just punctuation/whitespace.
-            #    And typically they will be at the same insertion point if they are
-            #    contiguous in source but skipped in script.
             if (
                 current_ins == last_ins
                 and current_offset == last_offset
@@ -927,29 +1258,110 @@ def validate_script(txt_path: Path, script_path: Path) -> ValidationResult:
                 merged.append((current_start, current_end, current_ins, current_offset))
 
         for start, end, ins_idx, split_offset in merged:
-            # expand to include adjacent punctuation but not whitespace
-            while start > 0 and original_text[start - 1] in ".,;:?!\"'()[]-":
+            while start > 0 and source_text[start - 1] in ".,;:?!\"'()[]-":
                 start -= 1
-            while end < len(original_text) and original_text[end] in ".,;:?!\"'()[]-":
+            while end < len(source_text) and source_text[end] in ".,;:?!\"'()[]-":
                 end += 1
 
-            text = original_text[start:end].strip()
-            # filter out tiny fragments
-            if len(text) > 1 or (len(text) == 1 and text.isalnum()):
-                missing_fragments.append((text, ins_idx, split_offset))
+            text = source_text[start:end].strip()
 
-    # 4. Identify hallucinated segments
+            line_start = source_text.rfind("\n", 0, start) + 1
+            line_end = source_text.find("\n", end)
+            if line_end == -1:
+                line_end = len(source_text)
+            full_line = source_text[line_start:line_end].strip()
+
+            if len(text) > 1 or (len(text) == 1 and text.isalnum()):
+                missing_fragments.append((text, ins_idx, split_offset, full_line))
+
+    # identify hallucinated segments
     hallucinated_indices = []
     for i in range(len(segments)):
         stats = segment_stats[i]
         if stats["total"] == 0:
             continue
-
         ratio = stats["matched"] / stats["total"]
-        if ratio < 0.5:  # less than 50% words matched
+        if ratio < 0.5:
             hallucinated_indices.append(i)
 
-    return ValidationResult(missing=missing_fragments, hallucinated=hallucinated_indices)
+    return ValidationResult(
+        missing=missing_fragments, hallucinated=hallucinated_indices
+    )
+
+
+def validate_script(txt_path: Path, script_path: Path) -> ValidationResult:
+    """validate that script segments match the source text using fuzzy diffing."""
+    segments = load_script(script_path)
+    if not segments:
+        return ValidationResult(
+            missing=[(f"no script found for {txt_path.name}", 0, 0, "")],
+            hallucinated=[],
+        )
+
+    original_text = txt_path.read_text(encoding="utf-8")
+    return _validate_segments(original_text, segments)
+
+
+def _truncate(text: str, max_len: int = 80) -> str:
+    """truncate text for display, adding ellipsis if needed."""
+    text = text.replace("\n", " ").strip()
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3] + "..."
+
+
+def format_validation_failure(
+    result: ValidationResult,
+    segments: List[ScriptSegment],
+    source_text: str,
+) -> str:
+    """format validation failures with detailed troubleshooting info."""
+    if not result.missing and not result.hallucinated:
+        return ""
+
+    lines = []
+
+    for i, (fragment, idx, offset, full_line) in enumerate(result.missing, 1):
+        lines.append(f'[missing #{i}] "{_truncate(fragment, 60)}"')
+        if full_line and full_line != fragment:
+            lines.append(f'  full line: "{_truncate(full_line, 70)}"')
+
+        # show insertion context
+        if idx == 0:
+            lines.append("  insert at: beginning of script")
+        elif idx >= len(segments):
+            if segments:
+                prev_seg = segments[-1]
+                lines.append(
+                    f"  insert after segment {len(segments) - 1}: "
+                    f'{prev_seg.speaker}: "{_truncate(prev_seg.text, 50)}"'
+                )
+            else:
+                lines.append("  insert at: end of empty script")
+        else:
+            prev_seg = segments[idx - 1]
+            next_seg = segments[idx]
+            lines.append(
+                f"  insert after segment {idx - 1}: "
+                f'{prev_seg.speaker}: "{_truncate(prev_seg.text, 50)}"'
+            )
+            lines.append(
+                f"  insert before segment {idx}: "
+                f'{next_seg.speaker}: "{_truncate(next_seg.text, 50)}"'
+            )
+
+        if offset > 0:
+            lines.append(f"  split offset: {offset} chars into segment {idx}")
+
+    for idx in result.hallucinated:
+        if idx < len(segments):
+            seg = segments[idx]
+            lines.append(
+                f'[hallucinated #{idx}] {seg.speaker}: "{_truncate(seg.text, 60)}"'
+            )
+            lines.append("  no matching text found in source")
+
+    return "\n".join(lines)
 
 
 def run_validation(
@@ -993,7 +1405,9 @@ def run_validation(
     total_missing = 0
     total_hallucinated = 0
 
-    for txt_path, script_path in tqdm(chapters_to_check, desc="validating", unit="chapter"):
+    for txt_path, script_path in tqdm(
+        chapters_to_check, desc="validating", unit="chapter"
+    ):
         result = validate_script(txt_path, script_path)
         results[txt_path.name] = result
 
@@ -1016,15 +1430,17 @@ def run_validation(
         if issues:
             print(f"\n{txt_path.name}: {', '.join(issues)}")
 
-            if check_missing:
-                for i, (fragment, idx, offset) in enumerate(result.missing, 1):
-                    print(f"  [missing {i} @ {idx}+{offset}] {fragment}")
-
-            if check_hallucinated:
-                segments = load_script(script_path)
-                for idx in result.hallucinated:
-                    seg = segments[idx]
-                    print(f"  [hallucinated {idx}] {seg.speaker}: {seg.text}")
+            # filter result based on what we're checking
+            filtered_result = ValidationResult(
+                missing=result.missing if check_missing else [],
+                hallucinated=result.hallucinated if check_hallucinated else [],
+            )
+            segments = load_script(script_path)
+            source_text = txt_path.read_text(encoding="utf-8")
+            detail = format_validation_failure(filtered_result, segments, source_text)
+            if detail:
+                for line in detail.split("\n"):
+                    print(f"  {line}")
         else:
             print(f"{txt_path.name}: OK")
 
@@ -1038,86 +1454,45 @@ def run_validation(
     if total_missing == 0 and total_hallucinated == 0:
         print(f"\nvalidate: all {len(results)} chapters OK")
     else:
-        print(f"\nvalidate: found {', '.join(summary_parts)} across {len(results)} chapters")
+        msg = (
+            f"validate: found {', '.join(summary_parts)} across {len(results)} chapters"
+        )
+        print(f"\n{msg}")
+        raise ValidationError(msg)
 
     return results
 
 
-def cmd_validate(args):
+def cmd_revise(args):
+    """review and repair scripts.
+
+    --dry-run: only report missing/hallucinated segments (validate).
+    otherwise: fix them via LLM and hallucination removal."""
+    from .utils import Logger
+
     chapters = get_chapters(args)
+    workdir = Path(args.workdir)
+    Logger.init(workdir)
 
-    # default to checking both if neither flag specified
-    check_missing = args.missing or (not args.missing and not args.hallucinated)
-    check_hallucinated = args.hallucinated or (not args.missing and not args.hallucinated)
+    if args.dry_run:
+        run_validation(workdir, chapters, True, True)
+        return
 
-    run_validation(Path(args.workdir), chapters, check_missing, check_hallucinated)
+    # --prune: do only the local destructive step (strip hallucinations),
+    # skip the expensive LLM fix-missing pass.
+    fix_missing = not getattr(args, "prune", False)
 
-
-DEFAULT_CONTEXT_CHARS = 500  # default characters of context before/after missing text
-DEFAULT_CONTEXT_PARAGRAPHS = 2  # default paragraphs of context before/after missing text
-
-
-def _extract_context(
-    original_text: str,
-    fragment: str,
-    context_chars: int | None = None,
-    context_paragraphs: int | None = None,
-) -> tuple[str, str]:
-    """extract context before and after a missing fragment.
-
-    if context_paragraphs is set, uses paragraph boundaries.
-    otherwise uses context_chars (default 500).
-
-    returns (context_before, context_after) as strings.
-    """
-    if context_paragraphs is not None:
-        return _extract_context_paragraphs(original_text, fragment, context_paragraphs)
-
-    # character-based extraction
-    original_norm = _normalize_text(original_text)
-    fragment_norm = _normalize_text(fragment)
-    chars = context_chars or DEFAULT_CONTEXT_CHARS
-
-    pos = original_norm.find(fragment_norm[:50])
-    if pos == -1:
-        return "", ""
-
-    start = max(0, pos - chars)
-    context_before = original_norm[start:pos].strip()
-
-    end_pos = pos + len(fragment_norm)
-    context_after = original_norm[end_pos : end_pos + chars].strip()
-
-    return context_before, context_after
-
-
-def _extract_context_paragraphs(
-    original_text: str, fragment: str, num_paragraphs: int
-) -> tuple[str, str]:
-    """extract context using paragraph boundaries."""
-    paragraphs = original_text.split("\n\n")
-    fragment_norm = _normalize_text(fragment)
-
-    # find which paragraph contains the start of the fragment
-    target_idx = None
-    for i, para in enumerate(paragraphs):
-        para_norm = _normalize_text(para)
-        if fragment_norm[:50] in para_norm:
-            target_idx = i
-            break
-
-    if target_idx is None:
-        return "", ""
-
-    # extract paragraphs before
-    start_idx = max(0, target_idx - num_paragraphs)
-    context_before = "\n\n".join(paragraphs[start_idx:target_idx])
-
-    # extract paragraphs after
-    end_idx = min(len(paragraphs), target_idx + num_paragraphs + 1)
-    context_after = "\n\n".join(paragraphs[target_idx + 1 : end_idx])
-
-    return context_before.strip(), context_after.strip()
+    run_revise(
+        workdir,
+        api_base=args.api_base,
+        api_key=args.api_key,
+        model=args.model,
+        chapters=chapters,
+        fix_missing=fix_missing,
+        fix_hallucinated=True,
+        verbose=args.verbose,
+        thinking_budget=args.thinking_budget,
+    )
 
 
 def _attempt_merge(segments: List[ScriptSegment], index: int) -> bool:
@@ -1140,7 +1515,9 @@ def _attempt_merge(segments: List[ScriptSegment], index: int) -> bool:
     return False
 
 
-def _remove_hallucinations(segments: List[ScriptSegment], hallucinated_indices: List[int]) -> int:
+def _remove_hallucinations(
+    segments: List[ScriptSegment], hallucinated_indices: List[int]
+) -> int:
     """remove segments identified as hallucinations."""
     removed = 0
     for idx in sorted(hallucinated_indices, reverse=True):
@@ -1151,27 +1528,40 @@ def _remove_hallucinations(segments: List[ScriptSegment], hallucinated_indices: 
     return removed
 
 
+def _segments_to_context(segments: List[ScriptSegment], start: int, end: int) -> str:
+    """format a slice of segments as JSON for LLM context."""
+    start = max(0, start)
+    end = min(len(segments), end)
+    context = [
+        {"speaker": s.speaker, "text": s.text, "instruction": s.instruction}
+        for s in segments[start:end]
+    ]
+    return json.dumps(context, ensure_ascii=False, indent=2) if context else "[]"
+
+
 def _fill_missing_fragments(
     segments: List[ScriptSegment],
-    missing: list[tuple[str, int, int]],
+    missing: list[tuple[str, int, int, str]],
     original_text: str,
     cast: List[Character],
     api_base: str | None,
     api_key: str | None,
     model: str | None,
-    context_chars: int | None,
-    context_paragraphs: int | None,
     verbose: bool,
     thinking_budget: int = DEFAULT_THINKING_BUDGET,
 ) -> int:
-    """fill missing text fragments using LLM."""
+    """fill missing text fragments using LLM with surrounding script as context."""
     added = 0
-    # Sort descending so insertions don't invalidate subsequent indices
-    for fragment, insertion_idx, split_offset in sorted(
+    context_segs = 3  # number of surrounding segments to include as context
+
+    # sort descending so insertions don't invalidate subsequent indices
+    for fragment, insertion_idx, split_offset, full_line in sorted(
         missing, key=lambda x: (x[1], x[2]), reverse=True
     ):
         if verbose:
-            print(f"\n    missing fragment (@ {insertion_idx}+{split_offset}): {fragment}")
+            print(
+                f"\n    missing fragment (@ {insertion_idx}+{split_offset}): {full_line}"
+            )
 
         target_idx = insertion_idx
         if split_offset > 0 and insertion_idx < len(segments):
@@ -1186,8 +1576,12 @@ def _fill_missing_fragments(
                 segments.insert(insertion_idx + 1, right_seg)
                 target_idx = insertion_idx + 1
 
-        context_before, context_after = _extract_context(
-            original_text, fragment, context_chars, context_paragraphs
+        # use surrounding script JSON as context
+        context_before = _segments_to_context(
+            segments, target_idx - context_segs, target_idx
+        )
+        context_after = _segments_to_context(
+            segments, target_idx, target_idx + context_segs
         )
 
         try:
@@ -1213,10 +1607,11 @@ def _fill_missing_fragments(
                 added += len(new_segs)
         except Exception as e:
             print(f"    failed: {e}")
+            raise
     return added
 
 
-def run_fix(
+def run_revise(
     workdir: Path,
     api_base: str | None = None,
     api_key: str | None = None,
@@ -1224,8 +1619,6 @@ def run_fix(
     chapters: list[int] | None = None,
     fix_missing: bool = True,
     fix_hallucinated: bool = True,
-    context_chars: int | None = None,
-    context_paragraphs: int | None = None,
     verbose: bool = False,
     thinking_budget: int = DEFAULT_THINKING_BUDGET,
 ) -> None:
@@ -1236,6 +1629,10 @@ def run_fix(
         get_command_dir(workdir, "script"),
     )
     txt_files = sorted(extract_dir.glob(f"*{TXT_EXT}"))
+    if not txt_files:
+        msg = "revise: no text files found in extract/!"
+        print(msg)
+        raise RuntimeError(msg)
 
     total_added, total_removed = 0, 0
     for txt_path in txt_files:
@@ -1255,14 +1652,18 @@ def run_fix(
 
         segments = load_script(script_path)
         if fix_hallucinated and result.hallucinated:
-            print(f"\n{txt_path.name}: removing {len(result.hallucinated)} hallucination(s)...")
+            print(
+                f"\n{txt_path.name}: removing {len(result.hallucinated)} hallucination(s)..."
+            )
             total_removed += _remove_hallucinations(segments, result.hallucinated)
             save_script(script_path, segments)
 
         if fix_missing:
             result = validate_script(txt_path, script_path)  # re-validate
             if result.missing:
-                print(f"\n{txt_path.name}: filling {len(result.missing)} missing fragment(s)...")
+                print(
+                    f"\n{txt_path.name}: filling {len(result.missing)} missing fragment(s)..."
+                )
                 total_added += _fill_missing_fragments(
                     segments,
                     result.missing,
@@ -1271,17 +1672,24 @@ def run_fix(
                     api_base,
                     api_key,
                     model,
-                    context_chars,
-                    context_paragraphs,
                     verbose,
                     thinking_budget,
                 )
                 save_script(script_path, segments)
+                # strict: after the llm fix pass, any remaining missing
+                # fragments are unrecoverable — raise rather than ship a gap.
+                final = validate_script(txt_path, script_path)
+                if final.missing:
+                    raise RuntimeError(
+                        f"revise: {txt_path.name} still has "
+                        f"{len(final.missing)} missing fragment(s) after "
+                        f"llm fix attempt"
+                    )
 
     if total_added > 0 or total_removed > 0:
-        print(f"\nfix: added {total_added}, removed {total_removed} segment(s)")
+        print(f"\nrevise: added {total_added}, removed {total_removed} segment(s)")
     else:
-        print("fix: no issues found.")
+        print("revise: no issues found.")
 
     # summary
     summary_parts = []
@@ -1291,35 +1699,19 @@ def run_fix(
         summary_parts.append(f"removed {total_removed} segment(s)")
 
     if summary_parts:
-        print(f"\nfix: {', '.join(summary_parts)}")
+        print(f"\nrevise: {', '.join(summary_parts)}")
     else:
-        print("fix: no issues found.")
+        print("revise: no issues found.")
 
 
-def cmd_fix(args):
-    chapters = get_chapters(args)
+def _step_if_changed(step: bool, phase: str, path: Path, before: float) -> None:
+    """raise StepComplete if step mode is active and files changed."""
+    from .utils import dir_mtime
 
-    # default to fixing both if neither flag specified
-    fix_missing = args.missing or (not args.missing and not args.hallucinated)
-    fix_hallucinated = args.hallucinated or (not args.missing and not args.hallucinated)
+    if step and dir_mtime(path) > before:
+        from .main import StepComplete
 
-    # context flags are mutually exclusive
-    context_chars = getattr(args, "context_chars", None)
-    context_paragraphs = getattr(args, "context_paragraphs", None)
-
-    run_fix(
-        Path(args.workdir),
-        api_base=args.api_base,
-        api_key=args.api_key,
-        model=args.model,
-        chapters=chapters,
-        fix_missing=fix_missing,
-        fix_hallucinated=fix_hallucinated,
-        context_chars=context_chars,
-        context_paragraphs=context_paragraphs,
-        verbose=args.verbose,
-        thinking_budget=args.thinking_budget,
-    )
+        raise StepComplete(phase)
 
 
 def dramatize_book(
@@ -1328,13 +1720,20 @@ def dramatize_book(
     api_key: str | None = None,
     model: str | None = None,
     chapters: list[int] | None = None,
-    tts_config: TTSConfig | None = None,
+    design_config: Any = None,
+    clone_config: Any = None,
     pooled: bool = False,
     verbose: bool = False,
     force: bool = False,
     thinking_budget: int = DEFAULT_THINKING_BUDGET,
+    revise: bool = False,
+    step: bool = False,
+    redo_phase: str | None = None,
+    retake: bool = False,
+    callback: bool = False,
 ) -> None:
     """run full dramatization pipeline."""
+    before = dir_mtime(get_command_dir(workdir, "cast"))
     run_cast_generation(
         workdir,
         api_base,
@@ -1342,25 +1741,49 @@ def dramatize_book(
         model,
         chapters,
         verbose=verbose,
-        force=force,
+        force=force or redo_phase == "cast",
         thinking_budget=thinking_budget,
     )
-    # generate scripts first before auditions
-    if not run_script_generation(
+    _step_if_changed(step, "cast", get_command_dir(workdir, "cast"), before)
+
+    from .introduce import run_introduce
+
+    before = dir_mtime(get_command_dir(workdir, "introduce"))
+    run_introduce(
+        workdir,
+        verbose=verbose,
+        force=force or redo_phase == "introduce",
+        config=design_config,
+        callback=callback,
+    )
+    _step_if_changed(step, "introduce", get_command_dir(workdir, "introduce"), before)
+
+    before = dir_mtime(get_command_dir(workdir, "audition"))
+    run_auditions(
+        workdir,
+        verbose=verbose,
+        force=force or redo_phase == "audition",
+        config=design_config,
+        callback=callback,
+    )
+    _step_if_changed(step, "audition", get_command_dir(workdir, "audition"), before)
+
+    before = dir_mtime(get_command_dir(workdir, "script"))
+    run_script_generation(
         workdir,
         api_base,
         api_key,
         model,
         chapters,
         verbose=verbose,
-        force=force,
+        force=force or redo_phase == "script",
         thinking_budget=thinking_budget,
-    ):
-        print("script generation failed. aborting.")
-        return
+        revise=revise,
+    )
+    _step_if_changed(step, "script", get_command_dir(workdir, "script"), before)
 
-    # fix script issues (missing/hallucinated)
-    run_fix(
+    before = dir_mtime(get_command_dir(workdir, "script"))
+    run_revise(
         workdir,
         api_base,
         api_key,
@@ -1369,14 +1792,30 @@ def dramatize_book(
         verbose=verbose,
         thinking_budget=thinking_budget,
     )
+    _step_if_changed(step, "revise", get_command_dir(workdir, "script"), before)
 
-    # now run auditions
-    run_auditions(workdir, verbose=verbose, force=force)
+    before = dir_mtime(get_command_dir(workdir, "perform"))
     run_performance(
         workdir,
         chapters,
-        tts_config,
+        clone_config,
         pooled,
         verbose=verbose,
-        force=force,
+        force=force or redo_phase == "perform",
+        retake=retake,
+    )
+    _step_if_changed(step, "perform", get_command_dir(workdir, "perform"), before)
+
+    before = dir_mtime(get_command_dir(workdir, "perform") / "segments")
+    from .retake import run_retake
+
+    run_retake(
+        workdir,
+        command="perform",
+        chapters=chapters,
+        config=clone_config,
+        verbose=verbose,
+    )
+    _step_if_changed(
+        step, "retake", get_command_dir(workdir, "perform") / "segments", before
     )

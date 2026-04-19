@@ -9,7 +9,13 @@ import pytest
 
 from autiobook.audio import save_segment
 from autiobook.config import SAMPLE_RATE
-from autiobook.pooling import AudioTask, process_audio_pipeline
+from autiobook.pooling import (
+    AudioTask,
+    process_audio_pipeline,
+    srt_path,
+    vtt_path,
+    write_subtitles,
+)
 
 
 @pytest.fixture
@@ -154,7 +160,6 @@ class TestChapterOrderedScheduling:
 
         # extract assembly events
         assemblies = [e for e in tracking_engine.event_log if e[0] == "assemble"]
-        synth_events = [e for e in tracking_engine.event_log if e[0] == "synthesize"]
 
         # chapters should be assembled in order
         assert [a[1] for a in assemblies] == [
@@ -397,3 +402,46 @@ class TestSegmentDeduplication:
         assert len(call_args) == 2
         assert call_args[0] == "single task"
         assert call_args[1] == "."  # padding
+
+
+class TestSubtitles:
+    """tests for srt/vtt emission."""
+
+    def test_write_subtitles_srt_and_vtt(self, temp_workdir):
+        chunks = [
+            {"start_s": 0.0, "end_s": 1.5, "text": "Hello world."},
+            {"start_s": 2.0, "end_s": 3.25, "text": "Second line.", "speaker": "Alice"},
+            {"start_s": 3.25, "end_s": 3.5, "text": "   "},  # skipped
+        ]
+        wav = temp_workdir / "chapter_0.wav"
+        write_subtitles(wav, chunks)
+
+        srt = srt_path(wav).read_text()
+        assert "1\n00:00:00,000 --> 00:00:01,500\nHello world." in srt
+        assert "2\n00:00:02,000 --> 00:00:03,250\n[Alice] Second line." in srt
+        assert "3\n" not in srt  # empty chunk skipped
+
+        vtt = vtt_path(wav).read_text()
+        assert vtt.startswith("WEBVTT\n")
+        assert "00:00:00.000 --> 00:00:01.500\nHello world." in vtt
+        assert "00:00:02.000 --> 00:00:03.250\n[Alice] Second line." in vtt
+
+    def test_pipeline_emits_subtitles(self, mock_engine, temp_workdir):
+        segments_dir = temp_workdir / "segments"
+        wav = temp_workdir / "chapter_0.wav"
+        tasks = [
+            AudioTask(text="first", segment_hash="h1", segments_dir=segments_dir),
+            AudioTask(
+                text="second",
+                segment_hash="h2",
+                segments_dir=segments_dir,
+                metadata={"speaker": "Bob"},
+            ),
+        ]
+        process_audio_pipeline(mock_engine, [(wav, tasks)])
+
+        assert srt_path(wav).exists()
+        assert vtt_path(wav).exists()
+        srt = srt_path(wav).read_text()
+        assert "first" in srt
+        assert "[Bob] second" in srt

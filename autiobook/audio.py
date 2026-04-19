@@ -1,5 +1,6 @@
 """audio processing utilities."""
 
+import hashlib
 from pathlib import Path
 from typing import cast
 
@@ -63,11 +64,17 @@ def check_segment_exists(segments_dir: Path, segment_hash: str) -> bool:
 
 def save_segment(
     segments_dir: Path, segment_hash: str, audio: np.ndarray, sample_rate: int
-) -> None:
-    """save a segment to the central cache."""
+) -> str:
+    """save a segment to the central cache. returns sha256 of wav bytes."""
     segments_dir.mkdir(parents=True, exist_ok=True)
     path = get_segment_path(segments_dir, segment_hash)
     sf.write(str(path), audio, sample_rate)
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def wav_sha256(path: Path) -> str:
+    """sha256 of a wav file's bytes."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def load_segment(segments_dir: Path, segment_hash: str) -> np.ndarray:

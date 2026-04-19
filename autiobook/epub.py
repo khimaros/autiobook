@@ -76,6 +76,21 @@ def extract_text_from_html(html_content: bytes) -> str:
 
     paragraphs = []
     for tag in soup.find_all(CONTENT_TAGS):
+        if tag.find(CONTENT_TAGS):
+            # container with nested content tags
+            # extract text from non-content children to avoid skipping mixed content
+            parts = []
+            for child in tag.children:
+                # child.name is None for NavigableString (text nodes)
+                name = getattr(child, "name", None)
+                if name is None or name not in CONTENT_TAGS:
+                    parts.append(child.get_text())
+
+            text = " ".join("".join(parts).split())
+            if text:
+                paragraphs.append(text)
+            continue
+
         text = " ".join(tag.get_text().split())
         if text:
             paragraphs.append(text)
@@ -155,6 +170,11 @@ def parse_epub(path: Path) -> tuple[Book, bytes | None]:
 def ensure_extracted(epub_path: Path, workdir: Path, force: bool = False) -> None:
     """ensure epub is extracted to workdir, skipping if already fresh."""
     from .resume import get_command_dir
+
+    if not epub_path.exists():
+        msg = f"epub file not found: {epub_path}"
+        print(msg)
+        raise FileNotFoundError(msg)
 
     extract_dir = get_command_dir(workdir, "extract")
     state_path = extract_dir / "state.json"

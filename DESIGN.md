@@ -4,14 +4,14 @@
 
 Standard Workflow:
 ```
-epub file → extract → txt files → synthesize → wav files → export → mp3 files
+epub file → extract → txt files → synthesize → wav files → retake → export → mp3 files
 ```
 
 Dramatization Workflow:
 ```
 txt files → cast gen → characters.json → audition → voice samples
      ↓
-script gen (llm) → json scripts → validate → fix → perform (cloning) → wav files
+script gen (llm) → json scripts → revise → perform (cloning) → wav files → retake
 ```
 
 each phase is idempotent and can be run independently.
@@ -44,60 +44,52 @@ creates:
 convert text files to wav audio.
 
 ```
-autiobook synthesize workdir/ -s Ryan
+autiobook synthesize workdir/ -s ryan
 ```
 
 creates:
 - `workdir/synthesize/NN_Title.wav` - audio files
 - `workdir/synthesize/state.json` - resumability state
 
-### dramatize / cast / audition / showcase / script / validate / fix / perform
+### dramatize / cast / introduce / audition / script / revise / perform / callback
 
-advanced workflow for multi-speaker dramatization.
+dramatize accepts `--strict` as a rollup for `--revise --retake --callback`; convert accepts `--strict` as a rollup for `--retake`.
+
+
+advanced workflow for multi-speaker dramatization. pipeline order: cast → introduce → audition → script → revise → perform → retake.
 
 - `cast`: generates `characters.json` from text sample using LLM.
-- `audition`: generates `audition/Character.wav` using `Qwen3-TTS-VoiceDesign`.
-- `showcase`: generates `showcase/Character/*.wav` emotion samples using voice cloning.
-- `script`: rewrites text into `NN_Title.json` script with speaker attribution using LLM.
-- `validate`: verifies scripts match source text, reports missing and hallucinated segments.
-- `fix`: fills missing segments using LLM with context, removes hallucinated segments.
+- `introduce`: generates `introduce/Character.wav` using `Qwen3-TTS-VoiceDesign` with the character description only (no emotion hints). this is the canonical per-character voice identity and serves as a fallback ref clip during perform when an emotion variant is missing. `--callback` validates inline.
+- `audition`: generates `audition/Character__emotion.wav` per emotion using `Qwen3-TTS-VoiceDesign` with the description plus an emotion instruct. these are the per-emotion ref clips that perform clones from. reuses the per-character seed recorded by introduce so every variant rides the same voice trajectory; a changed introduce seed invalidates the audition via the task hash. `--callback` validates inline.
+- `callback`: post-hoc audio quality scan for `introduce/` and `audition/` wavs (base files and per-emotion variants); deletes offenders and regenerates (mirrors `retake` for chapter segments). `--dry-run` reports only; `--prune` deletes without regenerating.
+- `script`: rewrites text into `NN_Title.json` script with speaker attribution using LLM. Supports `--validate` for iterative fixing of missing or hallucinated segments during generation.
+- `revise`: review and repair scripts. compares script to source, then fills missing segments via LLM and removes hallucinated segments. `--dry-run` reports without modifying; `--prune` strips hallucinations but skips LLM fix-missing.
 - `perform`: synthesizes audio using `Qwen3-TTS-Base` voice cloning from scripts + voice samples.
 
-### showcase
+### introduce / audition
 
-generates emotion samples for each character voice to help vet actor voices in different situations.
+`introduce` produces one base file per character (`introduce/{name}.wav`) using `design_voice` with the character description, tracked in `introduce/state.json`. `audition` then produces per-emotion variants (`audition/{name}__{emotion}.wav`) using `design_voice` with the description plus an emotion instruction, tracked in `audition/state.json` keyed `{name}/{emotion}`. audition reads the seed recorded in `introduce/state.json` for each character and reuses it, so the base file and all emotion variants stay on the same voice trajectory; that seed also feeds the audition task hash, so bumping an introduce seed forces re-audition. both phases honor `--callback` and archive rejected takes to `{phase}/rejected/`.
 
 ```
-autiobook showcase workdir/
+autiobook introduce workdir/
+autiobook audition workdir/
 ```
-
-creates:
-- `workdir/showcase/CharacterName/emotion.wav` - samples for each emotion
-- `workdir/showcase/state.json` - resumability state
 
 emotions generated: neutral, happy, sad, angry, fearful, surprised, whispering, shouting, sarcastic, excited, contemplative.
 
-### validate
+### revise
 
-compares script segments against original text to detect:
-- **missing**: text from source not present in any script segment
-- **hallucinated**: script segments with text not found in source
-
-```
-autiobook validate workdir/ [--missing] [--hallucinated]
-```
-
-### fix
-
-repairs script issues found by validation:
-- fills missing text by sending to LLM with surrounding context
-- removes hallucinated segments from script
-- checkpoints after each fix for resumability
+compares script segments against original text and repairs defects:
+- **missing**: text from source not present in any script segment → filled via LLM with surrounding context
+- **hallucinated**: script segments with text not found in source → removed
+- checkpoints after each revise step for resumability
+- `--dry-run`: report only (exits non-zero if issues found); no changes written
+- `--prune`: strip hallucinations only; skip the LLM fix-missing pass
 
 ```
-autiobook fix workdir/ [--missing] [--hallucinated] --api-key sk-...
-autiobook fix workdir/ --missing --context-chars 1000  # character-based context
-autiobook fix workdir/ --missing --context-paragraphs 3  # paragraph-based context
+autiobook revise workdir/ --api-key sk-...
+autiobook revise workdir/ --dry-run                    # review only
+autiobook revise workdir/ --prune                      # local cleanup only
 ```
 
 ### export
@@ -114,7 +106,7 @@ creates:
 
 ### convert
 
-run all phases (extract → synthesize → export).
+run all phases (extract → synthesize → retake → export).
 
 ```
 autiobook convert book.epub -o workdir/
@@ -207,16 +199,13 @@ workdir/
 ├── cast/                  # character list and analysis state
 │   ├── characters.json
 │   └── state.json
-├── audition/              # character voice samples
+├── introduce/             # per-character base voices (description only)
 │   ├── Character.wav
 │   └── state.json
-├── showcase/              # emotion samples for character voices
-│   ├── Character/
-│   │   ├── neutral.wav
-│   │   ├── happy.wav
-│   │   ├── ...
-│   │   └── contemplative.wav
-│   ├── segments/          # segment cache
+├── audition/              # per-emotion voice variants
+│   ├── Character__neutral.wav
+│   ├── Character__happy.wav
+│   ├── ...
 │   └── state.json
 ├── script/                # dramatized scripts (speaker segments)
 │   ├── NN_Title.json

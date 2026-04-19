@@ -44,25 +44,30 @@ echo "--- test: cast ---"
 autiobook cast "$WORKDIR" || die "cast command failed"
 
 echo ""
+echo "--- test: introduce ---"
+autiobook introduce "$WORKDIR" || die "introduce command failed"
+
+# verify introduce output (base voice files have no emotion suffix)
+intro_count=$(find "$WORKDIR/introduce" -maxdepth 1 -name "*.wav" | wc -l)
+[[ $intro_count -gt 0 ]] || die "no introduce wavs created"
+echo "introduced $intro_count character(s)"
+
+echo ""
 echo "--- test: audition ---"
 autiobook audition "$WORKDIR" || die "audition command failed"
 
-echo ""
-echo "--- test: showcase ---"
-autiobook showcase "$WORKDIR" || die "showcase command failed"
-
-# verify showcase output
-showcase_dirs=$(find "$WORKDIR/showcase" -mindepth 1 -maxdepth 1 -type d | wc -l)
-[[ $showcase_dirs -gt 0 ]] || die "no showcase directories created"
-echo "generated showcase for $showcase_dirs character(s)"
+# verify audition output (per-emotion variants have __ suffix)
+audition_count=$(find "$WORKDIR/audition" -maxdepth 1 -name "*__*.wav" | wc -l)
+[[ $audition_count -gt 0 ]] || die "no audition emotion wavs created"
+echo "auditioned $audition_count emotion variant(s)"
 
 echo ""
 echo "--- test: script ---"
 autiobook script "$WORKDIR" || die "script command failed"
 
 echo ""
-echo "--- test: fix ---"
-autiobook fix "$WORKDIR" || die "fix command failed"
+echo "--- test: revise ---"
+autiobook revise "$WORKDIR" || die "revise command failed"
 
 echo ""
 echo "--- test: perform ---"
@@ -96,10 +101,10 @@ echo "--- test: idempotency ---"
 autiobook extract "$TEST_EPUB" -o "$WORKDIR" || die "idempotent extract failed"
 # run cast again, should skip existing
 autiobook cast "$WORKDIR" || die "idempotent cast failed"
+# run introduce again, should skip existing
+autiobook introduce "$WORKDIR" || die "idempotent introduce failed"
 # run audition again, should skip existing
 autiobook audition "$WORKDIR" || die "idempotent audition failed"
-# run showcase again, should skip existing
-autiobook showcase "$WORKDIR" || die "idempotent showcase failed"
 # run script again, should skip existing
 autiobook script "$WORKDIR" || die "idempotent script failed"
 # run perform again, should skip existing

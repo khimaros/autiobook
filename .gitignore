@@ -5,5 +5,6 @@ __pycache__/
 /.ruff_cache/
 .pytest_cache/
 /testdata_workdir/
+/testdata/*_output/
 /books/
 .env

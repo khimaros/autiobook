@@ -134,7 +134,9 @@ def export_m4b(
 
     # output file
     # sanitize filename
-    safe_title = "".join(c for c in meta["title"] if c.isalnum() or c in (" ", "-", "_")).strip()
+    safe_title = "".join(
+        c for c in meta["title"] if c.isalnum() or c in (" ", "-", "_")
+    ).strip()
     output_file = output_dir / f"{safe_title}{M4B_EXT}"
 
     # build ffmpeg command
@@ -226,7 +228,9 @@ def export_audiobook(
     info_map = {c["index"]: c for c in meta["chapters"]}
 
     if m4b:
-        return export_m4b(chapter_paths, info_map, meta, output_dir, cover_path, bitrate)
+        return export_m4b(
+            chapter_paths, info_map, meta, output_dir, cover_path, bitrate
+        )
 
     resume = ResumeManager.for_command(workdir, "export", force=force)
 
