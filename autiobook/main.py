@@ -76,6 +76,17 @@ class StepComplete(Exception):
         super().__init__(f"step complete: {phase}")
 
 
+def _print_step_complete(phase: str, phases: list[str] | None) -> None:
+    """standardized step-mode message; names the next phase explicitly."""
+    next_phase = None
+    if phases and phase in phases:
+        i = phases.index(phase)
+        if i + 1 < len(phases):
+            next_phase = phases[i + 1]
+    tail = f"next: {next_phase}. re-run to continue." if next_phase else "done."
+    print(f"step: {phase} complete. {tail}")
+
+
 def _run_pipeline(args, process_fn, name, phases=None):
     """common helper for full pipelines."""
     epub_path, workdir = get_pipeline_paths(args)
@@ -100,7 +111,7 @@ def _run_pipeline(args, process_fn, name, phases=None):
     extract_before = dir_mtime(workdir / "extract")
     ensure_extracted(epub_path, workdir, force=force_extract)
     if step and dir_mtime(workdir / "extract") > extract_before:
-        print("step: extract complete. re-run to continue.")
+        _print_step_complete("extract", phases)
         return
 
     Logger.init(workdir)
@@ -111,17 +122,23 @@ def _run_pipeline(args, process_fn, name, phases=None):
     try:
         process_fn(workdir, config, chapters, redo_phase=redo_phase)
     except StepComplete as e:
-        print(f"step: {e.phase} complete. re-run to continue.")
+        _print_step_complete(e.phase, phases)
         return
 
     if step and dir_mtime(workdir) > before:
-        print("step: processing complete. re-run to export.")
+        print("step: processing complete. next: export. re-run to continue.")
         return
 
     force_export = force or redo_phase == "export"
+    accept = getattr(args, "accept", False)
     print(f"export: exporting chapters to {export_dir}/...")
     new, skipped = export_audiobook(
-        workdir, export_dir, args.bitrate, force=force_export, m4b=args.m4b
+        workdir,
+        export_dir,
+        args.bitrate,
+        force=force_export,
+        m4b=args.m4b,
+        accept=accept,
     )
 
     msg = f"{name}: done - {new} chapter(s) exported"
@@ -142,19 +159,45 @@ def cmd_dramatize(args):
     emotions = getattr(args, "emotions", False)
     preset_voices = getattr(args, "preset_voices", False)
     directed = getattr(args, "directed", False)
+    accept = getattr(args, "accept", False)
     phases = ["extract", "cast", "audition"]
     if emotions:
         phases.append("emote")
-    phases.extend(["script", "revise", "perform", "retake", "export"])
+    phases.extend(["script", "revise"])
+    if getattr(args, "review", False) or getattr(args, "strict", False):
+        phases.append("review")
+    phases.extend(["perform", "retake", "export"])
 
     # --strict rolls up all validation checks
     strict = getattr(args, "strict", False)
     revise = args.revise or strict
+    review = getattr(args, "review", False) or strict
     retake = args.retake or strict
     callback = getattr(args, "callback", False) or strict
 
+    phase_wise = getattr(args, "phase_wise", False)
+
     def process_fn(workdir, config, chapters, redo_phase=None):
         print(f"dramatize: dramatizing chapters in {workdir}...")
+
+        # per-chapter export is only meaningful for mp3; m4b bundles the whole
+        # book into one file at the end.
+        export_fn = None
+        if not phase_wise and not args.m4b:
+            force_export = args.force or redo_phase == "export"
+            export_dir = workdir / "export"
+
+            def export_fn(chs):
+                export_audiobook(
+                    workdir,
+                    export_dir,
+                    args.bitrate,
+                    force=force_export,
+                    m4b=False,
+                    chapters=chs,
+                    accept=accept,
+                )
+
         dramatize_book(
             workdir,
             api_base=args.api_base,
@@ -168,6 +211,7 @@ def cmd_dramatize(args):
             force=args.force,
             thinking_budget=args.thinking_budget,
             revise=revise,
+            review=review,
             step=step,
             redo_phase=redo_phase,
             retake=retake,
@@ -175,6 +219,10 @@ def cmd_dramatize(args):
             emotions=emotions,
             preset_voices=preset_voices,
             directed=directed,
+            accept=accept,
+            ignore_flags=getattr(args, "ignore_flags", False),
+            phase_wise=phase_wise,
+            export_fn=export_fn,
         )
 
     _run_pipeline(args, process_fn, "dramatize", phases=phases)
@@ -244,7 +292,12 @@ def cmd_export(args):
 
     print(f"export: exporting chapters to {output_dir}/...")
     new, skipped = export_audiobook(
-        workdir, output_dir, args.bitrate, force=args.force, m4b=args.m4b
+        workdir,
+        output_dir,
+        args.bitrate,
+        force=args.force,
+        m4b=args.m4b,
+        accept=getattr(args, "accept", False),
     )
 
     msg = f"export: {new} chapter(s) exported"
@@ -352,6 +405,18 @@ def _cmd_revise(args):
     cmd_revise(args)
 
 
+def _cmd_review(args):
+    from .dramatize import cmd_review
+
+    cmd_review(args)
+
+
+def _cmd_audit(args):
+    from .dramatize import cmd_audit
+
+    cmd_audit(args)
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="autiobook",
@@ -409,6 +474,14 @@ def main():
                     },
                 ),
                 (
+                    ("--review",),
+                    {
+                        "action": "store_true",
+                        "help": "run LLM review pass over scripts before perform "
+                        "(fixes speaker/text/emotion errors against source)",
+                    },
+                ),
+                (
                     ("--retake",),
                     {
                         "action": "store_true",
@@ -426,7 +499,8 @@ def main():
                     ("--strict",),
                     {
                         "action": "store_true",
-                        "help": "enable all validation checks (--revise --retake --callback)",
+                        "help": "enable all validation checks "
+                        "(--revise --review --retake --callback)",
                     },
                 ),
                 (
@@ -453,13 +527,53 @@ def main():
                         "(combine with --preset-voices)",
                     },
                 ),
+                (
+                    ("--accept",),
+                    {
+                        "action": "store_true",
+                        "help": "skip regeneration for every phase (cast, audition, "
+                        "emote, script, revise, review, perform, retake, export); "
+                        "existing artifacts are re-stamped as fresh under current "
+                        "hashes. intended to pair with --step so you can approve "
+                        "upstream edits without redoing downstream work.",
+                    },
+                ),
+                (
+                    ("--ignore-flags",),
+                    {
+                        "action": "store_true",
+                        "help": "proceed to perform even if review audit has "
+                        "unresolved flags",
+                    },
+                ),
+                (
+                    ("--phase-wise",),
+                    {
+                        "action": "store_true",
+                        "help": "run each tail phase (script/revise/review/"
+                        "perform/retake) across all chapters before advancing "
+                        "to the next phase. default is chapter-wise: all tail "
+                        "phases run per chapter before the next chapter starts.",
+                    },
+                ),
             ],
         ),
         "cast": (
             _cmd_cast,
             "generate cast list from book text",
             [("scripting",), ("chapter_selection",), ("cast",), ("runtime",)],
-            [(("workdir",), {"help": "path to workdir"})],
+            [
+                (("workdir",), {"help": "path to workdir"}),
+                (
+                    ("--accept",),
+                    {
+                        "action": "store_true",
+                        "help": "skip regeneration; mark existing cast as fresh "
+                        "under current chapter hashes (useful after editing "
+                        "cast/characters.json).",
+                    },
+                ),
+            ],
         ),
         "design": (
             _cmd_design,
@@ -504,6 +618,14 @@ def main():
                         "per character (combine with --preset-voices)",
                     },
                 ),
+                (
+                    ("--accept",),
+                    {
+                        "action": "store_true",
+                        "help": "skip regeneration; mark existing wavs as fresh under "
+                        "current cast hashes (useful after editing descriptions)",
+                    },
+                ),
             ],
         ),
         "emote": (
@@ -521,6 +643,14 @@ def main():
                     {
                         "action": "store_true",
                         "help": "validate new voice wavs inline and re-emote bad takes",
+                    },
+                ),
+                (
+                    ("--accept",),
+                    {
+                        "action": "store_true",
+                        "help": "skip regeneration; mark existing wavs as fresh under "
+                        "current cast hashes (useful after editing descriptions)",
                     },
                 ),
             ],
@@ -560,6 +690,15 @@ def main():
                         "help": "review chunks during generation and retry on failure",
                     },
                 ),
+                (
+                    ("--accept",),
+                    {
+                        "action": "store_true",
+                        "help": "skip regeneration; mark existing scripts as fresh "
+                        "under current (extract + cast) hashes (useful after "
+                        "hand-editing a script file).",
+                    },
+                ),
             ],
         ),
         "perform": (
@@ -573,6 +712,20 @@ def main():
                     {
                         "action": "store_true",
                         "help": "validate segment wavs inline; re-synthesize bad takes",
+                    },
+                ),
+                (
+                    ("--ignore-flags",),
+                    {
+                        "action": "store_true",
+                        "help": "proceed even if review audit has unresolved flags",
+                    },
+                ),
+                (
+                    ("--accept",),
+                    {
+                        "action": "store_true",
+                        "help": "skip synthesis; trust existing chapter wavs as-is.",
                     },
                 ),
             ],
@@ -595,6 +748,67 @@ def main():
                     {
                         "action": "store_true",
                         "help": "strip hallucinated segments but skip LLM fix-missing",
+                    },
+                ),
+                (
+                    ("--accept",),
+                    {
+                        "action": "store_true",
+                        "help": "skip validation/repair; trust existing scripts as-is.",
+                    },
+                ),
+            ],
+        ),
+        "audit": (
+            _cmd_audit,
+            "walk through the review audit log (flags + edits)",
+            [("runtime",)],
+            [
+                (("workdir",), {"help": "path to workdir"}),
+                (
+                    ("-l", "--list"),
+                    {
+                        "action": "store_true",
+                        "help": "print entries non-interactively",
+                    },
+                ),
+                (
+                    ("-a", "--all"),
+                    {
+                        "action": "store_true",
+                        "help": "include edit records (default: flags only)",
+                    },
+                ),
+                (
+                    ("--clear",),
+                    {
+                        "action": "store_true",
+                        "help": "delete the audit file and exit",
+                    },
+                ),
+            ],
+        ),
+        "review": (
+            _cmd_review,
+            "review scripts against source in batches (LLM-corrected)",
+            [("scripting",), ("chapter_selection",), ("runtime",)],
+            [
+                (("workdir",), {"help": "path to workdir"}),
+                (
+                    ("--batch-size",),
+                    {
+                        "type": int,
+                        "default": None,
+                        "help": "segments per LLM review call "
+                        "(defaults to AUTIOBOOK_REVIEW_BATCH_SIZE)",
+                    },
+                ),
+                (
+                    ("--accept",),
+                    {
+                        "action": "store_true",
+                        "help": "skip LLM review; mark existing scripts as fresh "
+                        "under current (source + cast + batch_size) hashes.",
                     },
                 ),
             ],
@@ -628,6 +842,14 @@ def main():
                 (
                     ("--m4b",),
                     {"action": "store_true", "help": "export as m4b audiobook"},
+                ),
+                (
+                    ("--accept",),
+                    {
+                        "action": "store_true",
+                        "help": "skip re-encoding; mark existing mp3s as fresh "
+                        "under current wav/metadata hashes.",
+                    },
                 ),
             ],
         ),
@@ -671,6 +893,13 @@ def main():
                     {
                         "action": "store_true",
                         "help": "delete offenders but skip regeneration",
+                    },
+                ),
+                (
+                    ("--accept",),
+                    {
+                        "action": "store_true",
+                        "help": "skip scan and regeneration entirely.",
                     },
                 ),
             ],

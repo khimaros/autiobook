@@ -75,6 +75,36 @@ def _play_wav_async(path: Path) -> subprocess.Popen | None:
     return None
 
 
+def _play_pcm_stream(sample_rate: int) -> subprocess.Popen | None:
+    """spawn ffplay reading s16le mono PCM from stdin; returns Popen with
+    a writable stdin pipe, or None if ffplay isn't available.
+    """
+    player = shutil.which("ffplay")
+    if not player:
+        return None
+    # ffplay >= 5.x dropped -ac; use -ch_layout mono (works on both old and new).
+    return subprocess.Popen(
+        [
+            player,
+            "-nodisp",
+            "-autoexit",
+            "-loglevel",
+            "quiet",
+            "-f",
+            "s16le",
+            "-ar",
+            str(sample_rate),
+            "-ch_layout",
+            "mono",
+            "-i",
+            "-",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
 def _stop_playback(proc: subprocess.Popen | None) -> None:
     """terminate a running playback subprocess, if any."""
     if proc is None or proc.poll() is not None:

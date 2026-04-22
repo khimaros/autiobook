@@ -40,6 +40,18 @@ LLM_MAX_RETRIES = 3
 VALIDATION_MAX_RETRIES = 5
 LLM_RETRY_DELAY = 1.0  # initial delay in seconds, doubles on each retry
 CAST_BATCH_SIZE = int(os.getenv("AUTIOBOOK_CAST_BATCH_SIZE", "3"))
+# review command sends this many consecutive script segments per LLM call along
+# with the covering source-text span so the model can correct mis-attributions
+# and other drift (text, emotion) against the original.
+REVIEW_BATCH_SIZE = int(os.getenv("AUTIOBOOK_REVIEW_BATCH_SIZE", "50"))
+# cast generation chunks chapters into windows this many words wide so the
+# LLM has enough coreference context (pronouns, dialogue attribution) to
+# identify speakers — much larger than script-writing chunks (~1500 words)
+# because identity resolution benefits from broader span than transcription.
+CAST_CHUNK_WORDS = int(os.getenv("AUTIOBOOK_CAST_CHUNK_WORDS", "4000"))
+# overlap (words) between successive cast chunks so a character introduced
+# at the tail of chunk N remains recognizable in chunk N+1.
+CAST_CHUNK_OVERLAP_WORDS = int(os.getenv("AUTIOBOOK_CAST_CHUNK_OVERLAP_WORDS", "400"))
 
 # seed for reproducibility (tts + llm). unset → generate one concrete random
 # seed per process so the exact value can be logged and recorded with output.
@@ -48,6 +60,10 @@ DEFAULT_SEED = int(_seed_env) if _seed_env else random.randint(1, 2**31 - 1)
 
 # tts http settings
 TTS_HTTP_TIMEOUT = int(os.getenv("AUTIOBOOK_TTS_TIMEOUT", "300"))
+# streaming audio batch size. 0 disables streaming (single response_format=wav
+# reply). >0 enables SSE per-batch PCM streaming so playback starts before
+# synthesis finishes. 16 frames ≈ 1.28s audio; recommended range 8-32.
+TTS_STREAM_BATCH_SIZE = int(os.getenv("AUTIOBOOK_TTS_STREAM_BATCH_SIZE", "0"))
 
 # audio processing
 PARAGRAPH_PAUSE_MS = 500

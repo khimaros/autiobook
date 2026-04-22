@@ -94,9 +94,15 @@ class ResumeManager:
         )
 
     def update(self, key: str, current_hash: str, **extra: Any):
-        """mark key as fully complete. extra kwargs are stored alongside."""
+        """mark key as fully complete. extra kwargs are stored alongside.
+
+        no-op if the key already holds an identical entry, so repeated accepts
+        don't advance the state file's mtime (which --step keys off of).
+        """
         entry: Dict[str, Any] = {"hash": current_hash, "done": True}
         entry.update(extra)
+        if self.state.get(str(key)) == entry:
+            return
         self.state[str(key)] = entry
         self.dirty = True
 
@@ -114,9 +120,10 @@ class ResumeManager:
         self.dirty = True
 
     def clear_partial(self, key: str):
-        """clear state for key."""
+        """clear a partial (non-done) entry for key. completed entries are kept."""
         key_str = str(key)
-        if key_str in self.state:
+        val = self.state.get(key_str)
+        if isinstance(val, dict) and not val.get("done", False):
             del self.state[key_str]
             self.dirty = True
 

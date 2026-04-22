@@ -13,7 +13,7 @@ import soundfile as sf  # type: ignore
 from tqdm import tqdm  # type: ignore
 
 from .audio import wav_sha256
-from .config import CAST_FILE, VOICE_DESIGN_MODEL, WAV_EXT
+from .config import CAST_FILE, SAMPLE_RATE, VOICE_DESIGN_MODEL, WAV_EXT
 from .dramatize import load_cast
 from .llm import Character
 from .resume import ResumeManager, compute_hash, get_command_dir
@@ -88,12 +88,16 @@ def run_audition(
     callback: bool = False,
     preset_voices: bool = False,
     directed: bool = False,
+    accept: bool = False,
 ) -> None:
     """generate the per-character base voice (description only).
 
     modes:
       preset_voices=True, directed=False: auto round-robin assign backend voices
       preset_voices=True, directed=True: interactive casting loop with backend voices
+      accept=True: skip regeneration; mark existing wavs as fresh under current
+        cast hashes (useful after tweaking descriptions without wanting to redo
+        the audio)
       otherwise: generate voices via voice-design (default)
     """
     if cast is None:
@@ -108,6 +112,10 @@ def run_audition(
             print(f"cast file found at {cast_path} but contains no characters.")
         else:
             print("no cast found. run 'cast' command first.")
+        return
+
+    if accept:
+        _accept_existing(workdir, cast, voices_dir, resume, preset_voices=preset_voices)
         return
 
     if preset_voices:
@@ -217,9 +225,9 @@ def _run_directed_design(
     the description and retries.
     """
     import random
-    from threading import Lock, Thread
+    from threading import Event, Lock, Thread
 
-    from .casting import _play_wav_async, _prompt, _stop_playback
+    from .casting import _play_pcm_stream, _play_wav_async, _prompt, _stop_playback
     from .dramatize import save_cast
 
     resume = ResumeManager.for_command(workdir, AUDITION_COMMAND, force=force)
@@ -311,6 +319,21 @@ def _run_directed_design(
             self.ensure_running()
             return item
 
+        def try_take(self, instruct_: str) -> tuple[int, Any, int] | None:
+            """non-blocking pop: return a ready take or None immediately.
+
+            used when a streaming foreground path is available — we prefer
+            fast TTFA over joining the pregen worker's non-streaming synth.
+            """
+            self.set_target(self.text or "", instruct_)
+            with self._lock:
+                if self.instruct != instruct_ or not self.ready:
+                    item = None
+                else:
+                    item = self.ready.pop(0)
+            self.ensure_running()
+            return item
+
         def join(self) -> None:
             if self.thread:
                 self.thread.join()
@@ -327,6 +350,16 @@ def _run_directed_design(
         nonlocal playback
         _stop_playback(playback)
         playback = None
+
+    # streaming path bypasses pregen: pregen's non-streaming worker holds
+    # engine_lock, which would block streaming requests for the full duration
+    # of a pregen synth. streaming TTFA (~1 batch) is fast enough that we
+    # don't need a zero-wait buffer for successive takes.
+    stream_fn = getattr(engine, "design_voice_stream", None)
+    stream_batch_size = getattr(getattr(engine, "config", None), "stream_batch_size", 0)
+    streaming_available = (
+        callable(stream_fn) and stream_batch_size and stream_batch_size > 0
+    )
 
     accepted = 0
     skipped = 0
@@ -350,53 +383,156 @@ def _run_directed_design(
         cursor = -1
         quit_requested = False
         generate_next = True
-        pregen = PregenQueue(max_depth=PREGEN_DEPTH)
-        pregen.set_target(text, instruct)
+        pregen: PregenQueue | None = None
+        if not streaming_available:
+            pregen = PregenQueue(max_depth=PREGEN_DEPTH)
+            pregen.set_target(text, instruct)
+
+        # pending streaming synth: (thread, seed, instruct, result, live_proc, cancel)
+        pending: tuple[Thread, int, str, dict, Any, Event] | None = None
 
         while True:
             if generate_next:
-                got = pregen.take(instruct)
+                got = pregen.take(instruct) if pregen is not None else None
                 if got is not None:
                     seed, audio, sr = got
                     if verbose:
-                        print(f"  seed={seed} (pregen)")
+                        print(f"  seed={seed}")
+                    take_path = takes_dir / f"{char.name}__{seed}{WAV_EXT}"
+                    sf.write(str(take_path), audio, sr)
+                    takes.append((seed, instruct, audio, sr, take_path))
+                    cursor = len(takes) - 1
+                    if pregen is not None:
+                        pregen.ensure_running()
+                    play(take_path)
                 else:
+                    # spawn background streaming synth; prompt will appear
+                    # immediately while PCM streams to ffplay live.
                     seed = int(getattr(config, "seed", 0) or 0) or random.randint(
                         1, 2**31 - 1
                     )
                     if verbose:
                         print(f"  seed={seed}")
-                    try:
-                        with engine_lock:
-                            config.seed = seed
-                            audio, sr = engine.design_voice(
-                                text=text, instruct=instruct
-                            )
-                    except Exception as e:
-                        print(f"  failed: {e}")
-                        ans = _prompt("  [n]ext / [s]kip / [q]uit: ")
-                        if ans in ("q", "quit"):
-                            quit_requested = True
-                            break
-                        if ans in ("s", "skip"):
-                            break
-                        config.seed = random.randint(1, 2**31 - 1)
-                        continue
-                take_path = takes_dir / f"{char.name}__{seed}{WAV_EXT}"
-                sf.write(str(take_path), audio, sr)
-                takes.append((seed, instruct, audio, sr, take_path))
-                cursor = len(takes) - 1
-                generate_next = False
-                # keep the pregen buffer filling; play current concurrently
-                pregen.ensure_running()
-                play(take_path)
+                    live_proc = None
+                    use_live = streaming_available
+                    if use_live:
+                        stop()  # kill any prior playback before new stream
+                        live_proc = _play_pcm_stream(SAMPLE_RATE)
+                        use_live = live_proc is not None and live_proc.stdin is not None
+                        if use_live:
+                            playback = live_proc  # so stop() can kill it
+                    synth_seed = seed
+                    synth_instruct = instruct
+                    result: dict[str, Any] = {}
+                    cancel_event = Event()
 
-            cur_seed, cur_instruct, cur_audio, cur_sr, cur_path = takes[cursor]
-            pos = f"{cursor + 1}/{len(takes)}"
+                    def _synth(
+                        _live_proc=live_proc,
+                        _use_live=use_live,
+                        _seed=synth_seed,
+                        _instruct=synth_instruct,
+                        _result=result,
+                        _cancel=cancel_event,
+                    ) -> None:
+                        try:
+                            with engine_lock:
+                                config.seed = _seed
+                                if _use_live:
+
+                                    def _on_chunk(b: bytes) -> None:
+                                        try:
+                                            _live_proc.stdin.write(b)
+                                            _live_proc.stdin.flush()
+                                        except (BrokenPipeError, OSError):
+                                            pass
+
+                                    assert stream_fn is not None
+                                    a, s = stream_fn(
+                                        text=text,
+                                        instruct=_instruct,
+                                        on_chunk=_on_chunk,
+                                        cancel=_cancel,
+                                    )
+                                else:
+                                    a, s = engine.design_voice(
+                                        text=text, instruct=_instruct
+                                    )
+                            _result["audio"] = a
+                            _result["sr"] = s
+                        except Exception as e:
+                            _result["error"] = e
+                        finally:
+                            if (
+                                _use_live
+                                and _live_proc is not None
+                                and _live_proc.stdin is not None
+                            ):
+                                try:
+                                    _live_proc.stdin.close()
+                                except OSError:
+                                    pass
+
+                    t = Thread(target=_synth, daemon=True)
+                    t.start()
+                    pending = (
+                        t,
+                        synth_seed,
+                        synth_instruct,
+                        result,
+                        live_proc,
+                        cancel_event,
+                    )
+                generate_next = False
+
+            if pending is not None:
+                pos = f"{len(takes) + 1}/?"
+            else:
+                pos = f"{cursor + 1}/{len(takes)}"
             ans = _prompt(
                 f"  [{pos}] [y]es / [n]ext / [p]rev / [r]eplay / [d]escribe / [s]kip / [q]uit: "
             )
+            # resolve any pending streaming synth: cancel it unless the user
+            # action needs the full audio (y = accept, r = replay).
+            if pending is not None:
+                _t, _seed, _instruct, _result, _live_proc, _cancel = pending
+                keep = ans in ("y", "yes", "r", "replay")
+                if not keep:
+                    _cancel.set()
+                if _t.is_alive():
+                    if keep:
+                        print("  (waiting for synthesis to finish...)")
+                    _t.join()
+                pending = None
+                if keep and "error" not in _result and "audio" in _result:
+                    audio = _result["audio"]
+                    sr = _result["sr"]
+                    take_path = takes_dir / f"{char.name}__{_seed}{WAV_EXT}"
+                    sf.write(str(take_path), audio, sr)
+                    takes.append((_seed, _instruct, audio, sr, take_path))
+                    cursor = len(takes) - 1
+                else:
+                    if _live_proc is not None:
+                        _stop_playback(_live_proc)
+                    if keep and "error" in _result:
+                        print(f"  failed: {_result['error']}")
             stop()
+            # if synth was cancelled/errored and no prior takes exist, loop back
+            # and regenerate (unless user explicitly skipped or quit).
+            if not takes:
+                if ans in ("q", "quit"):
+                    quit_requested = True
+                    break
+                if ans in ("s", "skip"):
+                    break
+                if ans in ("d", "describe"):
+                    new_desc = _edit_description(instruct)
+                    if new_desc != instruct:
+                        instruct = new_desc
+                        print(f"  description: {instruct}")
+                config.seed = random.randint(1, 2**31 - 1)
+                generate_next = True
+                continue
+            cur_seed, cur_instruct, cur_audio, cur_sr, cur_path = takes[cursor]
             if ans in ("y", "yes"):
                 accept_hash = compute_hash(
                     {"name": char.name, "description": cur_instruct, "text": text}
@@ -421,7 +557,8 @@ def _run_directed_design(
                 break
             if ans in ("r", "replay"):
                 play(cur_path)
-                pregen.ensure_running()
+                if pregen is not None:
+                    pregen.ensure_running()
                 continue
             if ans in ("p", "prev"):
                 if cursor > 0:
@@ -429,7 +566,8 @@ def _run_directed_design(
                     play(takes[cursor][4])
                 else:
                     print("  (no earlier take)")
-                pregen.ensure_running()
+                if pregen is not None:
+                    pregen.ensure_running()
                 continue
             if ans in ("d", "describe"):
                 new_desc = _edit_description(instruct)
@@ -437,7 +575,8 @@ def _run_directed_design(
                     instruct = new_desc
                     print(f"  description: {instruct}")
                     # flush stale buffer and start refilling for the new instruct
-                    pregen.set_target(text, instruct)
+                    if pregen is not None:
+                        pregen.set_target(text, instruct)
                 config.seed = random.randint(1, 2**31 - 1)
                 generate_next = True
                 continue
@@ -450,19 +589,97 @@ def _run_directed_design(
             if cursor < len(takes) - 1:
                 cursor += 1
                 play(takes[cursor][4])
-                pregen.ensure_running()
+                if pregen is not None:
+                    pregen.ensure_running()
             else:
                 config.seed = random.randint(1, 2**31 - 1)
                 generate_next = True
 
         stop()
         # let any background pregen finish before moving to next character
-        pregen.join()
+        if pregen is not None:
+            pregen.join()
         if quit_requested:
             break
 
     resume.save()
     print(f"audition: {accepted} accepted, {skipped} skipped")
+
+
+def _accept_existing(
+    workdir: Path,
+    cast: List[Character],
+    voices_dir: Path,
+    resume: ResumeManager,
+    preset_voices: bool = False,
+) -> None:
+    """mark existing audition wavs as fresh under current cast hashes."""
+    voices_map: dict[str, str] = {}
+    if preset_voices:
+        from .casting import load_voices
+
+        voices_map = load_voices(workdir)
+
+    updated = 0
+    missing: list[str] = []
+    for char in cast:
+        wav_path = voices_dir / f"{char.name}{WAV_EXT}"
+        if not wav_path.exists():
+            missing.append(char.name)
+            continue
+
+        prior = (
+            resume.state.get(char.name, {}) if isinstance(resume.state, dict) else {}
+        )
+        prior_entry = prior if isinstance(prior, dict) else {}
+
+        if preset_voices:
+            voice_id = voices_map.get(char.name) or prior_entry.get("voice_id")
+            if not voice_id:
+                missing.append(f"{char.name} (no voice_id)")
+                continue
+            task_hash = compute_hash(
+                {
+                    "name": char.name,
+                    "voice_id": voice_id,
+                    "text": char.audition_line,
+                    "mode": "preset",
+                }
+            )
+            resume.update(
+                char.name,
+                task_hash,
+                character=char.name,
+                voice_id=voice_id,
+                audition_line=char.audition_line,
+                wav_sha256=wav_sha256(wav_path),
+            )
+        else:
+            task_hash = compute_hash(
+                {
+                    "name": char.name,
+                    "description": char.description,
+                    "text": char.audition_line,
+                }
+            )
+            resume.update(
+                char.name,
+                task_hash,
+                character=char.name,
+                prompt=char.description,
+                audition_line=char.audition_line,
+                seed=int(prior_entry.get("seed", 0) or 0),
+                wav_sha256=wav_sha256(wav_path),
+            )
+        updated += 1
+
+    resume.save()
+    print(f"audition: accepted {updated} existing voices")
+    if missing:
+        print(
+            f"audition: {len(missing)} missing — re-run without --accept "
+            f"to fill in: {', '.join(missing)}"
+        )
 
 
 def _run_preset(
@@ -600,4 +817,5 @@ def cmd_audition(args):
         callback=getattr(args, "callback", False),
         preset_voices=preset_voices,
         directed=directed,
+        accept=getattr(args, "accept", False),
     )

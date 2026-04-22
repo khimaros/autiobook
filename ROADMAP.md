@@ -3,6 +3,23 @@
 ```
 [ ] audition command: add --audition-line flag to override per-character audition lines
 
+[x] export: skip per-chapter export work when state.json shows everything is up to date (no print, no mp3 lyric rewrite); back-fill loop only touches chapters missing the .srt sidecar
+[x] review: record per-batch validation rejections to review/audit.json as kind="validation" so the reviewer can see when LLM output was rolled back due to missing/hallucinated text
+[x] --accept support in every dramatize phase (cast, audition, emote, script, revise, review, perform, retake, export): re-stamp existing artifacts as fresh under current hashes or skip the phase entirely
+[x] dramatize: every phase runs chapter-wise by default (cast→audition→[emote]→script→revise→[review]→perform→retake→export per chapter); --phase-wise restores prior behavior
+[x] dramatize: unresolved audit flags no longer block further review passes; gate is enforced only before perform
+[x] dramatize: per-chapter mp3 export runs inline in chapter-wise mode so exports land before the next chapter begins
+[x] export: embed synchronized lyrics in mp3 id3 tags (SYLT + USLT) so audio-only players render captions without autoloading sidecars
+[x] export: emit .srt/.vtt subtitles alongside mp3 in export/ instead of alongside wav in perform/synthesize
+[x] review --verbose: list all per-segment changes (speaker/text/instruction) made during review
+[x] review: emit only changed segments by index; incremental save; per-batch resume in state.json; progress bar
+[x] review: restrict to speaker/instruction corrections (text never modified)
+[x] review: LLM human-review flags written to review/flags.json as discovered
+[x] flags command: interactive walkthrough / list / clear for review flags
+[x] flags: record source_span, show context in walkthrough, [e]dit option that auto-validates
+[x] review: record speaker/instruction edits and flags to review/audit.json; `flags` renamed to `audit` (defaults to flags, --all includes edits)
+[x] perform + dramatize pipeline: block if unresolved flags exist; bypass with --ignore-flags
+[x] perform: fix chapter not reassembling when a segment was regenerated but m_hash matched stored (due to cached wav_sha256 in resume state)
 [x] rename phases: audition→emote (per-emotion variants) and introduce→audition (per-character base); emote reuses audition seed
 [x] fix_missing_segment: prevent LLM from grabbing text from context instead of MISSING TEXT
 [x] fix nested HTML tag duplication in extract_text_from_html (div containing p tags)

@@ -1,18 +1,20 @@
 """mp3 export with id3 metadata."""
 
 import contextlib
+import json
 import shutil
 import subprocess
 import wave
 from dataclasses import dataclass
 from pathlib import Path
 
-from mutagen.id3 import APIC, ID3  # type: ignore
+from mutagen.id3 import APIC, ID3, SYLT, USLT  # type: ignore
 from mutagen.mp3 import MP3  # type: ignore
 from pydub import AudioSegment  # type: ignore
 
 from .config import COVER_FILE, DEFAULT_BITRATE, M4B_EXT, MP3_EXT, WAV_EXT
 from .epub import load_metadata
+from .pooling import timing_manifest_path, write_subtitles
 
 
 @dataclass
@@ -24,6 +26,83 @@ class MP3Metadata:
     artist: str
     track_number: int
     total_tracks: int
+
+
+def _load_chunks(wav_path: Path) -> list[dict]:
+    """return the chunk list from the timing manifest beside `wav_path`, or []."""
+    tpath = timing_manifest_path(wav_path)
+    if not tpath.exists():
+        return []
+    try:
+        chunks = json.loads(tpath.read_text()).get("chunks", [])
+    except (OSError, ValueError):
+        return []
+    return list(chunks)
+
+
+def emit_subtitles_from_timing(wav_path: Path, target_path: Path) -> None:
+    """write .srt/.vtt next to `target_path` using the wav's timing manifest."""
+    chunks = _load_chunks(wav_path)
+    if not chunks:
+        return
+    write_subtitles(target_path, chunks)
+
+
+def embed_synced_lyrics(mp3_path: Path, wav_path: Path) -> None:
+    """embed timed text from the wav's timing manifest into the mp3 as id3 SYLT.
+
+    SYLT is the standard id3v2 frame for synchronized lyrics/captions and
+    is rendered by players like voice, poweramp, and vlc. a plain USLT
+    (unsynced) copy is also added as a fallback for players that only
+    understand USLT.
+    """
+    chunks = _load_chunks(wav_path)
+    if not chunks:
+        return
+
+    synced: list[tuple[str, int]] = []
+    unsynced: list[str] = []
+    for c in chunks:
+        text = (c.get("text") or "").strip()
+        if not text:
+            continue
+        speaker = c.get("speaker")
+        body = f"[{speaker}] {text}" if speaker else text
+        ms = max(0, int(round(float(c.get("start_s", 0.0)) * 1000)))
+        synced.append((body, ms))
+        unsynced.append(body)
+    if not synced:
+        return
+
+    mp3 = MP3(str(mp3_path), ID3=ID3)
+    if mp3.tags is None:
+        mp3.add_tags()
+    assert mp3.tags is not None
+
+    # remove any existing synced/unsynced lyric frames so reruns stay clean.
+    for key in list(mp3.tags.keys()):
+        if key.startswith("SYLT") or key.startswith("USLT"):
+            del mp3.tags[key]
+
+    mp3.tags.add(
+        SYLT(
+            encoding=3,  # utf-8
+            lang="eng",
+            format=2,  # absolute milliseconds
+            type=1,  # lyrics
+            desc="captions",
+            text=synced,
+        )
+    )
+    mp3.tags.add(
+        USLT(
+            encoding=3,
+            lang="eng",
+            desc="captions",
+            text="\n".join(unsynced),
+        )
+    )
+    mp3.save()
 
 
 def wav_to_mp3(
@@ -193,8 +272,14 @@ def export_audiobook(
     bitrate: str = DEFAULT_BITRATE,
     force: bool = False,
     m4b: bool = False,
+    chapters: list[int] | None = None,
+    accept: bool = False,
 ) -> tuple[int, int]:
-    """export all chapters as mp3 files with cover art."""
+    """export all chapters as mp3 files with cover art.
+
+    accept=True skips re-encoding; existing mp3s are re-stamped as fresh under
+    the current wav/metadata hash.
+    """
     from .resume import ResumeManager, compute_hash, get_command_dir, list_chapters
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -215,7 +300,12 @@ def export_audiobook(
         return 0, 0
 
     chapter_paths = list_chapters(
-        meta, source_dir, output_dir, source_ext=WAV_EXT, target_ext=MP3_EXT
+        meta,
+        source_dir,
+        output_dir,
+        chapters_filter=chapters,
+        source_ext=WAV_EXT,
+        target_ext=MP3_EXT,
     )
 
     cover = get_command_dir(workdir, "extract") / COVER_FILE
@@ -228,12 +318,39 @@ def export_audiobook(
     info_map = {c["index"]: c for c in meta["chapters"]}
 
     if m4b:
+        for _, wav_p, mp3_p in chapter_paths:
+            emit_subtitles_from_timing(wav_p, mp3_p)
         return export_m4b(
             chapter_paths, info_map, meta, output_dir, cover_path, bitrate
         )
 
     resume = ResumeManager.for_command(workdir, "export", force=force)
 
+    if accept:
+        accepted = 0
+        for idx, wav_p, mp3_p in chapter_paths:
+            c_info = info_map.get(idx)
+            if not c_info or not mp3_p.exists():
+                continue
+            h = compute_hash(
+                {
+                    "size": wav_p.stat().st_size,
+                    "mtime": wav_p.stat().st_mtime,
+                    "title": c_info["title"],
+                    "album": meta["title"],
+                    "artist": meta["author"],
+                    "track": idx,
+                    "bitrate": bitrate,
+                    "cover": str(cover_path) if cover_path else None,
+                }
+            )
+            resume.update(str(mp3_p), h)
+            accepted += 1
+        resume.save()
+        print(f"export: accepted {accepted} existing mp3(s)")
+        return 0, accepted
+
+    stale: list[tuple[int, Path, Path, dict, str]] = []
     for idx, wav_p, mp3_p in chapter_paths:
         c_info = info_map.get(idx)
         if not c_info:
@@ -250,12 +367,31 @@ def export_audiobook(
                 "cover": str(cover_path) if cover_path else None,
             }
         )
-
         if not force and mp3_p.exists() and resume.is_fresh(str(mp3_p), h):
             skipped += 1
             continue
+        stale.append((idx, wav_p, mp3_p, c_info, h))
 
-        print(f"exporting {wav_p.name}...")
+    # back-fill srt+lyrics for prior exports that predate the sidecar feature.
+    # presence of the .srt is the sentinel; lyrics are written together with it.
+    backfill = [
+        (wav_p, mp3_p)
+        for _, wav_p, mp3_p in chapter_paths
+        if mp3_p.exists() and not mp3_p.with_suffix(".srt").exists()
+    ]
+
+    if not stale and not backfill:
+        print(f"export: all {len(chapter_paths)} chapter(s) up to date.")
+        return 0, skipped
+
+    if stale:
+        print(
+            f"export: exporting chapter(s) {[s[0] for s in stale]} "
+            f"to {output_dir}/..."
+        )
+
+    for idx, wav_p, mp3_p, c_info, h in stale:
+        print(f"exporting {wav_p.name} -> {mp3_p}...")
         wav_to_mp3(
             wav_p,
             mp3_p,
@@ -269,8 +405,16 @@ def export_audiobook(
             bitrate,
             cover_path,
         )
+        emit_subtitles_from_timing(wav_p, mp3_p)
+        embed_synced_lyrics(mp3_p, wav_p)
         resume.update(str(mp3_p), h)
         resume.save()
         new += 1
+
+    for wav_p, mp3_p in backfill:
+        if mp3_p.with_suffix(".srt").exists():
+            continue  # just written by the stale loop above
+        emit_subtitles_from_timing(wav_p, mp3_p)
+        embed_synced_lyrics(mp3_p, wav_p)
 
     return new, skipped

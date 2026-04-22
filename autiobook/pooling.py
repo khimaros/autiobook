@@ -316,27 +316,34 @@ def _iter_cues(chunks: list[dict[str, Any]]):
 
 
 def write_subtitles(wav_path: Path, chunks: list[dict[str, Any]]) -> None:
-    """write SRT and VTT files next to the chapter wav."""
-    srt_lines: list[str] = []
-    vtt_lines: list[str] = ["WEBVTT", ""]
+    """write SRT and VTT files next to the chapter wav.
+
+    both formats use CRLF line endings and a trailing blank line after every
+    cue (including the last) — strict parsers like GStreamer's srtparse and
+    some players' autoloader reject looser variants.
+    """
+    srt_parts: list[str] = []
+    vtt_parts: list[str] = ["WEBVTT\r\n\r\n"]
+    prev_end = -1.0
     for idx, (start, end, body) in enumerate(_iter_cues(chunks), start=1):
-        srt_lines.extend(
-            [
-                str(idx),
-                f"{_format_ts(start, ',')} --> {_format_ts(end, ',')}",
-                body,
-                "",
-            ]
+        # guard against non-monotonic/zero-length cues that confuse parsers.
+        if end <= start:
+            end = start + 0.001
+        if start < prev_end:
+            start = prev_end
+            if end <= start:
+                end = start + 0.001
+        prev_end = end
+        srt_parts.append(
+            f"{idx}\r\n"
+            f"{_format_ts(start, ',')} --> {_format_ts(end, ',')}\r\n"
+            f"{body}\r\n\r\n"
         )
-        vtt_lines.extend(
-            [
-                f"{_format_ts(start, '.')} --> {_format_ts(end, '.')}",
-                body,
-                "",
-            ]
+        vtt_parts.append(
+            f"{_format_ts(start, '.')} --> {_format_ts(end, '.')}\r\n" f"{body}\r\n\r\n"
         )
-    srt_path(wav_path).write_text("\n".join(srt_lines), encoding="utf-8")
-    vtt_path(wav_path).write_text("\n".join(vtt_lines), encoding="utf-8")
+    srt_path(wav_path).write_text("".join(srt_parts), encoding="utf-8")
+    vtt_path(wav_path).write_text("".join(vtt_parts), encoding="utf-8")
 
 
 def write_timing_manifest(
@@ -347,7 +354,10 @@ def write_timing_manifest(
     sample_rate: int = SAMPLE_RATE,
     pause_ms: int = PAUSE_MS_BETWEEN_CHUNKS,
 ) -> None:
-    """write a timing manifest (JSON) + subtitles (SRT) for a chapter wav."""
+    """write a timing manifest (JSON) for a chapter wav.
+
+    subtitles (.srt/.vtt) are emitted later during export, not here.
+    """
     import json
 
     pause_s = pause_ms / 1000.0
@@ -375,7 +385,6 @@ def write_timing_manifest(
         "chunks": chunks,
     }
     timing_manifest_path(wav_path).write_text(json.dumps(manifest, indent=2))
-    write_subtitles(wav_path, chunks)
 
 
 def _assemble_chapter(
@@ -529,6 +538,7 @@ def process_audio_pipeline(
         needs_assembly = (
             force
             or not wav_path.exists()
+            or bool(pending_hashes)
             or (resume and not resume.is_fresh(str(wav_path), m_hash))
         )
 

@@ -16,12 +16,15 @@ from .audio import (
 from .config import (
     BASE_MODEL,
     CAST_BATCH_SIZE,
+    CAST_CHUNK_OVERLAP_WORDS,
+    CAST_CHUNK_WORDS,
     CAST_FILE,
     DEFAULT_CAST,
     DEFAULT_LLM_MODEL,
     DEFAULT_THINKING_BUDGET,
     EMOTION_SEP,
     RETAINED_SPEAKERS,
+    REVIEW_BATCH_SIZE,
     SCRIPT_EXT,
     TXT_EXT,
     VALIDATION_MAX_RETRIES,
@@ -36,6 +39,7 @@ from .llm import (
     fix_missing_segment,
     generate_cast,
     process_script_chunk,
+    review_script_batch,
     split_text_smart,
 )
 from .pooling import AudioTask, process_audio_pipeline
@@ -116,6 +120,25 @@ def load_cast(workdir: Path) -> List[Character]:
     return chars_dict
 
 
+_QUOTE_PAIRS = {'"': '"', "'": "'", "“": "”", "‘": "’"}
+
+
+def _strip_wrapping_quotes(text: str) -> str:
+    """strip a single matched pair of boundary quotes, if present.
+
+    LLM segments split narrator from dialogue, so a segment wrapped in
+    matching quotes has redundant boundary marks — spoken as a pause or
+    glottal click by TTS. preserves inner quotes and unmatched boundaries.
+    """
+    s = text.strip()
+    if len(s) < 2:
+        return text
+    close = _QUOTE_PAIRS.get(s[0])
+    if close and s.endswith(close):
+        return s[1:-1].strip()
+    return text
+
+
 def save_script(
     script_path: Path,
     segments: List[ScriptSegment],
@@ -126,7 +149,7 @@ def save_script(
         "segments": [
             {
                 "speaker": s.speaker,
-                "text": s.text,
+                "text": _strip_wrapping_quotes(s.text),
                 "instruction": s.instruction,
             }
             for s in segments
@@ -191,11 +214,35 @@ def _merge_character_into_cast(
         if merge_source and merge_source.casefold() != canon_low:
             new_aliases.add(merge_source)
 
+        # drop proposed aliases that conflict with other characters in the cast
+        existing_low = existing.name.lower()
+        rejected_aliases: list[str] = []
+        filtered_new: set[str] = set()
+        for a in new_aliases:
+            a_low = a.lower()
+            owner = cast_map.get(a_low)
+            if owner is not None and owner is not existing:
+                rejected_aliases.append(f"{a} (conflicts with '{owner.name}')")
+                continue
+            alias_owner = alias_map.get(a_low)
+            if alias_owner is not None and alias_owner != existing_low:
+                rejected_aliases.append(
+                    f"{a} (already alias of '{cast_map[alias_owner].name}')"
+                )
+                continue
+            filtered_new.add(a)
+        new_aliases = filtered_new
+
         added_aliases = sorted(new_aliases - old_aliases)
         if new_aliases != set(existing.aliases or []):
             existing.aliases = sorted(new_aliases) if new_aliases else None
         if added_aliases:
             diff_parts.append("+aliases: " + ", ".join(repr(a) for a in added_aliases))
+        if verbose and rejected_aliases:
+            diff_parts.append("rejected aliases: " + ", ".join(rejected_aliases))
+        # refresh alias_map for newly added aliases
+        for a in added_aliases:
+            alias_map[a.lower()] = existing_low
 
         if c.description and c.description != existing.description:
             diff_parts.append(
@@ -218,12 +265,13 @@ def _merge_character_into_cast(
     )
     c.aliases = clean_aliases or None
     if verbose:
-        alias_str = (
-            f" (aliases: {', '.join(repr(a) for a in clean_aliases)})"
-            if clean_aliases
-            else ""
-        )
-        print(f"  added new character: '{c.name}'{alias_str}")
+        print(f"  added new character: '{c.name}'")
+        if clean_aliases:
+            print(f"    aliases: {', '.join(repr(a) for a in clean_aliases)}")
+        if c.description:
+            print(f"    description: {c.description!r}")
+        if c.audition_line:
+            print(f"    audition_line: {c.audition_line!r}")
     cast_map[c.name.lower()] = c
     for alias in clean_aliases:
         alias_map[alias.lower()] = c.name.lower()
@@ -254,7 +302,64 @@ def _get_chapters_to_analyze(
     return chapters_to_process, chapter_hashes
 
 
+def _chunk_by_words(text: str, max_words: int, overlap_words: int) -> list[str]:
+    """split text at paragraph boundaries with tail-overlap for coreference.
+
+    each chunk (after the first) is prefixed with the last `overlap_words`
+    from the prior chunk so a character introduced near a boundary remains
+    attributable in the next chunk.
+    """
+    paragraphs = [p for p in text.split("\n\n") if p.strip()]
+    chunks: list[str] = []
+    current: list[str] = []
+    count = 0
+
+    def _flush() -> None:
+        if current:
+            chunks.append("\n\n".join(current))
+
+    for p in paragraphs:
+        wc = len(p.split())
+        if count + wc > max_words and current:
+            _flush()
+            # build overlap from tail of just-flushed chunk
+            tail_words: list[str] = []
+            for prev in reversed(current):
+                tail_words = prev.split() + tail_words
+                if len(tail_words) >= overlap_words:
+                    break
+            overlap = " ".join(tail_words[-overlap_words:]) if overlap_words else ""
+            current = [overlap] if overlap else []
+            count = len(overlap.split())
+        current.append(p)
+        count += wc
+
+    _flush()
+    return chunks
+
+
+def _save_cast_narrator_first(workdir: Path, cast_map: dict[str, Character]) -> None:
+    """persist cast with 'narrator' pinned to the front if present."""
+    final_cast = list(cast_map.values())
+    narrator = next((c for c in final_cast if c.name.lower() == "narrator"), None)
+    if narrator:
+        final_cast.remove(narrator)
+        final_cast.insert(0, narrator)
+    save_cast(workdir, final_cast)
+
+
+def _batch_chunks(batch_chapters: list[int], chapter_map: dict[int, Path]) -> list[str]:
+    """build the sample text for a batch and split it into cast chunks."""
+    full_sample = ""
+    for num in batch_chapters:
+        txt_path = chapter_map[num]
+        full_sample += f"\n--- Chapter {txt_path.stem} ---\n"
+        full_sample += txt_path.read_text(encoding="utf-8")
+    return _chunk_by_words(full_sample, CAST_CHUNK_WORDS, CAST_CHUNK_OVERLAP_WORDS)
+
+
 def _process_cast_batch(
+    workdir: Path,
     batch_chapters: list[int],
     chapter_map: dict[int, Path],
     cast_map: dict[str, Character],
@@ -264,42 +369,44 @@ def _process_cast_batch(
     model: str | None,
     verbose: bool,
     thinking_budget: int = DEFAULT_THINKING_BUDGET,
+    progress: Any = None,
 ) -> int:
-    """process a single batch of chapters for cast generation."""
-    full_sample = ""
-    for num in batch_chapters:
-        txt_path = chapter_map[num]
-        full_sample += f"\n--- Chapter {txt_path.stem} ---\n"
-        full_sample += txt_path.read_text(encoding="utf-8")
+    """process a single batch of chapters, chunked for coreference context."""
+    chunks = _batch_chunks(batch_chapters, chapter_map)
+    total_found = 0
+    for ci, chunk in enumerate(chunks):
+        if progress is not None:
+            progress.set_postfix_str(
+                f"batch {batch_chapters} chunk {ci + 1}/{len(chunks)} "
+                f"({len(cast_map)} known)"
+            )
+        elif len(chunks) > 1:
+            print(
+                f"    chunk {ci + 1}/{len(chunks)} "
+                f"(~{len(chunk.split())} words, {len(cast_map)} known)"
+            )
+        current_cast = list(cast_map.values())
+        summary = "\n".join(
+            f"- {c.name}: {c.description}"
+            + (f" (also known as: {', '.join(c.aliases)})" if c.aliases else "")
+            for c in current_cast
+        )
+        chunk_cast = generate_cast(
+            chunk,
+            api_base,
+            api_key,
+            model or DEFAULT_LLM_MODEL,
+            existing_cast_summary=summary,
+            thinking_budget=thinking_budget,
+        )
+        for c in chunk_cast:
+            _merge_character_into_cast(c, cast_map, alias_map, verbose=verbose)
+        total_found += len(chunk_cast)
+        _save_cast_narrator_first(workdir, cast_map)
+        if progress is not None:
+            progress.update(1)
 
-    # format current cast for context
-    current_cast = list(cast_map.values())
-    summary = "\n".join(
-        f"- {c.name}: {c.description}"
-        + (f" (also known as: {', '.join(c.aliases)})" if c.aliases else "")
-        for c in current_cast
-    )
-
-    batch_cast = generate_cast(
-        full_sample,
-        api_base,
-        api_key,
-        model or DEFAULT_LLM_MODEL,
-        existing_cast_summary=summary,
-        thinking_budget=thinking_budget,
-    )
-
-    added, updated, merged = 0, 0, 0
-    for c in batch_cast:
-        result = _merge_character_into_cast(c, cast_map, alias_map, verbose=verbose)
-        if result == "added":
-            added += 1
-        elif result == "updated":
-            updated += 1
-        elif result == "merged":
-            merged += 1
-
-    return len(batch_cast)
+    return total_found
 
 
 def run_cast_generation(
@@ -311,8 +418,14 @@ def run_cast_generation(
     verbose: bool = False,
     force: bool = False,
     thinking_budget: int = DEFAULT_THINKING_BUDGET,
+    accept: bool = False,
 ) -> List[Character]:
-    """analyze book and generate cast list."""
+    """analyze book and generate cast list.
+
+    when `accept` is True, skip llm analysis and mark the existing cast as
+    fresh under current chapter hashes. useful after hand-editing
+    cast/characters.json to lock it in without re-analyzing.
+    """
     existing_cast = load_cast(workdir)
     resume = ResumeManager.for_command(workdir, "cast", force=force)
 
@@ -337,6 +450,13 @@ def run_cast_generation(
         print(f"cast: all {len(chapters or chapter_map)} chapters up to date.")
         return existing_cast
 
+    if accept:
+        for num, h in chapter_hashes.items():
+            resume.update(str(num), h)
+        resume.save()
+        print(f"cast: accepted existing cast for {len(chapter_hashes)} chapter(s)")
+        return existing_cast
+
     print(f"cast: analyzing {len(chapters_to_process)} chapters...")
 
     cast_map = {c.name.lower(): c for c in existing_cast}
@@ -345,35 +465,36 @@ def run_cast_generation(
     }
 
     batch_size = CAST_BATCH_SIZE
-    for batch_start in range(0, len(chapters_to_process), batch_size):
-        batch_chapters = chapters_to_process[batch_start : batch_start + batch_size]
-        print(
-            f"  batch {batch_start // batch_size + 1}: chapters {batch_chapters} "
-            f"({len(cast_map)} characters known)..."
-        )
+    batches = [
+        chapters_to_process[i : i + batch_size]
+        for i in range(0, len(chapters_to_process), batch_size)
+    ]
+    # precompute total chunks across all batches so the progress bar is accurate
+    total_chunks = sum(len(_batch_chunks(b, chapter_map)) for b in batches)
+    progress = tqdm(total=total_chunks, desc="cast", unit="chunk")
 
-        _process_cast_batch(
-            batch_chapters,
-            chapter_map,
-            cast_map,
-            alias_map,
-            api_base,
-            api_key,
-            model,
-            verbose,
-            thinking_budget,
-        )
+    try:
+        for batch_chapters in batches:
+            _process_cast_batch(
+                workdir,
+                batch_chapters,
+                chapter_map,
+                cast_map,
+                alias_map,
+                api_base,
+                api_key,
+                model,
+                verbose,
+                thinking_budget,
+                progress=progress,
+            )
 
-        for num in batch_chapters:
-            resume.update(str(num), chapter_hashes[num])
-        resume.save()
-
-        final_cast = list(cast_map.values())
-        narrator = next((c for c in final_cast if c.name.lower() == "narrator"), None)
-        if narrator:
-            final_cast.remove(narrator)
-            final_cast.insert(0, narrator)
-        save_cast(workdir, final_cast)
+            for num in batch_chapters:
+                resume.update(str(num), chapter_hashes[num])
+            resume.save()
+            _save_cast_narrator_first(workdir, cast_map)
+    finally:
+        progress.close()
 
     return list(cast_map.values())
 
@@ -393,6 +514,71 @@ def _emote_tasks(
     return tasks
 
 
+def _accept_existing_emotes(
+    workdir: Path,
+    cast: List[Character],
+    voices_dir: Path,
+    resume: ResumeManager,
+    audition_line: str | None,
+    preset_map: dict[str, str],
+    preset_voices: bool,
+) -> None:
+    """mark existing emote wavs as fresh under current hashes, without regen."""
+    from .audio import wav_sha256
+    from .audition import recorded_seed
+
+    updated = 0
+    missing: list[str] = []
+    for char in cast:
+        intro_seed = recorded_seed(workdir, char.name)
+        voice_id = preset_map.get(char.name) if preset_voices else None
+        if preset_voices and not voice_id:
+            missing.append(f"{char.name} (no voice_id)")
+            continue
+        for filename, resume_key, text, instruct in _emote_tasks(char, audition_line):
+            wav_path = voices_dir / f"{filename}{WAV_EXT}"
+            if not wav_path.exists():
+                missing.append(resume_key)
+                continue
+            emote_instruct = instruct
+            if preset_voices:
+                _, _, emotion_only = instruct.partition("; ")
+                emote_instruct = emotion_only or instruct
+            task_hash = compute_hash(
+                {
+                    "name": char.name,
+                    "description": char.description,
+                    "text": text,
+                    "instruct": emote_instruct,
+                    "audition_seed": intro_seed,
+                    "voice_id": voice_id or "",
+                }
+            )
+            character, _, emotion = resume_key.partition("/")
+            prior = resume.state.get(resume_key, {})
+            prior_seed = (
+                int(prior.get("seed", 0) or 0) if isinstance(prior, dict) else 0
+            )
+            resume.update(
+                resume_key,
+                task_hash,
+                character=character,
+                emotion=emotion,
+                prompt=emote_instruct,
+                audition_line=text,
+                seed=prior_seed,
+                wav_sha256=wav_sha256(wav_path),
+            )
+            updated += 1
+    resume.save()
+    print(f"emote: accepted {updated} existing samples")
+    if missing:
+        print(
+            f"emote: {len(missing)} missing — re-run without --accept "
+            f"to fill in: {', '.join(missing)}"
+        )
+
+
 def run_emotes(
     workdir: Path,
     cast: List[Character] | None = None,
@@ -402,6 +588,7 @@ def run_emotes(
     config: Any = None,
     callback: bool = False,
     preset_voices: bool = False,
+    accept: bool = False,
 ) -> None:
     """generate voice samples for cast with emotion variants.
 
@@ -440,6 +627,12 @@ def run_emotes(
         if not preset_map:
             print("emote: --preset-voices set but no audition/voices.json; skipping")
             return
+
+    if accept:
+        _accept_existing_emotes(
+            workdir, cast, voices_dir, resume, audition_line, preset_map, preset_voices
+        )
+        return
 
     if config is None:
         from .tts import TTSConfig
@@ -694,11 +887,16 @@ def run_script_generation(
     force: bool = False,
     thinking_budget: int = DEFAULT_THINKING_BUDGET,
     revise: bool = False,
+    accept: bool = False,
 ) -> bool:
     """generate dramatized scripts for chapters incrementally.
 
     if revise=True, each chunk is reviewed against source text and
     retried with feedback on validation failures.
+
+    if accept=True, skip llm generation and mark existing script files as
+    fresh under the current (extract + cast) input hash. useful after hand-
+    editing a script to lock it in without re-generating.
     """
     cast = load_cast(workdir)
     # Cast hash for dependency tracking
@@ -757,6 +955,24 @@ def run_script_generation(
 
     if not to_process:
         print(f"script: all {completed_count + len(to_process)} chapters up to date.")
+        return True
+
+    if accept:
+        accepted, missing = 0, []
+        for chapter_num, _txt_path, script_path, _text, input_hash in to_process:
+            if not script_path.exists():
+                missing.append(chapter_num)
+                continue
+            resume.clear_partial(str(chapter_num))
+            resume.update(str(chapter_num), input_hash)
+            accepted += 1
+        resume.save()
+        print(f"script: accepted {accepted} existing script(s)")
+        if missing:
+            print(
+                f"script: {len(missing)} missing — re-run without --accept "
+                f"to generate: {missing}"
+            )
         return True
 
     print(
@@ -871,8 +1087,16 @@ def run_performance(
     force: bool = False,
     retake: bool = False,
     only_hashes: set[str] | None = None,
+    accept: bool = False,
 ) -> None:
-    """synthesize audio from scripts with segment-level resume."""
+    """synthesize audio from scripts with segment-level resume.
+
+    accept=True skips synthesis; existing chapter wavs are re-stamped as fresh
+    under the current segment-content fingerprint.
+    """
+    if accept:
+        print("perform: skipped (--accept)")
+        return
 
     cast = load_cast(workdir)
     if not cast:
@@ -895,8 +1119,16 @@ def run_performance(
     script_dir = get_command_dir(workdir, "script")
     perform_dir = get_command_dir(workdir, "perform")
 
-    if not any(voices_dir.glob(f"*{WAV_EXT}")):
-        msg = "no voices found. run 'emote' command first."
+    # perform can use emote wavs, fall back to audition wavs, or run in preset
+    # mode (voices.json assigns backend voice_ids so no ref wavs are needed).
+    from .casting import load_voices
+
+    has_emote = any(voices_dir.glob(f"*{WAV_EXT}"))
+    audition_dir = get_command_dir(workdir, "audition")
+    has_audition = any(audition_dir.glob(f"*{WAV_EXT}"))
+    has_preset = bool(load_voices(workdir))
+    if not (has_emote or has_audition or has_preset):
+        msg = "no voices found. run 'audition' (and optionally 'emote') first."
         print(msg)
         raise RuntimeError(msg)
 
@@ -1120,6 +1352,7 @@ def cmd_cast(args):
         verbose=args.verbose,
         force=args.force,
         thinking_budget=args.thinking_budget,
+        accept=getattr(args, "accept", False),
     )
 
 
@@ -1134,6 +1367,7 @@ def cmd_emote(args):
         audition_line=getattr(args, "audition_line", None),
         config=config,
         callback=getattr(args, "callback", False),
+        accept=getattr(args, "accept", False),
     )
 
 
@@ -1154,23 +1388,62 @@ def cmd_script(args):
         force=args.force,
         thinking_budget=args.thinking_budget,
         revise=getattr(args, "revise", False),
+        accept=getattr(args, "accept", False),
+    )
+
+
+def _check_unresolved_flags(
+    workdir: Path,
+    ignore: bool = False,
+    chapters: list[int] | None = None,
+) -> None:
+    """raise if review/audit.json contains unresolved flags, unless ignored.
+
+    when `chapters` is given, only flags for those chapters are considered.
+    """
+    audit_path = get_command_dir(workdir, "review") / "audit.json"
+    entries = _load_audit(audit_path)
+    flags = [e for e in entries if e.get("kind") == "flag"]
+    if chapters is not None:
+        wanted = set(chapters)
+
+        def _ch_num(entry: dict) -> int | None:
+            stem = entry.get("chapter") or ""
+            try:
+                return int(stem.split("_")[0])
+            except ValueError:
+                return None
+
+        flags = [f for f in flags if _ch_num(f) in wanted]
+    if not flags:
+        return
+    if ignore:
+        print(f"perform: ignoring {len(flags)} unresolved flag(s) at {audit_path}")
+        return
+    raise RuntimeError(
+        f"{len(flags)} unresolved review flag(s) at {audit_path}. "
+        f"run `autiobook audit {workdir}` to resolve, or pass --ignore-flags."
     )
 
 
 def cmd_perform(args):
     from .utils import get_clone_config
 
+    workdir = Path(args.workdir)
+    _check_unresolved_flags(workdir, ignore=getattr(args, "ignore_flags", False))
+
     chapters = get_chapters(args)
     config = get_clone_config(args)
 
     run_performance(
-        Path(args.workdir),
+        workdir,
         chapters,
         config,
         args.pooled,
         verbose=args.verbose,
         force=args.force,
         retake=getattr(args, "retake", False),
+        accept=getattr(args, "accept", False),
     )
 
 
@@ -1551,6 +1824,7 @@ def cmd_revise(args):
         fix_hallucinated=True,
         verbose=args.verbose,
         thinking_budget=args.thinking_budget,
+        accept=getattr(args, "accept", False),
     )
 
 
@@ -1680,8 +1954,16 @@ def run_revise(
     fix_hallucinated: bool = True,
     verbose: bool = False,
     thinking_budget: int = DEFAULT_THINKING_BUDGET,
+    accept: bool = False,
 ) -> None:
-    """fix script issues by filling missing segments and removing hallucinated ones."""
+    """fix script issues by filling missing segments and removing hallucinated ones.
+
+    accept=True skips validation/repair entirely — the on-disk scripts are
+    trusted as-is.
+    """
+    if accept:
+        print("revise: skipped (--accept)")
+        return
     cast = load_cast(workdir)
     extract_dir, script_dir = (
         get_command_dir(workdir, "extract"),
@@ -1745,12 +2027,6 @@ def run_revise(
                         f"llm fix attempt"
                     )
 
-    if total_added > 0 or total_removed > 0:
-        print(f"\nrevise: added {total_added}, removed {total_removed} segment(s)")
-    else:
-        print("revise: no issues found.")
-
-    # summary
     summary_parts = []
     if fix_missing and total_added > 0:
         summary_parts.append(f"added {total_added} segment(s)")
@@ -1763,6 +2039,495 @@ def run_revise(
         print("revise: no issues found.")
 
 
+_WS_RE = re.compile(r"\s+")
+
+
+def _locate_span(source: str, batch_texts: list[str], cursor: int) -> tuple[int, int]:
+    """find the source-text span covering the batch's texts starting at cursor.
+
+    returns (start, end) in source coordinates. walks each batch text forward
+    from the cursor; on a miss, falls back to searching the normalized source.
+    if nothing locates, the span degenerates to the cursor → end-of-source.
+    """
+    start = cursor
+    end = cursor
+    cur = cursor
+    for t in batch_texts:
+        needle = t.strip()
+        if not needle:
+            continue
+        idx = source.find(needle, cur)
+        if idx < 0:
+            # fallback: try normalized whitespace match
+            norm_needle = _WS_RE.sub(" ", needle)
+            norm_tail = _WS_RE.sub(" ", source[cur:])
+            ni = norm_tail.find(norm_needle)
+            if ni < 0:
+                continue
+            # approximate: advance cursor by the length of the normalized match
+            idx = cur + ni
+        if start == cursor and idx >= cursor:
+            start = idx
+        cur = idx + len(needle)
+        end = cur
+    if end <= start:
+        end = len(source)
+    return start, end
+
+
+def _save_audit(audit_path: Path, entries: list[dict]) -> None:
+    """atomically write the review audit log to disk."""
+    import json as _json
+
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = audit_path.with_suffix(audit_path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        _json.dump(entries, f, indent=2, ensure_ascii=False)
+    tmp.replace(audit_path)
+
+
+def _load_audit(audit_path: Path) -> list[dict]:
+    """load review audit log, returning empty list if missing or malformed."""
+    import json as _json
+
+    if not audit_path.exists():
+        return []
+    try:
+        with open(audit_path, encoding="utf-8") as f:
+            data = _json.load(f)
+    except (OSError, _json.JSONDecodeError):
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _edit_script_and_validate(workdir: Path, chapter_stem: str) -> None:
+    """launch $EDITOR on the chapter script, then validate against source on save."""
+    import os
+    import shlex
+    import subprocess
+
+    script_path = get_command_dir(workdir, "script") / (chapter_stem + SCRIPT_EXT)
+    txt_path = get_command_dir(workdir, "extract") / (chapter_stem + TXT_EXT)
+    if not script_path.exists():
+        print(f"  edit: script not found: {script_path}")
+        return
+
+    editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "vi"
+    cmd = shlex.split(editor) + [str(script_path)]
+    try:
+        subprocess.call(cmd)
+    except OSError as e:
+        print(f"  edit: failed to launch editor ({e})")
+        return
+
+    if not txt_path.exists():
+        print(f"  validate: source not found: {txt_path}; skipping validation")
+        return
+    result = validate_script(txt_path, script_path)
+    if result.missing or result.hallucinated:
+        print(
+            f"  validate: FAIL ({len(result.missing)} missing, "
+            f"{len(result.hallucinated)} hallucinated)"
+        )
+        for text, _ins_idx, _off, _line in result.missing[:5]:
+            print(f"    missing: {_truncate(text)}")
+        if len(result.missing) > 5:
+            print(f"    ... +{len(result.missing) - 5} more")
+        if result.hallucinated:
+            print(f"    hallucinated seg idx: {result.hallucinated[:10]}")
+    else:
+        print("  validate: OK")
+
+
+def _print_audit_entry(idx: int, total: int, e: dict) -> None:
+    """render a single audit entry with source context for the human reviewer."""
+    kind = e.get("kind", "flag")
+    print()
+    header = f"[{idx + 1}/{total}] ({kind}) {e.get('chapter')} seg {e.get('segment')}"
+    print(header)
+    if kind == "flag":
+        print(f"  reason: {e.get('reason', '')}")
+    elif kind == "edit":
+        print(
+            f"  {e.get('field', '?')}: "
+            f"{e.get('before', '')!r} -> {e.get('after', '')!r}"
+        )
+    elif kind == "validation":
+        print(
+            f"  batch {e.get('batch', '?')} rejected: "
+            f"{e.get('missing', 0)} missing, "
+            f"{e.get('hallucinated', 0)} hallucinated"
+        )
+        for t in e.get("missing_text", [])[:3]:
+            print(f"    missing: {_truncate(t)}")
+    text = e.get("text", "")
+    if text:
+        print(f"  text: {text}")
+    span = e.get("source_span", "")
+    if span:
+        print("  --- source context ---")
+        for line in span.splitlines():
+            print(f"  | {line}")
+        print("  --- end source context ---")
+
+
+def cmd_audit(args) -> None:
+    """walk through the review audit log (flags by default; edits with --all)."""
+    workdir = Path(args.workdir)
+    audit_path = get_command_dir(workdir, "review") / "audit.json"
+    entries = _load_audit(audit_path)
+    if not entries:
+        print(f"audit: no entries at {audit_path}")
+        return
+
+    if args.clear:
+        audit_path.unlink(missing_ok=True)
+        print(f"audit: cleared {len(entries)} entry(s) from {audit_path}")
+        return
+
+    # default: flags + validation rejections. --all: include edit records too.
+    visible = (
+        entries
+        if args.all
+        else [e for e in entries if e.get("kind") in ("flag", "validation")]
+    )
+    if not visible:
+        print(f"audit: no flags at {audit_path} (use --all to show edits)")
+        return
+
+    if args.list:
+        for e in visible:
+            kind = e.get("kind", "flag")
+            head = f"{e.get('chapter', '?')} seg {e.get('segment', '?')} ({kind})"
+            if kind == "flag":
+                print(f"{head}: {e.get('reason', '')}")
+            elif kind == "validation":
+                print(
+                    f"{head}: batch {e.get('batch', '?')} rejected "
+                    f"({e.get('missing', 0)} missing, "
+                    f"{e.get('hallucinated', 0)} hallucinated)"
+                )
+            else:
+                print(
+                    f"{head}: {e.get('field', '?')} "
+                    f"{e.get('before', '')!r} -> {e.get('after', '')!r}"
+                )
+        return
+
+    idx = 0
+    while idx < len(visible):
+        e = visible[idx]
+        _print_audit_entry(idx, len(visible), e)
+        choice = (
+            input("  [k]eep / [e]dit / [d]ismiss / [n]ext / [q]uit> ").strip().lower()
+        )
+        if choice in ("q", "quit"):
+            break
+        if choice in ("e", "edit"):
+            chapter = e.get("chapter", "")
+            if chapter:
+                _edit_script_and_validate(workdir, chapter)
+            else:
+                print("  edit: entry has no chapter; skipping")
+            continue
+        if choice in ("d", "dismiss"):
+            entries.remove(e)
+            visible.pop(idx)
+            _save_audit(audit_path, entries)
+            print("  dismissed.")
+            continue
+        idx += 1
+
+    flags_left = sum(1 for e in entries if e.get("kind") == "flag")
+    validation_left = sum(1 for e in entries if e.get("kind") == "validation")
+    edits_left = len(entries) - flags_left - validation_left
+    print(
+        f"audit: {flags_left} flag(s), {validation_left} validation(s), "
+        f"{edits_left} edit(s) remaining at {audit_path}"
+    )
+
+
+def run_review(
+    workdir: Path,
+    api_base: str | None = None,
+    api_key: str | None = None,
+    model: str | None = None,
+    chapters: list[int] | None = None,
+    batch_size: int = REVIEW_BATCH_SIZE,
+    verbose: bool = False,
+    force: bool = False,
+    thinking_budget: int = DEFAULT_THINKING_BUDGET,
+    accept: bool = False,
+) -> None:
+    """review each chapter's script in fixed-size batches against the source text.
+
+    each batch is sent to the LLM with its covering source span; the corrected
+    segments replace the original batch. per-chapter resume via script-content hash.
+
+    accept=True skips llm review; existing scripts are re-stamped as fresh under
+    the current (source + cast + batch_size) hash.
+    """
+    cast = load_cast(workdir)
+    extract_dir = get_command_dir(workdir, "extract")
+    script_dir = get_command_dir(workdir, "script")
+    txt_files = sorted(extract_dir.glob(f"*{TXT_EXT}"))
+    if not txt_files:
+        msg = "review: no text files found in extract/!"
+        print(msg)
+        raise RuntimeError(msg)
+
+    resume = ResumeManager.for_command(workdir, "review", force=force)
+
+    if accept:
+        accepted = 0
+        for txt_path in txt_files:
+            try:
+                num = int(txt_path.stem.split("_")[0])
+            except ValueError:
+                continue
+            if chapters and num not in chapters:
+                continue
+            script_path = script_dir / (txt_path.stem + SCRIPT_EXT)
+            if not script_path.exists():
+                continue
+            source = txt_path.read_text(encoding="utf-8")
+            task_hash = compute_hash(
+                {
+                    "source": source,
+                    "cast": [(c.name, tuple(c.aliases or ())) for c in cast],
+                    "batch_size": batch_size,
+                }
+            )
+            resume.clear_partial(str(num))
+            resume.update(str(num), task_hash)
+            accepted += 1
+        resume.save()
+        print(f"review: accepted existing review for {accepted} chapter(s)")
+        return
+    total_chapters = 0
+    total_batches = 0
+    audit: list[dict] = []
+    audit_path = get_command_dir(workdir, "review") / "audit.json"
+
+    for txt_path in txt_files:
+        try:
+            num = int(txt_path.stem.split("_")[0])
+        except ValueError:
+            continue
+        if chapters and num not in chapters:
+            continue
+        script_path = script_dir / (txt_path.stem + SCRIPT_EXT)
+        if not script_path.exists():
+            continue
+
+        segments = load_script(script_path)
+        if not segments:
+            continue
+
+        source = txt_path.read_text(encoding="utf-8")
+        # hash excludes script contents so partial writes to disk don't
+        # invalidate the resume record. script identity is on disk; source,
+        # cast, and batch_size are the real inputs that gate re-review.
+        task_hash = compute_hash(
+            {
+                "source": source,
+                "cast": [(c.name, tuple(c.aliases or ())) for c in cast],
+                "batch_size": batch_size,
+            }
+        )
+        if resume.is_fresh(str(num), task_hash):
+            continue
+
+        partial = resume.get_partial(str(num))
+        if partial and partial.get("hash") == task_hash:
+            start_batch = int(partial.get("batches_done", 0))
+            cursor = int(partial.get("cursor", 0))
+            new_segments = list(segments[: start_batch * batch_size])
+            print(
+                f"\n{txt_path.name}: resuming review at batch {start_batch + 1} "
+                f"({len(segments)} segments, batches of {batch_size})..."
+            )
+        else:
+            start_batch = 0
+            cursor = 0
+            new_segments = []
+            print(
+                f"\n{txt_path.name}: reviewing {len(segments)} segments "
+                f"in batches of {batch_size}..."
+            )
+
+        total_for_chapter = (len(segments) + batch_size - 1) // batch_size
+        bar = tqdm(
+            total=total_for_chapter,
+            initial=start_batch,
+            desc=f"review ch{num}",
+            unit="batch",
+        )
+        for i in range(start_batch * batch_size, len(segments), batch_size):
+            batch = segments[i : i + batch_size]
+            bnum = i // batch_size + 1
+            start, end = _locate_span(source, [s.text for s in batch], cursor)
+            span = source[start:end] if end > start else source[cursor:]
+            batch_flags: list = []
+            try:
+                corrected, batch_flags = review_script_batch(
+                    span,
+                    batch,
+                    cast,
+                    api_base=api_base,
+                    api_key=api_key,
+                    model=model or DEFAULT_LLM_MODEL,
+                    thinking_budget=thinking_budget,
+                )
+            except Exception as e:
+                tqdm.write(f"  batch {bnum}: review failed ({e}); keeping original")
+                corrected = batch
+            else:
+                # validate corrected batch covers the same source span as the
+                # original — reject any result that introduces missing fragments
+                # or hallucinations relative to this batch's source window.
+                result = _validate_segments(span, corrected)
+                if result.missing or result.hallucinated:
+                    tqdm.write(
+                        f"  batch {bnum}: review rejected "
+                        f"({len(result.missing)} missing, "
+                        f"{len(result.hallucinated)} hallucinated); keeping original"
+                    )
+                    audit.append(
+                        {
+                            "kind": "validation",
+                            "chapter": txt_path.stem,
+                            "segment": i + 1,
+                            "batch": bnum,
+                            "missing": len(result.missing),
+                            "hallucinated": len(result.hallucinated),
+                            "missing_text": [t for t, *_ in result.missing[:5]],
+                            "source_span": span,
+                        }
+                    )
+                    corrected = batch
+            # record accepted edits (speaker/instruction changes) to the audit log.
+            for idx, (a, b) in enumerate(zip(batch, corrected)):
+                seg_no = i + idx + 1
+                for field, before, after in (
+                    ("speaker", a.speaker, b.speaker),
+                    ("instruction", a.instruction, b.instruction),
+                ):
+                    if before != after:
+                        audit.append(
+                            {
+                                "kind": "edit",
+                                "chapter": txt_path.stem,
+                                "segment": seg_no,
+                                "field": field,
+                                "before": before,
+                                "after": after,
+                                "text": a.text,
+                                "source_span": span,
+                            }
+                        )
+            # record LLM-emitted human-review flags.
+            for f in batch_flags:
+                seg_no = i + f.index + 1
+                audit.append(
+                    {
+                        "kind": "flag",
+                        "chapter": txt_path.stem,
+                        "segment": seg_no,
+                        "reason": f.reason,
+                        "text": batch[f.index].text if f.index < len(batch) else "",
+                        "source_span": span,
+                    }
+                )
+                tqdm.write(f"  flag: {txt_path.stem} seg {seg_no}: {f.reason}")
+            _save_audit(audit_path, audit)
+            new_segments.extend(corrected)
+            cursor = end
+            total_batches += 1
+            # persist progress after each batch so cancel + rerun resumes here.
+            save_script(script_path, new_segments + segments[i + batch_size :])
+            resume.set_partial(
+                str(num),
+                {
+                    "hash": task_hash,
+                    "batches_done": bnum,
+                    "cursor": cursor,
+                },
+            )
+            resume.save()
+            if verbose:
+                changed = [
+                    (idx, a, b)
+                    for idx, (a, b) in enumerate(zip(batch, corrected))
+                    if a.speaker != b.speaker
+                    or a.text != b.text
+                    or a.instruction != b.instruction
+                ]
+                if changed:
+                    tqdm.write(f"  batch {bnum}: {len(changed)} change(s)")
+                    for idx, a, b in changed:
+                        seg_no = i + idx + 1
+                        if a.speaker != b.speaker:
+                            tqdm.write(
+                                f"    seg {seg_no} speaker: "
+                                f"{a.speaker!r} -> {b.speaker!r}"
+                            )
+                        if a.instruction != b.instruction:
+                            tqdm.write(
+                                f"    seg {seg_no} instruction: "
+                                f"{a.instruction!r} -> {b.instruction!r}"
+                            )
+                        if a.text != b.text:
+                            tqdm.write(f"    seg {seg_no} text: {a.text!r}")
+                            tqdm.write(f"      ->   {b.text!r}")
+            bar.update(1)
+        bar.close()
+
+        save_script(script_path, new_segments)
+        resume.update(str(num), task_hash)
+        resume.save()
+        total_chapters += 1
+
+    if audit:
+        flags_count = sum(1 for e in audit if e.get("kind") == "flag")
+        edits_count = sum(1 for e in audit if e.get("kind") == "edit")
+        validation_count = sum(1 for e in audit if e.get("kind") == "validation")
+        print(
+            f"review: {flags_count} flag(s), {edits_count} edit(s), "
+            f"{validation_count} validation(s) written to "
+            f"{audit_path}; run `autiobook audit <workdir>` to inspect"
+        )
+
+    if total_chapters == 0:
+        print("review: all chapters up to date.")
+    else:
+        print(
+            f"\nreview: processed {total_chapters} chapter(s), {total_batches} batch(es)"
+        )
+
+
+def cmd_review(args):
+    """review scripts against source text in batches (correct speakers, text, emotion)."""
+    from .utils import Logger
+
+    chapters = get_chapters(args)
+    workdir = Path(args.workdir)
+    Logger.init(workdir)
+
+    run_review(
+        workdir,
+        api_base=args.api_base,
+        api_key=args.api_key,
+        model=args.model,
+        chapters=chapters,
+        batch_size=getattr(args, "batch_size", None) or REVIEW_BATCH_SIZE,
+        verbose=args.verbose,
+        force=args.force,
+        thinking_budget=args.thinking_budget,
+        accept=getattr(args, "accept", False),
+    )
+
+
 def _step_if_changed(step: bool, phase: str, path: Path, before: float) -> None:
     """raise StepComplete if step mode is active and files changed."""
     from .utils import dir_mtime
@@ -1771,6 +2536,132 @@ def _step_if_changed(step: bool, phase: str, path: Path, before: float) -> None:
         from .main import StepComplete
 
         raise StepComplete(phase)
+
+
+def _enumerate_chapters(workdir: Path, chapters: list[int] | None) -> list[int]:
+    """list chapter numbers from extracted txt files, filtered by `chapters`."""
+    extract_dir = get_command_dir(workdir, "extract")
+    nums = []
+    for p in sorted(extract_dir.glob(f"*{TXT_EXT}")):
+        try:
+            n = int(p.stem.split("_")[0])
+        except ValueError:
+            continue
+        if chapters and n not in chapters:
+            continue
+        nums.append(n)
+    return nums
+
+
+def _run_script_phases(
+    workdir: Path,
+    chapters: list[int] | None,
+    *,
+    api_base: str | None,
+    api_key: str | None,
+    model: str | None,
+    verbose: bool,
+    force: bool,
+    thinking_budget: int,
+    revise: bool,
+    review: bool,
+    step: bool,
+    redo_phase: str | None,
+    accept: bool = False,
+) -> None:
+    """run script → revise → [review] for the given chapters.
+
+    review deliberately does not check for audit flags — unresolved flags only
+    block perform, not further review passes.
+    """
+    before = dir_mtime(get_command_dir(workdir, "script"))
+    run_script_generation(
+        workdir,
+        api_base,
+        api_key,
+        model,
+        chapters,
+        verbose=verbose,
+        force=force or redo_phase == "script",
+        thinking_budget=thinking_budget,
+        revise=revise,
+        accept=accept,
+    )
+    _step_if_changed(step, "script", get_command_dir(workdir, "script"), before)
+
+    before = dir_mtime(get_command_dir(workdir, "script"))
+    run_revise(
+        workdir,
+        api_base,
+        api_key,
+        model,
+        chapters,
+        verbose=verbose,
+        thinking_budget=thinking_budget,
+        accept=accept,
+    )
+    _step_if_changed(step, "revise", get_command_dir(workdir, "script"), before)
+
+    if review:
+        before = dir_mtime(get_command_dir(workdir, "script"))
+        run_review(
+            workdir,
+            api_base=api_base,
+            api_key=api_key,
+            model=model,
+            chapters=chapters,
+            verbose=verbose,
+            force=force or redo_phase == "review",
+            thinking_budget=thinking_budget,
+            accept=accept,
+        )
+        _step_if_changed(step, "review", get_command_dir(workdir, "script"), before)
+
+
+def _run_perform_phases(
+    workdir: Path,
+    chapters: list[int] | None,
+    *,
+    clone_config: Any,
+    pooled: bool,
+    verbose: bool,
+    force: bool,
+    redo_phase: str | None,
+    retake: bool,
+    step: bool,
+    accept: bool = False,
+) -> None:
+    """run perform → retake for the given chapters."""
+    before = dir_mtime(get_command_dir(workdir, "perform"))
+    run_performance(
+        workdir,
+        chapters,
+        clone_config,
+        pooled,
+        verbose=verbose,
+        force=force or redo_phase == "perform",
+        retake=retake,
+        accept=accept,
+    )
+    _step_if_changed(step, "perform", get_command_dir(workdir, "perform"), before)
+
+    before = dir_mtime(get_command_dir(workdir, "perform") / "segments")
+    from .retake import run_retake
+
+    if accept:
+        print("retake: skipped (--accept)")
+    else:
+        run_retake(
+            workdir,
+            command="perform",
+            chapters=chapters,
+            config=clone_config,
+            verbose=verbose,
+        )
+    if not accept:
+        _step_if_changed(
+            step, "retake", get_command_dir(workdir, "perform") / "segments", before
+        )
 
 
 def dramatize_book(
@@ -1786,6 +2677,7 @@ def dramatize_book(
     force: bool = False,
     thinking_budget: int = DEFAULT_THINKING_BUDGET,
     revise: bool = False,
+    review: bool = False,
     step: bool = False,
     redo_phase: str | None = None,
     retake: bool = False,
@@ -1793,21 +2685,18 @@ def dramatize_book(
     emotions: bool = False,
     preset_voices: bool = False,
     directed: bool = False,
+    accept: bool = False,
+    ignore_flags: bool = False,
+    phase_wise: bool = False,
+    export_fn: Any = None,
 ) -> None:
-    """run full dramatization pipeline."""
-    before = dir_mtime(get_command_dir(workdir, "cast"))
-    run_cast_generation(
-        workdir,
-        api_base,
-        api_key,
-        model,
-        chapters,
-        verbose=verbose,
-        force=force or redo_phase == "cast",
-        thinking_budget=thinking_budget,
-    )
-    _step_if_changed(step, "cast", get_command_dir(workdir, "cast"), before)
+    """run full dramatization pipeline.
 
+    by default every phase (cast → audition → [emote] → script → revise →
+    [review] → perform → retake → export) runs chapter-wise: all phases
+    complete for chapter 1 before chapter 2 begins. pass phase_wise=True to
+    instead run each phase across all chapters before advancing.
+    """
     from .audition import run_audition
 
     audition_config = design_config
@@ -1819,80 +2708,112 @@ def dramatize_book(
             api_base=api_base or "",
             model=DEFAULT_MODEL,
         )
+    emote_config = audition_config if preset_voices else design_config
 
-    before = dir_mtime(get_command_dir(workdir, "audition"))
-    run_audition(
-        workdir,
-        verbose=verbose,
-        force=force or redo_phase == "audition",
-        config=audition_config,
-        callback=callback,
-        preset_voices=preset_voices,
-        directed=directed,
-    )
-    _step_if_changed(step, "audition", get_command_dir(workdir, "audition"), before)
+    def _run_head(chs: list[int] | None) -> None:
+        before = dir_mtime(get_command_dir(workdir, "cast"))
+        run_cast_generation(
+            workdir,
+            api_base,
+            api_key,
+            model,
+            chs,
+            verbose=verbose,
+            force=force or redo_phase == "cast",
+            thinking_budget=thinking_budget,
+            accept=accept,
+        )
+        _step_if_changed(step, "cast", get_command_dir(workdir, "cast"), before)
 
-    if emotions:
-        emote_config = audition_config if preset_voices else design_config
-        before = dir_mtime(get_command_dir(workdir, "emote"))
-        run_emotes(
+        before = dir_mtime(get_command_dir(workdir, "audition"))
+        run_audition(
             workdir,
             verbose=verbose,
-            force=force or redo_phase == "emote",
-            config=emote_config,
+            force=force or redo_phase == "audition",
+            config=audition_config,
             callback=callback,
             preset_voices=preset_voices,
+            directed=directed,
+            accept=accept,
         )
-        _step_if_changed(step, "emote", get_command_dir(workdir, "emote"), before)
+        _step_if_changed(step, "audition", get_command_dir(workdir, "audition"), before)
 
-    before = dir_mtime(get_command_dir(workdir, "script"))
-    run_script_generation(
-        workdir,
-        api_base,
-        api_key,
-        model,
-        chapters,
+        if emotions:
+            before = dir_mtime(get_command_dir(workdir, "emote"))
+            run_emotes(
+                workdir,
+                verbose=verbose,
+                force=force or redo_phase == "emote",
+                config=emote_config,
+                callback=callback,
+                preset_voices=preset_voices,
+                accept=accept,
+            )
+            _step_if_changed(step, "emote", get_command_dir(workdir, "emote"), before)
+
+    script_kwargs: dict[str, Any] = dict(
+        api_base=api_base,
+        api_key=api_key,
+        model=model,
         verbose=verbose,
-        force=force or redo_phase == "script",
+        force=force,
         thinking_budget=thinking_budget,
         revise=revise,
+        accept=accept,
+        review=review,
+        step=step,
+        redo_phase=redo_phase,
     )
-    _step_if_changed(step, "script", get_command_dir(workdir, "script"), before)
-
-    before = dir_mtime(get_command_dir(workdir, "script"))
-    run_revise(
-        workdir,
-        api_base,
-        api_key,
-        model,
-        chapters,
+    perform_kwargs: dict[str, Any] = dict(
+        clone_config=clone_config,
+        pooled=pooled,
         verbose=verbose,
-        thinking_budget=thinking_budget,
-    )
-    _step_if_changed(step, "revise", get_command_dir(workdir, "script"), before)
-
-    before = dir_mtime(get_command_dir(workdir, "perform"))
-    run_performance(
-        workdir,
-        chapters,
-        clone_config,
-        pooled,
-        verbose=verbose,
-        force=force or redo_phase == "perform",
+        force=force,
+        redo_phase=redo_phase,
         retake=retake,
+        step=step,
+        accept=accept,
     )
-    _step_if_changed(step, "perform", get_command_dir(workdir, "perform"), before)
 
-    before = dir_mtime(get_command_dir(workdir, "perform") / "segments")
-    from .retake import run_retake
+    if phase_wise:
+        _run_head(chapters)
+        _run_script_phases(workdir, chapters, **script_kwargs)
+        _check_unresolved_flags(workdir, ignore=ignore_flags)
+        _run_perform_phases(workdir, chapters, **perform_kwargs)
+        return
 
-    run_retake(
-        workdir,
-        command="perform",
-        chapters=chapters,
-        config=clone_config,
-        verbose=verbose,
-    )
-    _step_if_changed(
-        step, "retake", get_command_dir(workdir, "perform") / "segments", before
-    )
+    chapter_nums = _enumerate_chapters(workdir, chapters)
+    if not chapter_nums:
+        _run_head(chapters)
+        _run_script_phases(workdir, chapters, **script_kwargs)
+        _check_unresolved_flags(workdir, ignore=ignore_flags)
+        _run_perform_phases(workdir, chapters, **perform_kwargs)
+        return
+
+    # single chapter-wise pass: everything for chapter N completes (including
+    # export) before chapter N+1 begins. unresolved flags from chapter N skip
+    # perform/export for that chapter but do not block chapter N+1's review.
+    deferred: list[int] = []
+    for num in chapter_nums:
+        print(f"dramatize: chapter {num}")
+        _run_head([num])
+        _run_script_phases(workdir, [num], **script_kwargs)
+        try:
+            _check_unresolved_flags(workdir, ignore=ignore_flags, chapters=[num])
+        except RuntimeError as e:
+            print(f"dramatize: chapter {num} deferred - {e}")
+            deferred.append(num)
+            continue
+        _run_perform_phases(workdir, [num], **perform_kwargs)
+        if export_fn is not None:
+            export_dir = workdir / "export"
+            before = dir_mtime(export_dir)
+            export_fn([num])
+            _step_if_changed(step, "export", export_dir, before)
+
+    if deferred:
+        raise RuntimeError(
+            f"{len(deferred)} chapter(s) deferred due to unresolved flags: "
+            f"{deferred}. run `autiobook audit` to resolve, or pass "
+            f"--ignore-flags."
+        )

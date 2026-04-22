@@ -426,7 +426,8 @@ class TestSubtitles:
         assert "00:00:00.000 --> 00:00:01.500\nHello world." in vtt
         assert "00:00:02.000 --> 00:00:03.250\n[Alice] Second line." in vtt
 
-    def test_pipeline_emits_subtitles(self, mock_engine, temp_workdir):
+    def test_pipeline_does_not_emit_subtitles(self, mock_engine, temp_workdir):
+        # subtitles are emitted during export, not during perform/synthesize.
         segments_dir = temp_workdir / "segments"
         wav = temp_workdir / "chapter_0.wav"
         tasks = [
@@ -440,8 +441,5 @@ class TestSubtitles:
         ]
         process_audio_pipeline(mock_engine, [(wav, tasks)])
 
-        assert srt_path(wav).exists()
-        assert vtt_path(wav).exists()
-        srt = srt_path(wav).read_text()
-        assert "first" in srt
-        assert "[Bob] second" in srt
+        assert not srt_path(wav).exists()
+        assert not vtt_path(wav).exists()

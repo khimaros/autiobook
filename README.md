@@ -1,6 +1,7 @@
 # autiobook
 
-convert epub files to audiobooks using qwen3-tts.
+convert epub files to audiobooks using qwen3-tts or with any
+openai compatible text-to-speech endpoint.
 
 ## requirements
 
@@ -199,8 +200,8 @@ workdir/export/
 └── ...
 ```
 
-`perform/` and `synthesize/` also emit `.srt` and `.vtt` subtitles alongside
-each chapter wav (with speaker labels for dramatized output).
+The `export/` folder also contains `.srt` and `.vtt` subtitles alongside
+each chapter mp3 (with speaker labels for dramatized output).
 
 compatible with the [Voice](https://github.com/PaulWoitaschek/Voice) audiobook player for android.
 
@@ -232,19 +233,17 @@ workdir/
 ├── perform/               # dramatized audio performance
 │   ├── NN_Title.wav
 │   ├── NN_Title.wav.timing.json  # per-chunk start/end offsets + metadata
-│   ├── NN_Title.srt       # subtitles (with speaker labels)
-│   ├── NN_Title.vtt       # webvtt subtitles
 │   ├── segments/          # segment cache
 │   └── state.json
 ├── synthesize/            # standard mono-voice audio
 │   ├── NN_Title.wav
 │   ├── NN_Title.wav.timing.json
-│   ├── NN_Title.srt
-│   ├── NN_Title.vtt
 │   ├── segments/          # segment cache
 │   └── state.json
 └── export/                # final mp3 output
     ├── NN_Title.mp3
+    ├── NN_Title.srt       # subtitles (with speaker labels)
+    ├── NN_Title.vtt       # webvtt subtitles
     └── state.json
 ```
 

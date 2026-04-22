@@ -411,7 +411,7 @@ key "characters" whose value is a list of character definitions.
 For each character (new OR updated) output a definition with the following:
 
 - name: Full canonical name
-- description: A voice-design prompt written as a short paragraph (2-4 \
+- description: A voice-design prompt written as a short paragraph (2-3 \
 sentences). Open with a compact backstory clause that MOTIVATES the voice \
 — role, condition, or defining circumstance that a listener would hear in \
 the delivery (e.g. a former soldier gone to seed, a centenarian sustained \
@@ -423,9 +423,16 @@ skip anything that doesn't (plot twists, physical appearance unrelated \
 to voice, relationships, goals). Ground every claim in the prose; do not \
 invent unsupported traits.
 - audition_line: A sample line for this character. It should be two full sentences long.
-- aliases: EVERY alternate form the prose uses — nicknames, shortened forms, \
-last-name-only references, first-name-only references, and any stylized variants. \
-Scan the text and include each distinct form you see.
+- aliases: Alternate forms the NARRATOR uses to refer to this character in \
+narration — i.e. names that appear in speaker-attribution tags ("said X", \
+"X replied") or in descriptive narration ("X walked in"). Include nicknames, \
+shortened forms, last-name-only, first-name-only, and stylized variants that \
+the narrator actually uses this way. EXCLUDE vocatives and terms of address \
+spoken by other characters inside dialogue (e.g. "baby", "kid", "boyo", "boss", \
+"old son", "friend", "mon"), generic role words that aren't used as a name by \
+the narrator, and epithets another character invents in the moment. If in \
+doubt, ask: would a listener hear this word and know it refers to this \
+specific character as the speaker or subject? If not, omit it.
 
 Example: {{"characters": [{{"name": "Mirabel Thatcher-Quinn", \
 "description": "A burnt-out field medic in her late twenties, still \
@@ -514,13 +521,35 @@ def _parse_cast_list(data: list | dict) -> List[Character]:
 
 
 def _validate_cast_list(characters: List[Character]) -> list[str]:
-    """check that each character has the fields needed for voice design."""
+    """check that each character has the fields needed for voice design and
+    that names/aliases don't collide across characters."""
     errors = []
     for i, c in enumerate(characters):
         if not c.description:
             errors.append(f"character {i} ({c.name}): missing 'description'")
         if not c.audition_line:
             errors.append(f"character {i} ({c.name}): missing 'audition_line'")
+
+    # name/alias collisions (normalized) across characters
+    owners: dict[str, str] = {}
+    for c in characters:
+        for label in [c.name, *(c.aliases or [])]:
+            key = _normalize_name(label)
+            if not key:
+                continue
+            if label != c.name and key == _normalize_name(c.name):
+                errors.append(
+                    f"character '{c.name}': alias '{label}' conflicts with its own name"
+                )
+                continue
+            if key in owners and owners[key] != c.name:
+                kind = "name" if label == c.name else "alias"
+                errors.append(
+                    f"character '{c.name}': {kind} '{label}' already used by "
+                    f"'{owners[key]}'"
+                )
+            else:
+                owners[key] = c.name
     return errors
 
 
@@ -780,6 +809,177 @@ def _valid_speaker_names(characters_list: List[Character]) -> list[str]:
     for c in characters_list:
         names.append(_display_name(c))
     return names
+
+
+REVIEW_CHANGES_SHAPE = (
+    '{"changes": [{"index": ..., "speaker": ..., "instruction": ...}, ...], '
+    '"flags": [{"index": ..., "reason": ...}, ...]}'
+)
+
+
+@dataclass
+class ReviewFlag:
+    """LLM-flagged segment needing human attention (e.g. needs splitting)."""
+
+    index: int
+    reason: str
+
+
+def _extract_flags_list(data: list | dict) -> list:
+    """pull the optional flags list out of the LLM response."""
+    if isinstance(data, dict):
+        v = data.get("flags")
+        if isinstance(v, list):
+            return v
+    return []
+
+
+def _extract_changes_list(data: list | dict) -> list:
+    """unwrap various LLM response shapes to a flat list of change objects."""
+    if isinstance(data, dict):
+        for key in ("changes", "segments", "seg"):
+            v = data.get(key)
+            if isinstance(v, list):
+                return v
+        if "index" in data:
+            return [data]
+        for v in data.values():
+            if isinstance(v, list):
+                return v
+        return []
+    if isinstance(data, list):
+        return data
+    raise ValueError(f"expected change list, got {type(data).__name__}")
+
+
+def _apply_review_changes(
+    original: List[ScriptSegment], changes: list[dict]
+) -> List[ScriptSegment]:
+    """merge a sparse changes list onto a copy of the original batch by index."""
+    merged = list(original)
+    for c in changes:
+        if not isinstance(c, dict):
+            continue
+        idx = c.get("index", c.get("i"))
+        if not isinstance(idx, int) or idx < 0 or idx >= len(merged):
+            preview = str(c)[:100] + "..." if len(str(c)) > 100 else str(c)
+            raise KeyError(f"change missing valid index: {preview}")
+        cur = merged[idx]
+        speaker = c.get("speaker", c.get("s", cur.speaker)) or cur.speaker
+        instruction = c.get("instruction", c.get("in", cur.instruction))
+        if instruction is None:
+            instruction = cur.instruction
+        # text is NOT reviewable; always preserve the original to prevent the
+        # LLM from truncating, rewording, or otherwise degrading source-faithful text.
+        merged[idx] = ScriptSegment(
+            speaker=speaker, text=cur.text, instruction=instruction or ""
+        )
+    return merged
+
+
+def review_script_batch(
+    source_span: str,
+    segments: List[ScriptSegment],
+    characters_list: List[Character],
+    api_base: Optional[str] = None,
+    api_key: Optional[str] = None,
+    model: str = DEFAULT_LLM_MODEL,
+    thinking_budget: int = DEFAULT_THINKING_BUDGET,
+) -> tuple[List[ScriptSegment], list[ReviewFlag]]:
+    """review a batch of segments against the covering source text.
+
+    returns (corrected_segments, flags). text is never modified; the LLM emits
+    speaker/instruction corrections by index and may flag segments needing
+    human attention (e.g. a segment that should be split)."""
+    cast_str = _format_cast_list(characters_list)
+    current_json = json.dumps(
+        [
+            {
+                "index": i,
+                "speaker": s.speaker,
+                "text": s.text,
+                "instruction": s.instruction,
+            }
+            for i, s in enumerate(segments)
+        ],
+        ensure_ascii=False,
+    )
+
+    system_prompt = f"""\
+Review script segments against the SOURCE TEXT and emit ONLY the segments whose \
+SPEAKER attribution or INSTRUCTION is wrong.
+
+[Character List]
+{cast_str}
+
+{SCRIPT_GENERATION_COMMON}
+
+Review Rules:
+
+- Output a JSON object {{"changes": [...]}} containing ONLY segments you are \
+correcting. Omit any segment that is already correct.
+- Each change MUST include the "index" field copied verbatim from the input, \
+plus the corrected "speaker" and "instruction".
+- DO NOT modify the "text" field. Text is not under review. You do not need to \
+emit "text" at all; if you do, it MUST be byte-for-byte identical to the input.
+- If no changes are needed, return {{"changes": []}}.
+- Do NOT renumber, reorder, split, or merge segments. Only speaker/instruction \
+corrections.
+- Fix SPEAKER attribution errors (narration tagged as a character, or the wrong \
+character speaking dialogue).
+- Fix INSTRUCTION values that don't match the tone of the dialogue or the narration.
+- Do NOT alter "Retained" segments.
+
+Human Review Flags:
+
+- If a segment needs a structural edit you are NOT allowed to make (e.g. it \
+mixes narration and dialogue and should be split, it contains content that \
+should be separated, or you are uncertain about speaker attribution), add an \
+entry to a top-level "flags" list: {{"index": <int>, "reason": "<short note>"}}.
+- Flags do not substitute for changes; a segment may be flagged even if you \
+also correct its speaker/instruction.
+- Omit "flags" entirely if nothing needs human attention.
+"""
+
+    user_content = f"""\
+--- SOURCE TEXT (authoritative) ---
+{source_span}
+--- END SOURCE TEXT ---
+
+--- CURRENT SCRIPT SEGMENTS (JSON; each has an "index"; review and correct) ---
+{current_json}
+--- END CURRENT SCRIPT SEGMENTS ---
+"""
+
+    captured_flags: list[ReviewFlag] = []
+
+    def parse_changes(data: list | dict) -> List[ScriptSegment]:
+        captured_flags.clear()
+        for f in _extract_flags_list(data):
+            if not isinstance(f, dict):
+                continue
+            idx = f.get("index", f.get("i"))
+            reason = f.get("reason") or f.get("r") or ""
+            if isinstance(idx, int) and 0 <= idx < len(segments):
+                captured_flags.append(ReviewFlag(index=idx, reason=str(reason)))
+        return _apply_review_changes(segments, _extract_changes_list(data))
+
+    messages: List[dict[str, str]] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
+    ]
+    corrected = _query_llm_validated(
+        messages,
+        parse_changes,
+        validate_fn=lambda segs: _validate_script_segments(segs, characters_list),
+        model=model,
+        api_base=api_base,
+        api_key=api_key,
+        thinking_budget=thinking_budget,
+        label="review",
+        expected_shape=REVIEW_CHANGES_SHAPE,
+    )
+    return corrected, list(captured_flags)
 
 
 def fix_missing_segment(

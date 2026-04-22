@@ -262,8 +262,12 @@ def run_retake(
     verbose: bool = False,
     prune: bool = False,
     dry_run: bool = False,
+    accept: bool = False,
 ) -> None:
     """scan segments, delete offenders, and regenerate only the deleted ones."""
+    if accept:
+        print("retake: skipped (--accept)")
+        return
     command_dir = get_command_dir(workdir, command)
     segments_dir = command_dir / SEGMENTS_DIR
 
@@ -355,4 +359,5 @@ def cmd_retake(args):
         verbose=getattr(args, "verbose", False),
         prune=getattr(args, "prune", False),
         dry_run=args.dry_run,
+        accept=getattr(args, "accept", False),
     )
