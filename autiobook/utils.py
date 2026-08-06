@@ -3,6 +3,7 @@
 import argparse
 import os
 import re
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, List
@@ -14,8 +15,14 @@ from .config import (
     DEFAULT_REVIEW_LLM_MODEL,
     DEFAULT_SPEAKER,
     DEFAULT_THINKING_BUDGET,
+    DEFAULT_TTS_DIALECT,
+    DEFAULT_TTS_DIRECTION,
+    DEFAULT_TTS_MODEL,
+    LEADING_DASH_RE,
     LOG_FILE,
     MAX_CHUNK_SIZE,
+    TTS_DIALECTS,
+    TTS_DIRECTIONS,
     VOICE_DESIGN_MODEL,
 )
 
@@ -80,6 +87,18 @@ def dir_mtime(path: Path) -> float:
         if f.is_file():
             latest = max(latest, f.stat().st_mtime)
     return latest
+
+
+def normalize_tts_text(text: str) -> str:
+    """drop a leading dash before synthesis, keeping the script text intact.
+
+    an attribution line like "-- Financial Times" is read as the publication
+    name; the dash is typographic. some models answer the bare dash with
+    silence, which retake then burns its whole retry budget on. a line that is
+    nothing but dashes is left alone rather than reduced to an empty request.
+    """
+    stripped = LEADING_DASH_RE.sub("", text)
+    return stripped or text
 
 
 SENTENCE_ENDINGS = re.compile(r"(?<=[.!?])\s+")
@@ -159,8 +178,10 @@ def add_common_args(parser: argparse.ArgumentParser, group: str = "all"):
 
         g.add_argument(
             "--tts-model",
-            default="",
-            help="default tts model (used unless overridden by --tts-*-model)",
+            default=DEFAULT_TTS_MODEL,
+            help="default tts model for every mode, overriding the qwen "
+            "defaults (used unless a --tts-*-model is given; "
+            "defaults to $AUTIOBOOK_TTS_MODEL)",
         )
         g.add_argument(
             "--tts-design-model",
@@ -171,6 +192,38 @@ def add_common_args(parser: argparse.ArgumentParser, group: str = "all"):
             "--tts-clone-model",
             default="",
             help="tts model for voice cloning (perform)",
+        )
+        g.add_argument(
+            "--tts-api-base",
+            default=os.getenv("AUTIOBOOK_TTS_API_BASE"),
+            help="tts endpoint when it differs from --api-base "
+            "(defaults to $AUTIOBOOK_TTS_API_BASE)",
+        )
+        g.add_argument(
+            "--tts-api-key",
+            default=os.getenv("AUTIOBOOK_TTS_API_KEY"),
+            help="tts api key when it differs from --api-key "
+            "(defaults to $AUTIOBOOK_TTS_API_KEY)",
+        )
+        g.add_argument(
+            "--tts-dialect",
+            default=DEFAULT_TTS_DIALECT,
+            choices=TTS_DIALECTS,
+            help="tts request subset: qwen (local server) or openai (hosted "
+            "providers); auto picks by endpoint host",
+        )
+        g.add_argument(
+            "--tts-voices",
+            default="",
+            help="comma separated preset voices for backends without an "
+            "/audio/voices endpoint (defaults to $AUTIOBOOK_TTS_VOICES)",
+        )
+        g.add_argument(
+            "--tts-direction",
+            default=DEFAULT_TTS_DIRECTION,
+            choices=TTS_DIRECTIONS,
+            help="how delivery direction reaches the model: field (top-level "
+            "instructions) or prefix (folded into the input text)",
         )
         g.add_argument(
             "--batch-size", type=int, default=64, help="batch size for tts generation"
@@ -413,16 +466,34 @@ def _resolve_tts_model(args, default: str, override_flag: str = "") -> str:
     return base or default
 
 
+def tts_endpoint(args) -> tuple[str, str]:
+    """(api_base, api_key) for tts, falling back to the shared llm endpoint.
+
+    the split exists so tts and llm can sit on different providers -- a hosted
+    tts backend with a local llm, or the reverse.
+    """
+    base = getattr(args, "tts_api_base", None) or getattr(args, "api_base", None) or ""
+    key = getattr(args, "tts_api_key", None) or getattr(args, "api_key", None) or ""
+    return base, key
+
+
 def _build_http_config(args, model: str):
     """build http tts config from args."""
     from .tts_http import HTTPTTSConfig
 
+    api_base, api_key = tts_endpoint(args)
+    voices = getattr(args, "tts_voices", "") or ""
     config = HTTPTTSConfig(
-        api_base=args.api_base,
+        api_base=api_base,
+        api_key=api_key,
+        dialect=getattr(args, "tts_dialect", None) or DEFAULT_TTS_DIALECT,
+        direction=getattr(args, "tts_direction", None) or DEFAULT_TTS_DIRECTION,
         model=model,
         chunk_size=getattr(args, "chunk_size", MAX_CHUNK_SIZE),
         temperature=getattr(args, "temperature", None),
     )
+    if voices:
+        config.voices = [v.strip() for v in voices.split(",") if v.strip()]
     if hasattr(args, "voice"):
         config.speaker = args.voice
     if hasattr(args, "speaker") and args.speaker:
@@ -456,25 +527,41 @@ def get_tts_config(args):
         BASE_MODEL if (hasattr(args, "speaker") and args.speaker) else DEFAULT_MODEL
     )
     model = _resolve_tts_model(args, default)
-
-    if getattr(args, "api_base", None):
-        return _build_http_config(args, model)
-    return _build_local_config(args, model)
+    return _build_tts_config(args, model)
 
 
 def get_design_config(args):
     """extract tts config for voice design (audition)."""
-    model = getattr(args, "tts_design_model", "") or VOICE_DESIGN_MODEL
-
-    if getattr(args, "api_base", None):
-        return _build_http_config(args, model)
-    return _build_local_config(args, model)
+    return _build_tts_config(
+        args, _resolve_tts_model(args, VOICE_DESIGN_MODEL, "design")
+    )
 
 
 def get_clone_config(args):
     """extract tts config for voice cloning (perform)."""
-    model = getattr(args, "tts_clone_model", "") or BASE_MODEL
+    return _build_tts_config(args, _resolve_tts_model(args, BASE_MODEL, "clone"))
 
-    if getattr(args, "api_base", None):
+
+def _build_tts_config(args, model: str):
+    """http config when a tts endpoint is configured, else the local engine."""
+    if tts_endpoint(args)[0]:
         return _build_http_config(args, model)
     return _build_local_config(args, model)
+
+
+def preset_audition_config(config: Any, api_base: str | None = ""):
+    """tts config for the preset-voices audition phase.
+
+    derived from the design config rather than rebuilt, so auth, dialect and
+    voice list survive. the qwen server serves presets from the instructable
+    model; a hosted provider answers every mode from one model id.
+    """
+    from .config import DEFAULT_MODEL, TTS_DIALECT_QWEN
+    from .tts_http import HTTPTTSConfig, resolve_dialect
+
+    if not isinstance(config, HTTPTTSConfig):
+        return HTTPTTSConfig(api_base=api_base or "", model=DEFAULT_MODEL)
+    model = config.model
+    if resolve_dialect(config.dialect, config.api_base) == TTS_DIALECT_QWEN:
+        model = DEFAULT_MODEL
+    return replace(config, model=model)

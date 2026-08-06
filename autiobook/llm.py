@@ -90,6 +90,10 @@ SCRIPT_RULES_COMMON = """Script Generation Rules:
 - Use "Narrator" as the speaker for ALL unquoted text, including attribution like "John said,"
 - Use "Retained" as the speaker for text which shouldn't be spoken: section markers, \
 chapter numbers, roman numerals, formatting artifacts, etc. Include the EXACT text.
+- "Retained" also covers front matter that is not part of the work itself: praise \
+blurbs, review quotes and their attribution lines (e.g. a line that is only a \
+publication or critic's name, with or without a leading dash), series lists, and \
+publisher copy. These are unquoted text but they are NOT narration.
 - Use other characters from the [Character List] for SPOKEN TEXT ONLY. Fallback to \
 "Extra Female" or "Extra Male" if the character is unclear.
 - Use speaker names EXACTLY as listed FIRST in the [Character List] (the short \
@@ -739,9 +743,14 @@ def _display_name(c: Character) -> str:
     return min(candidates, key=len)
 
 
-def _format_cast_list(characters_list: List[Character]) -> str:
+def _format_cast_list(characters_list: List[Character], specials: bool = False) -> str:
     """format cast list for LLM prompts. surfaces the shortest form first to
-    minimize tokens when the LLM echoes the speaker on every segment."""
+    minimize tokens when the LLM echoes the speaker on every segment.
+
+    `specials` appends the non-character speakers. review needs them: it is
+    told to use names exactly as listed, so a speaker missing from the list
+    reads as a mis-attribution to correct rather than a value to preserve.
+    """
     cast_info = []
     for c in characters_list:
         short = _display_name(c)
@@ -750,6 +759,12 @@ def _format_cast_list(characters_list: List[Character]) -> str:
             cast_info.append(f"{short} (also: {'; '.join(others)})")
         else:
             cast_info.append(short)
+    if specials:
+        cast_info.append("Narrator (prose narration)")
+        cast_info.append("Extra Female / Extra Male (unnamed minor characters)")
+        cast_info.append(
+            f"{' / '.join(sorted(RETAINED_SPEAKERS))} (kept in the text, never spoken)"
+        )
     return "- " + "\n- ".join(cast_info)
 
 
@@ -978,21 +993,27 @@ def _extract_changes_list(data: list | dict) -> list:
     raise ValueError(f"expected change list, got {type(data).__name__}")
 
 
-def _apply_review_changes(
-    original: List[ScriptSegment], changes: list[dict]
-) -> tuple[List[ScriptSegment], list[tuple[int, str]], list[tuple[int, str]]]:
+def _apply_review_changes(original: List[ScriptSegment], changes: list[dict]) -> tuple[
+    List[ScriptSegment],
+    list[tuple[int, str]],
+    list[tuple[int, str]],
+    list[tuple[int, str]],
+]:
     """merge a sparse changes list onto a copy of the original batch by index.
 
-    returns (merged, text_mutations, invalid_instructions). text_mutations records
-    (idx, attempted_text) for any change that tried to alter segment text — used
-    to detect when the LLM hallucinates during review. text is always preserved
-    on disk regardless. invalid_instructions records (idx, attempted_instruction)
-    for changes whose instruction was not in EMOTION_KEYS; those are ignored and
-    the original instruction is kept.
+    returns (merged, text_mutations, invalid_instructions, retained_edits).
+    text_mutations records (idx, attempted_text) for any change that tried to
+    alter segment text — used to detect when the LLM hallucinates during
+    review. text is always preserved on disk regardless. invalid_instructions
+    records (idx, attempted_instruction) for changes whose instruction was not
+    in EMOTION_KEYS. retained_edits records (idx, attempted_speaker) for
+    changes that tried to voice a retained segment. both are ignored and the
+    original kept.
     """
     merged = list(original)
     text_mutations: list[tuple[int, str]] = []
     invalid_instructions: list[tuple[int, str]] = []
+    retained_edits: list[tuple[int, str]] = []
     for c in changes:
         if not isinstance(c, dict):
             continue
@@ -1002,6 +1023,17 @@ def _apply_review_changes(
             raise KeyError(f"change missing valid index: {preview}")
         cur = merged[idx]
         speaker = c.get("speaker", c.get("s", cur.speaker)) or cur.speaker
+        # retained text is not narration: section markers, chapter numbers and
+        # front matter (blurbs and their attribution lines). the prompt says so,
+        # but a reviewer reading "Narrator for ALL unquoted text" reclassifies
+        # them anyway, and the result is a voice reading "-- Financial Times".
+        if cur.speaker in RETAINED_SPEAKERS and speaker not in RETAINED_SPEAKERS:
+            print(
+                f"  review: ignoring attempt to voice retained segment {idx} "
+                f"as {speaker!r}, keeping {cur.speaker!r}"
+            )
+            retained_edits.append((idx, str(speaker)))
+            speaker = cur.speaker
         instruction = c.get("instruction", c.get("in", cur.instruction))
         if instruction is None:
             instruction = cur.instruction
@@ -1024,7 +1056,7 @@ def _apply_review_changes(
         merged[idx] = ScriptSegment(
             speaker=speaker, text=cur.text, instruction=instruction or ""
         )
-    return merged, text_mutations, invalid_instructions
+    return merged, text_mutations, invalid_instructions, retained_edits
 
 
 def review_script_batch(
@@ -1040,10 +1072,12 @@ def review_script_batch(
     list[ReviewFlag],
     list[tuple[int, str]],
     list[tuple[int, str]],
+    list[tuple[int, str]],
 ]:
     """review a batch of segments against the covering source text.
 
-    returns (corrected_segments, flags, text_mutations, invalid_instructions).
+    returns (corrected_segments, flags, text_mutations, invalid_instructions,
+    retained_edits).
     text is never modified; the LLM emits speaker/instruction corrections by
     index and may flag segments needing human attention (e.g. a segment that
     should be split). text_mutations captures any LLM attempt to alter segment
@@ -1051,7 +1085,7 @@ def review_script_batch(
     logged so reviewers can see it). invalid_instructions captures any change
     whose instruction was not in EMOTION_KEYS; such corrections are ignored
     and the original instruction is kept."""
-    cast_str = _format_cast_list(characters_list)
+    cast_str = _format_cast_list(characters_list, specials=True)
     current_json = json.dumps(
         [
             {
@@ -1132,11 +1166,13 @@ source, do NOT flag it.
     captured_flags: list[ReviewFlag] = []
     captured_mutations: list[tuple[int, str]] = []
     captured_invalid_instructions: list[tuple[int, str]] = []
+    captured_retained_edits: list[tuple[int, str]] = []
 
     def parse_changes(data: list | dict) -> List[ScriptSegment]:
         captured_flags.clear()
         captured_mutations.clear()
         captured_invalid_instructions.clear()
+        captured_retained_edits.clear()
         for f in _extract_flags_list(data):
             if not isinstance(f, dict):
                 continue
@@ -1176,11 +1212,12 @@ source, do NOT flag it.
             captured_flags.append(
                 ReviewFlag(index=idx, reason=str(reason), suggestion=suggestion)
             )
-        merged, mutations, invalid_instructions = _apply_review_changes(
+        merged, mutations, invalid_instructions, retained_edits = _apply_review_changes(
             segments, _extract_changes_list(data)
         )
         captured_mutations.extend(mutations)
         captured_invalid_instructions.extend(invalid_instructions)
+        captured_retained_edits.extend(retained_edits)
         return merged
 
     messages: List[dict[str, str]] = [
@@ -1203,6 +1240,7 @@ source, do NOT flag it.
         list(captured_flags),
         list(captured_mutations),
         list(captured_invalid_instructions),
+        list(captured_retained_edits),
     )
 
 

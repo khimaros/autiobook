@@ -27,6 +27,9 @@ VOICE_DESIGN_MODEL = os.getenv(
     "AUTIOBOOK_TTS_DESIGN_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
 )
 BASE_MODEL = os.getenv("AUTIOBOOK_TTS_CLONE_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
+# one model for every mode, overriding the three qwen-specific defaults above.
+# hosted providers serve design, cloning and synthesis from a single model id.
+DEFAULT_TTS_MODEL = os.getenv("AUTIOBOOK_TTS_MODEL", "")
 DEFAULT_SPEAKER = "ryan"
 RETAINED_SPEAKERS = {"Retained", "Unvoiced", "Silent"}  # text kept but not narrated
 MAX_CHUNK_SIZE = 500  # balance between coherence and decode speed
@@ -86,9 +89,46 @@ def set_active_seed(seed: int) -> None:
 
 # tts http settings
 TTS_HTTP_TIMEOUT = int(os.getenv("AUTIOBOOK_TTS_TIMEOUT", "300"))
-# streaming audio batch size. 0 disables streaming (single response_format=wav
-# reply). >0 enables SSE per-batch PCM streaming so playback starts before
-# synthesis finishes. 16 frames ≈ 1.28s audio; recommended range 8-32.
+# tts backend dialects. "qwen" is the local qwen3-tts server: wav responses,
+# sse streaming, /audio/voices for listing and cloning, and sampler fields.
+# "openai" is the strict subset hosted providers accept (openrouter, openai):
+# model/input/voice/response_format/instructions answered as raw audio bytes.
+# "auto" picks by host, since a hosted endpoint rejects the qwen extensions
+# and bills for the attempt.
+TTS_DIALECT_AUTO = "auto"
+TTS_DIALECT_QWEN = "qwen"
+TTS_DIALECT_OPENAI = "openai"
+TTS_DIALECTS = [TTS_DIALECT_AUTO, TTS_DIALECT_QWEN, TTS_DIALECT_OPENAI]
+DEFAULT_TTS_DIALECT = os.getenv("AUTIOBOOK_TTS_DIALECT", TTS_DIALECT_AUTO)
+OPENAI_DIALECT_HOSTS = ["openrouter.ai", "api.openai.com"]
+# speech response formats. openrouter serves pcm (its default) or mp3 and
+# never wav; the local server serves wav. "" resolves from the dialect.
+TTS_FORMAT_WAV = "wav"
+TTS_FORMAT_PCM = "pcm"
+TTS_FORMAT_MP3 = "mp3"
+TTS_RESPONSE_FORMATS = [TTS_FORMAT_WAV, TTS_FORMAT_PCM, TTS_FORMAT_MP3]
+DEFAULT_TTS_RESPONSE_FORMAT = os.getenv("AUTIOBOOK_TTS_RESPONSE_FORMAT", "")
+# preset voice names for backends with no /audio/voices endpoint. openrouter
+# publishes no voice discovery api, so --preset-voices needs them supplied.
+TTS_PRESET_VOICES = [
+    v.strip() for v in os.getenv("AUTIOBOOK_TTS_VOICES", "").split(",") if v.strip()
+]
+# how delivery direction reaches the model. "field" sends a top-level
+# instructions field, which the qwen server and openai's own api read.
+# openrouter documents no such field, so "prefix" folds the direction into the
+# input text instead -- how gemini tts takes direction, and the only channel
+# left on a provider that drops unknown fields.
+TTS_DIRECTION_FIELD = "field"
+TTS_DIRECTION_PREFIX = "prefix"
+TTS_DIRECTIONS = [TTS_DIRECTION_FIELD, TTS_DIRECTION_PREFIX]
+DEFAULT_TTS_DIRECTION = os.getenv("AUTIOBOOK_TTS_DIRECTION", TTS_DIRECTION_FIELD)
+TTS_DIRECTION_TEMPLATE = (
+    "Read the following aloud. Voice and delivery: {instruct}\n\n{text}"
+)
+# streaming audio batch size for the qwen server. 0 disables streaming (single
+# response_format=wav reply). >0 enables SSE per-batch PCM streaming so playback
+# starts before synthesis finishes. 16 frames ≈ 1.28s audio; range 8-32.
+# hosted providers ignore this: their response body is already a byte stream.
 TTS_STREAM_BATCH_SIZE = int(os.getenv("AUTIOBOOK_TTS_STREAM_BATCH_SIZE", "0"))
 
 # audio processing. PARAGRAPH_PAUSE_MS is the single source of truth for the
@@ -96,6 +136,12 @@ TTS_STREAM_BATCH_SIZE = int(os.getenv("AUTIOBOOK_TTS_STREAM_BATCH_SIZE", "0"))
 # use the same value or every cue/overlay offset drifts by 500ms per chunk.
 PARAGRAPH_PAUSE_MS = 500
 CHAPTER_PAUSE_MS = 1000
+
+# leading dashes are typographic, not phonetic: a blurb attribution line reads
+# as the publication's name alone. some tts models answer the bare dash with
+# silence, so it is stripped before synthesis. dashes inside a line are left
+# alone; they shape prosody. covers ascii hyphen, U+2010-U+2015, minus sign.
+LEADING_DASH_RE = re.compile(r"^[\s\-\u2010-\u2015\u2212]+")
 
 # mp3 export
 DEFAULT_BITRATE = "192k"

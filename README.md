@@ -197,6 +197,10 @@ autiobook locate workdir/perform/NN_Title.wav 00:12:34
 - `-c, --chapters RANGE` - chapter selection (e.g., 1-5, 3,7,10)
 - `--tts-model`, `--tts-design-model`, `--tts-clone-model` - override tts models
 - `--api-base`, `--api-key` - openai-compatible endpoint (defaults to `$OPENAI_BASE_URL` / `$OPENAI_API_KEY`)
+- `--tts-api-base`, `--tts-api-key` - point tts at a different provider than the llm
+- `--tts-dialect` - request subset: `qwen`, `openai`, or `auto` (by host)
+- `--tts-voices` - preset voices for a backend with no `/audio/voices` endpoint
+- `--tts-direction` - `field` (top-level `instructions`) or `prefix` (folded into the text)
 - `--llm-model` - llm model name
 - `--m4b` - export as a single m4b with chapter markers
 - `-v, --verbose` - verbose output
@@ -216,11 +220,59 @@ environment variables (also loadable from `.env`; see `.env.example`):
 `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `AUTIOBOOK_LLM_MODEL`,
 `AUTIOBOOK_TTS_CLONE_MODEL`, `AUTIOBOOK_TTS_INSTRUCT_MODEL`,
 `AUTIOBOOK_TTS_DESIGN_MODEL`, `AUTIOBOOK_SEED`,
-`AUTIOBOOK_LLM_THINKING_BUDGET`, `AUTIOBOOK_CAST_BATCH_SIZE`.
+`AUTIOBOOK_LLM_THINKING_BUDGET`, `AUTIOBOOK_CAST_BATCH_SIZE`,
+`AUTIOBOOK_TTS_MODEL`, `AUTIOBOOK_TTS_API_BASE`, `AUTIOBOOK_TTS_API_KEY`,
+`AUTIOBOOK_TTS_DIALECT`, `AUTIOBOOK_TTS_VOICES`, `AUTIOBOOK_TTS_DIRECTION`,
+`AUTIOBOOK_TTS_RESPONSE_FORMAT`.
+
+### hosted tts backends
+
+the default tts backend is a local qwen3-tts server, whose api is a superset
+of openai's: wav responses, sse streaming, and an `/audio/voices` endpoint for
+listing presets and creating cloned voices. hosted providers offer none of
+that, so `--tts-dialect openai` (selected automatically for `openrouter.ai`
+and `api.openai.com`) narrows each request to `model`, `input`, `voice`,
+`response_format` and `instructions`, asks for pcm instead of wav, and skips
+the sse probe -- on a metered api that probe is a second billed synthesis of
+the same text.
+
+```bash
+export OPENAI_BASE_URL=https://openrouter.ai/api/v1
+export OPENAI_API_KEY=sk-or-...
+autiobook dramatize book.epub \
+    --tts-model google/gemini-3.1-flash-tts-preview \
+    --preset-voices --tts-direction prefix
+```
+
+`--tts-model` (or `$AUTIOBOOK_TTS_MODEL`) sets the model for every mode. the
+three per-mode defaults are qwen model ids, so a hosted run that leaves them
+in place asks openrouter for a model it has never heard of.
+
+takes play while they render on a hosted backend without any extra setting --
+`AUTIOBOOK_TTS_STREAM_BATCH_SIZE` is a qwen-server knob, and the provider's
+response body is already a stream. in `--directed` casting the prompt stays
+live during playback, so `n` moves on mid-take instead of after it, and
+`[p]rev` steps back to an earlier voice (replayed from cache, not re-rendered).
+
+`--preset-voices` is required: hosted providers have fixed voices and no
+server-side voice creation, so voice design and cloning are unavailable there.
+openrouter publishes no voice discovery api either; the gemini tts voice names
+are built in, and anything else needs `--tts-voices Zephyr,Puck,Kore`.
+
+`--tts-direction prefix` folds emotion and voice direction into the input text
+rather than the `instructions` field, which openrouter does not document as a
+top-level parameter. without it, delivery direction may be silently dropped
+and every line comes out flat.
+
+to keep tts local while the llm runs hosted (or the reverse), set
+`--tts-api-base`/`--tts-api-key` alongside `--api-base`/`--api-key`.
 
 ### available voices
 
-Vivian, Ryan, Sunny, Aria, Bella, Nova, Echo, Finn, Atlas
+qwen3-tts: Vivian, Ryan, Sunny, Aria, Bella, Nova, Echo, Finn, Atlas
+
+gemini tts (built in, used with `--preset-voices`): Zephyr, Puck, Charon,
+Kore, Fenrir, Leda, Orus, Aoede, and 22 more.
 
 ## output
 

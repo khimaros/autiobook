@@ -107,7 +107,11 @@ def _run_synthesis(engine: Any, batch: list[AudioTask]) -> list[np.ndarray]:
     """invoke the engine on a batch and return aligned audio arrays.
 
     handles batch padding (for torch.compile) and OOM retry; does not save."""
-    texts = [t.text for t in batch]
+    from .utils import normalize_tts_text
+
+    # normalized here rather than at task construction so segment hashes stay
+    # keyed on the script text, and cached takes are not invalidated
+    texts = [normalize_tts_text(t.text) for t in batch]
     ref_audio = batch[0].voice_ref_audio
     ref_text = batch[0].voice_ref_text
     instruct = batch[0].instruct
@@ -173,6 +177,9 @@ def _retry_bad_takes(
 
     base_seed = int(getattr(engine.config, "seed", 0) or 0)
     original_seed = base_seed
+    # a backend that ignores seed still samples fresh on each call, so retrying
+    # is worthwhile -- but reporting a seed that never left the process is not
+    seeded = base_seed > 0 and getattr(engine, "seeded", True)
 
     had_retakes = False
     for attempt in range(1, max_attempts + 1):
@@ -186,17 +193,18 @@ def _retry_bad_takes(
 
         # fresh random seed per retry explores a genuinely different trajectory;
         # neighboring seeds (base+1, base+2) often produce similar failures.
-        new_seed = random.randint(1, 2**31 - 1) if base_seed > 0 else 0
+        new_seed = random.randint(1, 2**31 - 1) if seeded else 0
 
         if verbose:
+            detail = f" seed={new_seed}" if seeded else ""
             for i, cats in bad:
                 tqdm.write(
                     f"retake: attempt {attempt}/{max_attempts}: "
-                    f"{batch[i].segment_hash[:16]} ({','.join(cats)}) "
-                    f"seed={new_seed}; retrying..."
+                    f"{batch[i].segment_hash[:16]} ({','.join(cats)})"
+                    f"{detail}; retrying..."
                 )
 
-        if base_seed > 0:
+        if seeded:
             engine.config.seed = new_seed
 
         sub_idx = [i for i, _ in bad]
@@ -209,7 +217,7 @@ def _retry_bad_takes(
         for k, i in enumerate(sub_idx):
             wavs[i] = redo[k]
 
-    if base_seed > 0:
+    if seeded:
         engine.config.seed = original_seed
 
     final_bad = [

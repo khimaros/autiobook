@@ -4,16 +4,18 @@ import json
 import shutil
 import subprocess
 from pathlib import Path
+from threading import Thread
 from typing import Any
 
 import soundfile as sf  # type: ignore
 
-from .config import WAV_EXT
+from .config import SAMPLE_RATE, WAV_EXT
 from .llm import Character
 from .resume import get_command_dir
 
 VOICES_FILE = "voices.json"
 PRESETS_DIR = "presets"
+SKIP_CHAR = "__skip__"  # sentinel: user passed on the character, not a voice
 
 
 def voices_path(workdir: Path) -> Path:
@@ -31,27 +33,18 @@ def load_voices(workdir: Path) -> dict[str, str]:
 
 
 def save_voices(workdir: Path, voices: dict[str, str]) -> None:
-    """persist the character → voice_id mapping."""
+    """persist the character → voice_id mapping.
+
+    no-op when the mapping already on disk is identical: --step advances only
+    when a phase touched files, so rewriting an unchanged voices.json pins the
+    pipeline on audition and it never reaches script.
+    """
     p = voices_path(workdir)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(voices, indent=2))
-
-
-def _play_wav(path: Path) -> None:
-    """play a wav file via ffplay, aplay, or paplay (whichever is available)."""
-    player = shutil.which("ffplay")
-    if player:
-        subprocess.run(
-            [player, "-nodisp", "-autoexit", "-loglevel", "quiet", str(path)],
-            check=False,
-        )
+    payload = json.dumps(voices, indent=2)
+    if p.exists() and p.read_text() == payload:
         return
-    for cmd in ("paplay", "aplay", "afplay"):
-        p = shutil.which(cmd)
-        if p:
-            subprocess.run([p, str(path)], check=False)
-            return
-    print(f"(no audio player found; listen to {path} manually)")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(payload)
 
 
 def _play_wav_async(path: Path) -> subprocess.Popen | None:
@@ -138,11 +131,122 @@ def _synthesize_preview(
         engine.config.speaker = original
 
 
+def _pcm_writer(stdin: Any) -> Any:
+    """feed pcm to a player, ignoring a pipe the user has already closed."""
+
+    def write(chunk: bytes) -> None:
+        try:
+            stdin.write(chunk)
+            stdin.flush()
+        except (BrokenPipeError, OSError):
+            pass
+
+    return write
+
+
+def _stream_preview(engine: Any, text: str, voice_id: str, preview_path: Path) -> Any:
+    """render a take straight into the player, caching the wav when it lands.
+
+    returns the player handle, or None when live playback is unavailable and
+    the caller should fall back to synthesizing the whole take first.
+    """
+    proc = _play_pcm_stream(SAMPLE_RATE)
+    if proc is None or proc.stdin is None:
+        return None
+    stdin = proc.stdin
+
+    def run() -> None:
+        try:
+            audio, sr = engine.design_voice_stream(
+                text=text, instruct="", on_chunk=_pcm_writer(stdin), voice=voice_id
+            )
+            sf.write(str(preview_path), audio, sr)
+        except Exception as e:
+            print(f"    stream failed: {e}")
+        finally:
+            try:
+                stdin.close()
+            except OSError:
+                pass
+
+    Thread(target=run, daemon=True).start()
+    return proc
+
+
+def _start_preview(engine: Any, char: Character, voice_id: str, preview: Path) -> Any:
+    """begin playing a take without blocking, so the prompt stays usable.
+
+    a streaming backend plays as it renders; anything else renders first and
+    then plays the cached wav.
+    """
+    if not preview.exists() and getattr(engine, "streaming", False):
+        proc = _stream_preview(engine, char.audition_line, voice_id, preview)
+        if proc is not None:
+            return proc
+    _synthesize_preview(engine, char, voice_id, preview)
+    return _play_wav_async(preview)
+
+
 def _prompt(msg: str) -> str:
     try:
         return input(msg).strip().lower()
     except (EOFError, KeyboardInterrupt):
         return "q"
+
+
+def _audition_voices(
+    workdir: Path, char: Character, available: list[str], engine: Any
+) -> tuple[str | None, bool]:
+    """walk the voice list for one character; returns (choice, quit_requested).
+
+    choice is the accepted voice id, SKIP_CHAR when the user passed on the
+    character, or None when the list ran out. navigation is by index rather
+    than a plain walk so [p]rev can go back, replaying the cached take.
+    """
+    index = 0
+    while 0 <= index < len(available):
+        voice_id = available[index]
+        preview = _preview_path(workdir, char.name, voice_id)
+        print(f"\n  trying '{voice_id}' ({index + 1}/{len(available)})...")
+        try:
+            playback = _start_preview(engine, char, voice_id, preview)
+        except Exception as e:
+            print(f"    failed to synthesize preview: {e}")
+            index += 1
+            continue
+
+        step = 1
+        while True:
+            ans = _prompt(
+                "  [y]es / [n]ext / [p]rev / [r]eplay / [s]kip char / [q]uit: "
+            )
+            # any answer cuts the take short rather than waiting it out
+            _stop_playback(playback)
+            if ans in ("y", "yes"):
+                return voice_id, False
+            if ans in ("n", "next", ""):
+                break
+            if ans in ("p", "prev"):
+                if index == 0:
+                    print("    already at the first voice")
+                    continue
+                step = -1
+                break
+            if ans in ("r", "replay"):
+                # never re-synthesize: on a metered backend that is a
+                # second charge for a take already paid for
+                if preview.exists():
+                    playback = _play_wav_async(preview)
+                else:
+                    print("    still rendering; replay again in a moment")
+                continue
+            if ans in ("s", "skip"):
+                return SKIP_CHAR, False
+            if ans in ("q", "quit"):
+                return None, True
+            print("    unknown input")
+        index += step
+    return None, False
 
 
 def run_casting(
@@ -153,7 +257,8 @@ def run_casting(
 ) -> dict[str, str]:
     """interactively assign a preset voice to each character.
 
-    plays each voice saying the character's audition line; user says yes/next/skip/quit.
+    plays each voice saying the character's audition line; the user navigates
+    the list with yes/next/prev/replay/skip/quit while it plays.
     resumable: existing mappings are preserved unless force=True.
     """
     available = engine.list_voices()
@@ -177,43 +282,13 @@ def run_casting(
         print(f"  voice: {char.voice_prompt()}")
         print(f"  line: {char.audition_line!r}")
 
-        cast_voice = None
-        for voice_id in available:
-            preview = _preview_path(workdir, char.name, voice_id)
-            print(f"\n  trying '{voice_id}'...")
-            try:
-                _synthesize_preview(engine, char, voice_id, preview)
-            except Exception as e:
-                print(f"    failed to synthesize preview: {e}")
-                continue
-            _play_wav(preview)
+        cast_voice, quit_requested = _audition_voices(workdir, char, available, engine)
 
-            while True:
-                ans = _prompt("  [y]es / [n]ext / [r]eplay / [s]kip char / [q]uit: ")
-                if ans in ("y", "yes"):
-                    cast_voice = voice_id
-                    break
-                if ans in ("n", "next", ""):
-                    break
-                if ans in ("r", "replay"):
-                    _play_wav(preview)
-                    continue
-                if ans in ("s", "skip"):
-                    cast_voice = "__skip__"
-                    break
-                if ans in ("q", "quit"):
-                    quit_requested = True
-                    break
-                print("    unknown input")
-
-            if cast_voice or quit_requested:
-                break
-
-        if cast_voice and cast_voice != "__skip__":
+        if cast_voice and cast_voice != SKIP_CHAR:
             voices[char.name] = cast_voice
             save_voices(workdir, voices)
             print(f"  cast: {char.name} -> {cast_voice}")
-        elif cast_voice == "__skip__":
+        elif cast_voice == SKIP_CHAR:
             print(f"  skipped: {char.name} (no voice assigned)")
 
     save_voices(workdir, voices)

@@ -356,10 +356,7 @@ def _run_directed_design(
     # of a pregen synth. streaming TTFA (~1 batch) is fast enough that we
     # don't need a zero-wait buffer for successive takes.
     stream_fn = getattr(engine, "design_voice_stream", None)
-    stream_batch_size = getattr(getattr(engine, "config", None), "stream_batch_size", 0)
-    streaming_available = (
-        callable(stream_fn) and stream_batch_size and stream_batch_size > 0
-    )
+    streaming_available = callable(stream_fn) and getattr(engine, "streaming", False)
 
     accepted = 0
     skipped = 0
@@ -823,11 +820,12 @@ def cmd_audition(args):
     if preset_voices:
         # preset mode needs an http backend and the custom-voice tts model
         from .config import DEFAULT_MODEL
-        from .utils import _build_http_config, _resolve_tts_model
+        from .utils import _build_http_config, _resolve_tts_model, tts_endpoint
 
-        if not getattr(args, "api_base", None):
+        if not tts_endpoint(args)[0]:
             raise RuntimeError(
-                "--preset-voices requires --api-base (or set OPENAI_BASE_URL)"
+                "--preset-voices requires --api-base or --tts-api-base "
+                "(or set OPENAI_BASE_URL)"
             )
         model = _resolve_tts_model(args, DEFAULT_MODEL)
         config = _build_http_config(args, model)

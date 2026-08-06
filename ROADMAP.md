@@ -1,6 +1,24 @@
 # ROADMAP
 
 ```
+[ ] http tts: voice cloning against openrouter via stateless input_references (base64 reference audio plus transcript sent with each request) instead of the qwen server's voice ids; currently refused on the openai dialect in favour of --preset-voices
+
+[x] review: refuse to voice retained segments. front-matter blurbs and their attribution lines were generated as "Retained" and then promoted to "Narrator" by review, which then read "-- Financial Times" aloud. three causes, all fixed: the shared rule "use Narrator for ALL unquoted text" outranked the narrower Retained rule and named no front-matter case; the review [Character List] omitted Narrator/Extra/Retained while telling the model to use names exactly as listed, so "Retained" read as a mis-attribution; and nothing enforced the prompt's "do NOT alter Retained segments". such changes are now dropped and logged to the audit as kind="retained_edit", mirroring invalid_instruction
+
+[x] tts: strip leading dashes before synthesis (script text is untouched, so segment hashes and cached takes stay valid). an attribution line's em dash is typographic, and gemini answers the bare dash with silence, which retake burned all 5 attempts on before failing the run
+
+[x] retake: stop reporting seed= on backends that ignore it. hosted providers document no seed on /audio/speech and the openai dialect never sends one, so the logged seed was a value that never left the process; retries there still explore fresh samples, they just are not reproducible. engines now advertise `seeded`
+
+[x] fix --step never advancing past audition with --preset-voices: run_casting rewrote voices.json on every run, including one where every character was already cast and nothing was prompted. --step raises StepComplete when a phase's directory mtime moves, so each re-run stopped on audition again and script was never reached. save_voices is now a no-op when the mapping on disk is identical, matching ResumeManager.update
+
+[x] directed casting: [p]rev to step back to an earlier preset voice (only the non-preset directed audition had it; the casting loop walked the voice list one way with no way back), with a position indicator matching that prompt. going back replays the cached take rather than re-rendering it
+
+[x] directed casting: play preview takes asynchronously so the prompt stays usable while audio plays (it previously blocked on ffplay for the whole take, so every answer waited out the audition line), and stream takes into the player as they render. hosted providers stream their response body rather than sse, so progressive playback now works there too; replay reuses the cached wav rather than paying for the take twice
+
+[x] http tts: fix dramatize --preset-voices rebuilding its audition config from scratch (api_base and a hardcoded qwen model only), which dropped the api key and 401'd every take on a hosted backend; derived from the design config now. --tts-model gained an AUTIOBOOK_TTS_MODEL default and is honoured by the design and clone configs, which previously ignored it and sent qwen model ids
+
+[x] http tts: support hosted openai-compatible backends (openrouter, openai). bearer auth on every tts request (previously llm-only, so any hosted endpoint 401'd), a "dialect" that narrows the request body to the subset they accept and skips the sse probe they would bill twice for, pcm/mp3 response decoding (openrouter never returns wav), preset voice lists for backends with no /audio/voices endpoint (gemini tts names built in), --tts-direction for providers that drop the instructions field, and --tts-api-base/--tts-api-key so tts and llm can point at different providers
+
 [x] fix UnboundLocalError crashing `audition --directed` on a resumed run: quit_requested was bound inside the per-character loop, after the skip `continue`, so a fully-cached cast reached the post-loop check with the name unbound. bound before the loop; the per-character reset was unreachable and removed
 
 [x] cast --verbose: show the voice prompt on new characters, diff every field update (including voice, which was silently dropped when merging into an existing character), report proposed audition_line changes that were kept, name unchanged characters, and summarise each chunk's outcome

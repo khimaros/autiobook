@@ -71,6 +71,20 @@ advanced workflow for multi-speaker dramatization. pipeline order: cast → audi
 - `revise`: review and repair scripts. compares script to source, then fills missing segments via LLM and removes hallucinated segments. `--dry-run` reports without modifying; `--prune` strips hallucinations but skips LLM fix-missing.
 - `perform`: synthesizes audio using `Qwen3-TTS-Base` voice cloning from scripts + voice samples.
 
+### review
+
+corrections the review LLM emits are filtered before they land. an instruction
+outside `EMOTION_KEYS` is dropped, and so is any change that moves a segment
+out of `RETAINED_SPEAKERS` -- retained text is the material that must never be
+spoken (section markers, chapter numbers, front-matter blurbs and their
+attribution lines), and promoting it to Narrator is never a correction. both
+are recorded to `review/audit.json` (`kind="invalid_instruction"` and
+`kind="retained_edit"`) rather than applied silently.
+
+the prompt asks for the same restraint, but a rule is not a guarantee: the
+shared script rules also say to narrate all unquoted text, and that broader
+instruction is what pulled blurbs out of Retained in the first place.
+
 ### audition / emote
 
 the interactive audition prompt offers `[e]dit`, which opens `$EDITOR` on the
@@ -153,6 +167,48 @@ wraps qwen3-tts for text-to-speech conversion.
 - supports configurable voice and style
 - **Voice Design**: generates new voices from text descriptions
 - **Voice Cloning**: clones voices from reference audio
+
+### tts_http.py
+
+talks to a speech api over http instead of loading a model locally.
+
+two dialects share one client, resolved from the endpoint host unless pinned
+with `--tts-dialect`:
+
+- `qwen` -- the local qwen3-tts server. its api is a superset of openai's:
+  wav responses, sse streaming with usage/timings, sampler fields, and an
+  `/audio/voices` endpoint for both listing presets and minting cloned voices
+  from reference audio.
+- `openai` -- hosted providers (openrouter, openai). requests carry only the
+  documented fields, responses are raw pcm, and the sse probe is skipped
+  because a metered endpoint bills it as a second synthesis of the same text.
+
+the split exists because the two disagree on every axis that matters: a body
+field the local server needs is at best ignored and at worst a paid 400 on a
+hosted one, and `wav` is not among the formats openrouter will return.
+
+capabilities that need server-side state (voice design, cloning) are refused
+on the openai dialect rather than silently producing one voice for the whole
+cast; `--preset-voices` is the supported route there. voice discovery has no
+hosted equivalent at all, so preset names come from `--tts-voices` or a
+built-in per-model table.
+
+`--tts-direction` picks the channel for delivery direction: a top-level
+`instructions` field, or folded into the input text for providers that drop
+unknown fields.
+
+engines advertise two capabilities the pipeline branches on. `seeded` is false
+for hosted providers, which document no seed on `/audio/speech`: retakes there
+still explore fresh samples, so retrying is worthwhile, but the seed is not
+reported since it never leaves the process. text is normalized at the single
+synthesis chokepoint (`_run_synthesis`) rather than at task construction, so
+segment hashes stay keyed on the script text and cached takes survive.
+
+progressive playback works on both, by different means: the qwen server emits
+pcm inside sse deltas once given a batch size, while a hosted provider's
+response body is itself the stream and is read a buffer at a time. the
+`streaming` property hides which, so the interactive loops ask the engine
+rather than inspecting config.
 
 ### dramatize.py
 

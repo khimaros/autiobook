@@ -3109,12 +3109,14 @@ def run_review(
             batch_flags: list = []
             batch_mutations: list[tuple[int, str]] = []
             batch_invalid_instructions: list[tuple[int, str]] = []
+            batch_retained_edits: list[tuple[int, str]] = []
             try:
                 (
                     corrected,
                     batch_flags,
                     batch_mutations,
                     batch_invalid_instructions,
+                    batch_retained_edits,
                 ) = review_script_batch(
                     span,
                     batch,
@@ -3238,6 +3240,31 @@ def run_review(
                 tqdm.write(
                     f"  invalid instruction: {txt_path.stem} seg {seg_no}: "
                     f"LLM emitted {attempted!r}; kept original"
+                )
+            # record attempts to voice retained text (section markers, front
+            # matter); the retained speaker is preserved regardless.
+            for idx, attempted in batch_retained_edits:
+                seg_no = i + idx + 1
+                orig = batch[idx] if idx < len(batch) else None
+                audit.append(
+                    {
+                        "kind": "retained_edit",
+                        "phase": REVIEW_AUDIT_PHASE,
+                        "chapter": txt_path.stem,
+                        "segment": seg_no,
+                        "reason": (
+                            f"review LLM tried to voice retained text as "
+                            f"{attempted!r}; kept original"
+                        ),
+                        "text": orig.text if orig else "",
+                        "attempted_speaker": attempted,
+                        "before": orig.speaker if orig else "",
+                        "source_span": span,
+                    }
+                )
+                tqdm.write(
+                    f"  retained edit: {txt_path.stem} seg {seg_no}: "
+                    f"LLM tried {attempted!r}; kept retained"
                 )
             _save_review_audit(audit_path, audit, reviewed)
             new_segments.extend(corrected)
@@ -3505,13 +3532,9 @@ def dramatize_book(
 
     audition_config = design_config
     if preset_voices:
-        from .config import DEFAULT_MODEL
-        from .tts_http import HTTPTTSConfig
+        from .utils import preset_audition_config
 
-        audition_config = HTTPTTSConfig(
-            api_base=api_base or "",
-            model=DEFAULT_MODEL,
-        )
+        audition_config = preset_audition_config(design_config, api_base)
     emote_config = audition_config if preset_voices else design_config
 
     def _run_head(chs: list[int] | None) -> None:
