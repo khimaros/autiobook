@@ -89,6 +89,28 @@ creates:
 - `workdir/export/NN_Title.mp3` - mp3 files with id3 tags
 - `workdir/export/state.json` - resumability state
 
+### read-along epub3
+
+rebuild the source epub with media overlays, so a reader highlights each
+phrase as it is narrated.
+
+```
+autiobook export workdir/ --epub3
+```
+
+creates `workdir/export/<book>.epub`.
+
+the source epub is located automatically from the extract state; pass
+`--epub book.epub` if it has since moved. `--epub3-bitrate` controls the
+embedded audio (default `64k` - a novel runs a few hundred MiB, so raising
+this gets large quickly).
+
+epub2 sources are upgraded to epub3, which media overlays require.
+
+read-along playback is supported by apple books, thorium, and other
+readium-based readers. kindle ignores media overlays entirely, and support
+in google play books and kobo is patchy.
+
 
 ### dramatized conversion (llm)
 
@@ -177,6 +199,16 @@ autiobook locate workdir/perform/NN_Title.wav 00:12:34
 - `--m4b` - export as a single m4b with chapter markers
 - `-v, --verbose` - verbose output
 - `-f, --force` - ignore resume state
+- `--seed` - seed for tts and llm (`0` disables seeding)
+
+### seeds
+
+the seed for a book is chosen once and recorded in `workdir/seed.json`, so
+resuming a conversion reuses it instead of drifting to a new one each run.
+
+precedence is `--seed`, then `$AUTIOBOOK_SEED`, then the recorded seed, then a
+fresh random one. passing `--seed` (or setting the env var) replaces what was
+recorded, and says so, since the whole point is that a book keeps one seed.
 
 environment variables (also loadable from `.env`; see `.env.example`):
 `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `AUTIOBOOK_LLM_MODEL`,
@@ -203,6 +235,9 @@ workdir/export/
 The `export/` folder also contains `.srt` and `.vtt` subtitles alongside
 each chapter mp3 (with speaker labels for dramatized output).
 
+`--epub3` instead produces a single read-along epub with the narration
+embedded and synchronized to the text.
+
 compatible with the [Voice](https://github.com/PaulWoitaschek/Voice) audiobook player for android.
 
 ## workdir structure
@@ -211,6 +246,7 @@ Intermediate files are organized into subdirectories by command:
 
 ```
 workdir/
+├── seed.json              # seed recorded for this book, reused on resume
 ├── extract/               # extracted text and metadata
 │   ├── metadata.json
 │   ├── cover.jpg

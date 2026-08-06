@@ -5,7 +5,7 @@ import io
 import json
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -13,11 +13,11 @@ import numpy as np
 import soundfile as sf  # type: ignore
 
 from .config import (
-    DEFAULT_SEED,
     MAX_CHUNK_SIZE,
     SAMPLE_RATE,
     TTS_HTTP_TIMEOUT,
     TTS_STREAM_BATCH_SIZE,
+    active_seed,
 )
 
 # voice cache: (api_base, ref_audio_path, ref_text) -> voice_id
@@ -37,7 +37,7 @@ class HTTPTTSConfig:
     temperature: float | None = None
     top_k: int | None = None
     repetition_penalty: float | None = None
-    seed: int = DEFAULT_SEED
+    seed: int = field(default_factory=active_seed)
     # when > 0, streaming audio calls request live per-batch PCM deltas so
     # playback can begin before synthesis finishes. set via
     # AUTIOBOOK_TTS_STREAM_BATCH_SIZE; 0 disables streaming.

@@ -97,6 +97,42 @@ class TestExtractTextFromHtml:
         result = extract_text_from_html(html)
         assert result == "Word with spaces."
 
+    def test_non_content_wrapper_does_not_duplicate(self):
+        """a non-content wrapper must not leak its nested content tags.
+
+        the container branch only skips direct children that are content tags,
+        so a wrapper like <section> that is not itself a content tag hands back
+        its entire subtree, which is then emitted again tag by tag.
+        """
+        html = b"<div><section><p>Only once.</p></section></div>"
+        result = extract_text_from_html(html)
+        assert result.count("Only once.") == 1
+
+    def test_galley_structure_does_not_duplicate(self):
+        """real-world orbit/hachette template: div > section > many p."""
+        html = b"""<div class="galley-rw">
+<section class="body-rw Chapter-rw">
+<p class="copyright-space">This book is a work of fiction.</p>
+<p class="copyright-space">Copyright 2024 by the authors.</p>
+<p class="copyright">Cover design by someone.</p>
+</section>
+</div>"""
+        result = extract_text_from_html(html)
+        for phrase in [
+            "This book is a work of fiction.",
+            "Copyright 2024 by the authors.",
+            "Cover design by someone.",
+        ]:
+            assert result.count(phrase) == 1, f"{phrase!r} duplicated"
+        assert len([p for p in result.split("\n\n") if p.strip()]) == 3
+
+    def test_loose_text_in_wrapper_preserved(self):
+        """text directly inside a non-content wrapper is still extracted."""
+        html = b"<div><section>Loose intro text.<p>A paragraph.</p></section></div>"
+        result = extract_text_from_html(html)
+        assert "Loose intro text." in result
+        assert result.count("A paragraph.") == 1
+
     def test_mixed_content_preservation(self):
         """verify text directly inside a div is preserved even if it contains paragraphs."""
         html = b"""<div class="intro">

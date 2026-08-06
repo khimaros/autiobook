@@ -378,21 +378,85 @@ def _run_directed_design(
         print(f"  description: {instruct}")
         print(f"  line: {text!r}")
 
-        # takes: list of (seed, instruct, audio, sr, path). cursor points at current.
-        takes: list[tuple[int, str, Any, int, Path]] = []
+        # takes: each entry [seed, instruct, audio|None, sr|None, path|None].
+        # uncached entries (audio is None) get re-streamed on revisit using
+        # the recorded seed — so 'p' returns to a phantom take that the user
+        # navigated away from before its synth completed.
+        takes: list[list[Any]] = []
         cursor = -1
         quit_requested = False
-        generate_next = True
+        # what to do at top of next iteration: "new" (generate at end),
+        # "restream" (re-stream takes[cursor]), or None (just prompt).
+        next_action: str | None = "new"
         pregen: PregenQueue | None = None
         if not streaming_available:
             pregen = PregenQueue(max_depth=PREGEN_DEPTH)
             pregen.set_target(text, instruct)
 
-        # pending streaming synth: (thread, seed, instruct, result, live_proc, cancel)
-        pending: tuple[Thread, int, str, dict, Any, Event] | None = None
+        # pending streaming synth: (thread, take_index, result, live_proc, cancel)
+        pending: tuple[Thread, int, dict, Any, Event] | None = None
+
+        def _start_stream(seed: int, synth_instruct: str, take_index: int) -> None:
+            """spawn a background streaming synth that pipes pcm to ffplay."""
+            nonlocal pending, playback
+            stop()
+            live_proc = _play_pcm_stream(SAMPLE_RATE)
+            use_live = live_proc is not None and live_proc.stdin is not None
+            if use_live:
+                playback = live_proc
+            result: dict[str, Any] = {}
+            cancel_event = Event()
+
+            def _synth(
+                _live_proc=live_proc,
+                _use_live=use_live,
+                _seed=seed,
+                _instruct=synth_instruct,
+                _result=result,
+                _cancel=cancel_event,
+            ) -> None:
+                try:
+                    with engine_lock:
+                        config.seed = _seed
+                        if _use_live:
+
+                            def _on_chunk(b: bytes) -> None:
+                                try:
+                                    _live_proc.stdin.write(b)
+                                    _live_proc.stdin.flush()
+                                except (BrokenPipeError, OSError):
+                                    pass
+
+                            assert stream_fn is not None
+                            a, s = stream_fn(
+                                text=text,
+                                instruct=_instruct,
+                                on_chunk=_on_chunk,
+                                cancel=_cancel,
+                            )
+                        else:
+                            a, s = engine.design_voice(text=text, instruct=_instruct)
+                    _result["audio"] = a
+                    _result["sr"] = s
+                except Exception as e:
+                    _result["error"] = e
+                finally:
+                    if (
+                        _use_live
+                        and _live_proc is not None
+                        and _live_proc.stdin is not None
+                    ):
+                        try:
+                            _live_proc.stdin.close()
+                        except OSError:
+                            pass
+
+            t = Thread(target=_synth, daemon=True)
+            t.start()
+            pending = (t, take_index, result, live_proc, cancel_event)
 
         while True:
-            if generate_next:
+            if next_action == "new":
                 got = pregen.take(instruct) if pregen is not None else None
                 if got is not None:
                     seed, audio, sr = got
@@ -400,140 +464,86 @@ def _run_directed_design(
                         print(f"  seed={seed}")
                     take_path = takes_dir / f"{char.name}__{seed}{WAV_EXT}"
                     sf.write(str(take_path), audio, sr)
-                    takes.append((seed, instruct, audio, sr, take_path))
+                    takes.append([seed, instruct, audio, sr, take_path])
                     cursor = len(takes) - 1
                     if pregen is not None:
                         pregen.ensure_running()
                     play(take_path)
                 else:
-                    # spawn background streaming synth; prompt will appear
-                    # immediately while PCM streams to ffplay live.
                     seed = int(getattr(config, "seed", 0) or 0) or random.randint(
                         1, 2**31 - 1
                     )
                     if verbose:
                         print(f"  seed={seed}")
-                    live_proc = None
-                    use_live = streaming_available
-                    if use_live:
-                        stop()  # kill any prior playback before new stream
-                        live_proc = _play_pcm_stream(SAMPLE_RATE)
-                        use_live = live_proc is not None and live_proc.stdin is not None
-                        if use_live:
-                            playback = live_proc  # so stop() can kill it
-                    synth_seed = seed
-                    synth_instruct = instruct
-                    result: dict[str, Any] = {}
-                    cancel_event = Event()
+                    takes.append([seed, instruct, None, None, None])
+                    cursor = len(takes) - 1
+                    _start_stream(seed, instruct, cursor)
+            elif next_action == "restream":
+                t_seed, t_instruct = takes[cursor][0], takes[cursor][1]
+                if verbose:
+                    print(f"  seed={t_seed} (restream)")
+                _start_stream(t_seed, t_instruct, cursor)
+            next_action = None
 
-                    def _synth(
-                        _live_proc=live_proc,
-                        _use_live=use_live,
-                        _seed=synth_seed,
-                        _instruct=synth_instruct,
-                        _result=result,
-                        _cancel=cancel_event,
-                    ) -> None:
-                        try:
-                            with engine_lock:
-                                config.seed = _seed
-                                if _use_live:
-
-                                    def _on_chunk(b: bytes) -> None:
-                                        try:
-                                            _live_proc.stdin.write(b)
-                                            _live_proc.stdin.flush()
-                                        except (BrokenPipeError, OSError):
-                                            pass
-
-                                    assert stream_fn is not None
-                                    a, s = stream_fn(
-                                        text=text,
-                                        instruct=_instruct,
-                                        on_chunk=_on_chunk,
-                                        cancel=_cancel,
-                                    )
-                                else:
-                                    a, s = engine.design_voice(
-                                        text=text, instruct=_instruct
-                                    )
-                            _result["audio"] = a
-                            _result["sr"] = s
-                        except Exception as e:
-                            _result["error"] = e
-                        finally:
-                            if (
-                                _use_live
-                                and _live_proc is not None
-                                and _live_proc.stdin is not None
-                            ):
-                                try:
-                                    _live_proc.stdin.close()
-                                except OSError:
-                                    pass
-
-                    t = Thread(target=_synth, daemon=True)
-                    t.start()
-                    pending = (
-                        t,
-                        synth_seed,
-                        synth_instruct,
-                        result,
-                        live_proc,
-                        cancel_event,
-                    )
-                generate_next = False
-
-            if pending is not None:
-                pos = f"{len(takes) + 1}/?"
-            else:
-                pos = f"{cursor + 1}/{len(takes)}"
+            pos = f"{cursor + 1}/{len(takes)}"
             ans = _prompt(
                 f"  [{pos}] [y]es / [n]ext / [p]rev / [r]eplay / [d]escribe / [s]kip / [q]uit: "
             )
-            # resolve any pending streaming synth: cancel it unless the user
-            # action needs the full audio (y = accept, r = replay).
+            # resolve any pending streaming synth. y/r need full audio so we
+            # wait. nav actions (n/p/d) don't wait — but if the synth already
+            # finished, cache it. s/q cancel and drop. cached results are
+            # written into takes[take_index] so subsequent revisits replay
+            # from disk instead of re-streaming.
             if pending is not None:
-                _t, _seed, _instruct, _result, _live_proc, _cancel = pending
-                keep = ans in ("y", "yes", "r", "replay")
-                if not keep:
+                _t, _idx, _result, _live_proc, _cancel = pending
+                wait = ans in ("y", "yes", "r", "replay")
+                drop = ans in ("s", "skip", "q", "quit")
+                if drop or not wait:
                     _cancel.set()
-                if _t.is_alive():
-                    if keep:
-                        print("  (waiting for synthesis to finish...)")
+                if wait and _t.is_alive():
+                    print("  (waiting for synthesis to finish...)")
                     _t.join()
+                done = not _t.is_alive()
+                cache = (
+                    not drop and done and "error" not in _result and "audio" in _result
+                )
                 pending = None
-                if keep and "error" not in _result and "audio" in _result:
+                if cache:
+                    seed_c = takes[_idx][0]
                     audio = _result["audio"]
                     sr = _result["sr"]
-                    take_path = takes_dir / f"{char.name}__{_seed}{WAV_EXT}"
+                    take_path = takes_dir / f"{char.name}__{seed_c}{WAV_EXT}"
                     sf.write(str(take_path), audio, sr)
-                    takes.append((_seed, _instruct, audio, sr, take_path))
-                    cursor = len(takes) - 1
+                    takes[_idx][2] = audio
+                    takes[_idx][3] = sr
+                    takes[_idx][4] = take_path
                 else:
                     if _live_proc is not None:
                         _stop_playback(_live_proc)
-                    if keep and "error" in _result:
+                    if wait and done and "error" in _result:
                         print(f"  failed: {_result['error']}")
             stop()
-            # if synth was cancelled/errored and no prior takes exist, loop back
-            # and regenerate (unless user explicitly skipped or quit).
-            if not takes:
-                if ans in ("q", "quit"):
-                    quit_requested = True
-                    break
-                if ans in ("s", "skip"):
-                    break
-                if ans in ("d", "describe"):
-                    new_desc = _edit_description(instruct)
-                    if new_desc != instruct:
-                        instruct = new_desc
-                        print(f"  description: {instruct}")
-                config.seed = random.randint(1, 2**31 - 1)
-                generate_next = True
-                continue
             cur_seed, cur_instruct, cur_audio, cur_sr, cur_path = takes[cursor]
             if ans in ("y", "yes"):
+                if cur_audio is None:
+                    print("  (synth incomplete; re-running to accept...)")
+                    _start_stream(cur_seed, cur_instruct, cursor)
+                    assert pending is not None
+                    _t, _idx, _result, _live_proc, _cancel = pending
+                    _t.join()
+                    pending = None
+                    stop()
+                    if "audio" not in _result:
+                        err = _result.get("error", "unknown")
+                        print(f"  failed: {err}")
+                        continue
+                    cur_audio = _result["audio"]
+                    cur_sr = _result["sr"]
+                    cur_path = takes_dir / f"{char.name}__{cur_seed}{WAV_EXT}"
+                    sf.write(str(cur_path), cur_audio, cur_sr)
+                    takes[cursor][2] = cur_audio
+                    takes[cursor][3] = cur_sr
+                    takes[cursor][4] = cur_path
                 accept_hash = compute_hash(
                     {"name": char.name, "description": cur_instruct, "text": text}
                 )
@@ -556,14 +566,20 @@ def _run_directed_design(
                 print(f"  accepted (seed={cur_seed})")
                 break
             if ans in ("r", "replay"):
-                play(cur_path)
+                if cur_audio is not None and cur_path is not None:
+                    play(cur_path)
+                else:
+                    next_action = "restream"
                 if pregen is not None:
                     pregen.ensure_running()
                 continue
             if ans in ("p", "prev"):
                 if cursor > 0:
                     cursor -= 1
-                    play(takes[cursor][4])
+                    if takes[cursor][2] is not None:
+                        play(takes[cursor][4])
+                    else:
+                        next_action = "restream"
                 else:
                     print("  (no earlier take)")
                 if pregen is not None:
@@ -574,11 +590,10 @@ def _run_directed_design(
                 if new_desc != instruct:
                     instruct = new_desc
                     print(f"  description: {instruct}")
-                    # flush stale buffer and start refilling for the new instruct
                     if pregen is not None:
                         pregen.set_target(text, instruct)
                 config.seed = random.randint(1, 2**31 - 1)
-                generate_next = True
+                next_action = "new"
                 continue
             if ans in ("s", "skip"):
                 break
@@ -588,12 +603,15 @@ def _run_directed_design(
             # [n]ext or empty: forward through history, or generate new at end
             if cursor < len(takes) - 1:
                 cursor += 1
-                play(takes[cursor][4])
+                if takes[cursor][2] is not None:
+                    play(takes[cursor][4])
+                else:
+                    next_action = "restream"
                 if pregen is not None:
                     pregen.ensure_running()
             else:
                 config.seed = random.randint(1, 2**31 - 1)
-                generate_next = True
+                next_action = "new"
 
         stop()
         # let any background pregen finish before moving to next character
@@ -604,6 +622,9 @@ def _run_directed_design(
 
     resume.save()
     print(f"audition: {accepted} accepted, {skipped} skipped")
+    if quit_requested:
+        # halt the pipeline rather than silently advancing to script.
+        raise KeyboardInterrupt
 
 
 def _accept_existing(

@@ -10,7 +10,6 @@ from typing import Any, Callable, List, Optional, TypeVar, cast
 
 from .config import (
     DEFAULT_LLM_MODEL,
-    DEFAULT_SEED,
     DEFAULT_THINKING_BUDGET,
     EMOTION_KEYS,
     LLM_MAX_RETRIES,
@@ -18,6 +17,7 @@ from .config import (
     LLM_TIMEOUT,
     RETAINED_SPEAKERS,
     VALIDATION_MAX_RETRIES,
+    active_seed,
 )
 
 T = TypeVar("T")
@@ -51,6 +51,15 @@ class Character:
     description: str  # visual/vocal description for VoiceDesign
     audition_line: str  # short text to generate the reference voice
     aliases: list[str] | None = None  # alternate names for the same character
+
+
+@dataclass
+class CastMerge:
+    """llm-directed merge of previously-distinct cast entries into one."""
+
+    into: str  # canonical name of the surviving character
+    from_: list[str]  # names of characters to fold in (and remove)
+    reason: str = ""  # llm-supplied rationale (for audit log)
 
 
 @dataclass
@@ -206,10 +215,15 @@ def _call_llm(
     api_base: Optional[str] = None,
     api_key: Optional[str] = None,
     thinking_budget: int = DEFAULT_THINKING_BUDGET,
-    seed: int = DEFAULT_SEED,
+    seed: int | None = None,
 ) -> str:
     """send messages to LLM and return raw content string. retries on API errors."""
     from .utils import log
+
+    # resolved here rather than as a default: the workdir seed is not known
+    # until the command line is parsed, well after this module is imported.
+    if seed is None:
+        seed = active_seed()
 
     url = (
         f"{api_base}/chat/completions"
@@ -364,7 +378,7 @@ def _query_llm_json(
     api_key: Optional[str] = None,
     wrapper_keys: List[str] | None = None,
     thinking_budget: int = DEFAULT_THINKING_BUDGET,
-    seed: int = DEFAULT_SEED,
+    seed: int | None = None,
 ) -> dict | list:
     """query LLM and return parsed JSON. for simple non-validated queries."""
     messages = [
@@ -395,8 +409,13 @@ def generate_cast(
     model: str = DEFAULT_LLM_MODEL,
     existing_cast_summary: Optional[str] = None,
     thinking_budget: int = DEFAULT_THINKING_BUDGET,
-) -> List[Character]:
-    """analyze text to identify characters and generate voice descriptions."""
+) -> tuple[List[Character], List[CastMerge]]:
+    """analyze text to identify characters and generate voice descriptions.
+
+    returns `(characters, merges)`. `merges` directs the caller to fold
+    previously-distinct cast entries together when the llm determines two
+    names in `existing_cast_summary` actually refer to the same character.
+    """
     context_str = (
         f"\nExisting characters (omit unless updating):\n{existing_cast_summary}\n"
         if existing_cast_summary
@@ -450,6 +469,21 @@ If you discover substantive new information about an existing character \
 (description updates OR additional aliases used in the new chapters that aren't \
 yet listed), you MUST re-emit their full character definition with the expanded \
 information.
+
+If you determine that two or more entries in the existing characters list \
+actually refer to the SAME character (e.g. a full name and a sobriquet that \
+were misclassified as separate), emit a top-level "merges" list alongside \
+"characters". Each merge is an object with "into" (the surviving canonical \
+name, chosen from the existing list), "from" (a list of other existing names \
+to fold in — their aliases will be preserved on the survivor and they will \
+be removed from the cast), and a short "reason". Only merge names that \
+already appear in the existing characters list. Do not merge distinct \
+characters who merely share a title or role. Omit "merges" entirely if no \
+merges are needed.
+
+Example with merges: {{"characters": [], "merges": [{{"into": "Mirabel \
+Thatcher-Quinn", "from": ["The Medic"], "reason": "narration in chapter 4 \
+reveals 'the medic' is Mirabel"}}]}}
 """
 
     messages = [
@@ -458,15 +492,16 @@ information.
     ]
     return _query_llm_validated(
         messages,
-        _parse_cast_list,
-        validate_fn=_validate_cast_list,
+        _parse_cast_response,
+        validate_fn=_validate_cast_response,
         model=model,
         api_base=api_base,
         api_key=api_key,
         thinking_budget=thinking_budget,
         label="cast",
         expected_shape='{"characters": [{"name": ..., "description": ..., '
-        '"audition_line": ..., "aliases": [...]}, ...]}',
+        '"audition_line": ..., "aliases": [...]}, ...], '
+        '"merges": [{"into": ..., "from": [...], "reason": ...}]}',
     )
 
 
@@ -518,6 +553,73 @@ def _parse_cast_list(data: list | dict) -> List[Character]:
             )
         )
     return results
+
+
+def _parse_merges(data: list | dict) -> List[CastMerge]:
+    """parse optional merges list from cast LLM response."""
+    if isinstance(data, dict):
+        raw = data.get("merges") or data.get("m") or []
+    else:
+        raw = []
+    if not isinstance(raw, list):
+        raise ValueError(f"expected list of merges, got {type(raw).__name__}")
+    merges: List[CastMerge] = []
+    for i, m in enumerate(raw):
+        if not isinstance(m, dict):
+            raise ValueError(f"merge {i}: expected object, got {type(m).__name__}")
+        into = str(m.get("into", m.get("i", ""))).strip()
+        if not into:
+            raise KeyError(f"merge {i}: missing 'into'")
+        from_raw = m.get("from", m.get("f", []))
+        if isinstance(from_raw, str):
+            from_raw = [from_raw]
+        if not isinstance(from_raw, list):
+            raise ValueError(f"merge {i}: 'from' must be a list")
+        from_ = [str(x).strip() for x in from_raw if str(x).strip()]
+        if not from_:
+            raise ValueError(f"merge {i}: 'from' must be non-empty")
+        merges.append(
+            CastMerge(into=into, from_=from_, reason=str(m.get("reason", "")))
+        )
+    return merges
+
+
+def _parse_cast_response(
+    data: list | dict,
+) -> tuple[List[Character], List[CastMerge]]:
+    """parse the full cast LLM response into characters and optional merges."""
+    merges = _parse_merges(data) if isinstance(data, dict) else []
+    characters = _parse_cast_list(data)
+    return characters, merges
+
+
+def _validate_cast_response(
+    parsed: tuple[List[Character], List[CastMerge]],
+) -> list[str]:
+    characters, merges = parsed
+    errors = _validate_cast_list(characters)
+    seen_from: dict[str, str] = {}
+    for i, m in enumerate(merges):
+        into_key = _normalize_name(m.into)
+        if not into_key:
+            errors.append(f"merge {i}: 'into' is empty after normalization")
+            continue
+        for src in m.from_:
+            src_key = _normalize_name(src)
+            if not src_key:
+                errors.append(f"merge {i}: empty entry in 'from'")
+                continue
+            if src_key == into_key:
+                errors.append(
+                    f"merge {i}: 'from' entry {src!r} equals 'into' {m.into!r}"
+                )
+            if src_key in seen_from:
+                errors.append(
+                    f"merge {i}: {src!r} already folded into " f"{seen_from[src_key]!r}"
+                )
+            else:
+                seen_from[src_key] = m.into
+    return errors
 
 
 def _validate_cast_list(characters: List[Character]) -> list[str]:
@@ -813,16 +915,22 @@ def _valid_speaker_names(characters_list: List[Character]) -> list[str]:
 
 REVIEW_CHANGES_SHAPE = (
     '{"changes": [{"index": ..., "speaker": ..., "instruction": ...}, ...], '
-    '"flags": [{"index": ..., "reason": ...}, ...]}'
+    '"flags": [{"index": ..., "speaker": ..., "instruction": ..., "reason": ...}, ...]}'
 )
 
 
 @dataclass
 class ReviewFlag:
-    """LLM-flagged segment needing human attention (e.g. needs splitting)."""
+    """LLM-flagged segment needing human attention (e.g. needs splitting).
+
+    suggestion: optional best-guess correction (speaker/instruction only) the
+    human can [a]pply via the audit walkthrough. text is never suggested —
+    text correctness is verified separately by `revise`.
+    """
 
     index: int
     reason: str
+    suggestion: Optional[dict] = None
 
 
 def _extract_flags_list(data: list | dict) -> list:
@@ -854,9 +962,19 @@ def _extract_changes_list(data: list | dict) -> list:
 
 def _apply_review_changes(
     original: List[ScriptSegment], changes: list[dict]
-) -> List[ScriptSegment]:
-    """merge a sparse changes list onto a copy of the original batch by index."""
+) -> tuple[List[ScriptSegment], list[tuple[int, str]], list[tuple[int, str]]]:
+    """merge a sparse changes list onto a copy of the original batch by index.
+
+    returns (merged, text_mutations, invalid_instructions). text_mutations records
+    (idx, attempted_text) for any change that tried to alter segment text — used
+    to detect when the LLM hallucinates during review. text is always preserved
+    on disk regardless. invalid_instructions records (idx, attempted_instruction)
+    for changes whose instruction was not in EMOTION_KEYS; those are ignored and
+    the original instruction is kept.
+    """
     merged = list(original)
+    text_mutations: list[tuple[int, str]] = []
+    invalid_instructions: list[tuple[int, str]] = []
     for c in changes:
         if not isinstance(c, dict):
             continue
@@ -869,12 +987,26 @@ def _apply_review_changes(
         instruction = c.get("instruction", c.get("in", cur.instruction))
         if instruction is None:
             instruction = cur.instruction
+        # skip unrecognized instructions rather than letting validation silently
+        # collapse them to "neutral" — the LLM often re-emits an instruction when
+        # only fixing the speaker, and any synonym or variant would wipe a
+        # perfectly good original.
+        if instruction and instruction not in EMOTION_KEYS:
+            print(
+                f"  review: ignoring invalid instruction "
+                f"{instruction!r} at segment {idx}, keeping {cur.instruction!r}"
+            )
+            invalid_instructions.append((idx, str(instruction)))
+            instruction = cur.instruction
+        emitted_text = c.get("text", c.get("t"))
+        if isinstance(emitted_text, str) and emitted_text.strip() != cur.text.strip():
+            text_mutations.append((idx, emitted_text))
         # text is NOT reviewable; always preserve the original to prevent the
         # LLM from truncating, rewording, or otherwise degrading source-faithful text.
         merged[idx] = ScriptSegment(
             speaker=speaker, text=cur.text, instruction=instruction or ""
         )
-    return merged
+    return merged, text_mutations, invalid_instructions
 
 
 def review_script_batch(
@@ -885,12 +1017,22 @@ def review_script_batch(
     api_key: Optional[str] = None,
     model: str = DEFAULT_LLM_MODEL,
     thinking_budget: int = DEFAULT_THINKING_BUDGET,
-) -> tuple[List[ScriptSegment], list[ReviewFlag]]:
+) -> tuple[
+    List[ScriptSegment],
+    list[ReviewFlag],
+    list[tuple[int, str]],
+    list[tuple[int, str]],
+]:
     """review a batch of segments against the covering source text.
 
-    returns (corrected_segments, flags). text is never modified; the LLM emits
-    speaker/instruction corrections by index and may flag segments needing
-    human attention (e.g. a segment that should be split)."""
+    returns (corrected_segments, flags, text_mutations, invalid_instructions).
+    text is never modified; the LLM emits speaker/instruction corrections by
+    index and may flag segments needing human attention (e.g. a segment that
+    should be split). text_mutations captures any LLM attempt to alter segment
+    text (defensive — text is preserved on disk regardless, but the attempt is
+    logged so reviewers can see it). invalid_instructions captures any change
+    whose instruction was not in EMOTION_KEYS; such corrections are ignored
+    and the original instruction is kept."""
     cast_str = _format_cast_list(characters_list)
     current_json = json.dumps(
         [
@@ -932,13 +1074,31 @@ character speaking dialogue).
 
 Human Review Flags:
 
-- If a segment needs a structural edit you are NOT allowed to make (e.g. it \
-mixes narration and dialogue and should be split, it contains content that \
-should be separated, or you are uncertain about speaker attribution), add an \
-entry to a top-level "flags" list: {{"index": <int>, "reason": "<short note>"}}.
-- Flags do not substitute for changes; a segment may be flagged even if you \
-also correct its speaker/instruction.
-- Omit "flags" entirely if nothing needs human attention.
+- Flag ANY uncertainty. If you are not confident about the speaker, the \
+instruction, or whether a segment is structured correctly, raise a flag rather \
+than guessing. It is FAR better to surface a doubt for human review than to \
+silently apply a wrong correction. Examples worth flagging: speaker is \
+ambiguous from context (could plausibly be more than one character), \
+attribution is missing in source so the speaker has to be inferred, the cast \
+list does not contain an obvious match for the speaker, dialogue and narration \
+appear merged into one segment and should be split, or two distinct source \
+elements (e.g. a chapter heading and the following paragraph) are merged into \
+one segment.
+- A flag has the SAME shape as a change, plus a "reason" field: \
+{{"index": <int>, "speaker": "...", "instruction": "...", "reason": "<short \
+note>"}} on a top-level "flags" list. "speaker" and "instruction" are your \
+best-guess suggestion (optional — omit either if you have no suggestion); the \
+human reviews and applies them. Omit "flags" entirely if nothing needs human \
+attention.
+- The ONLY difference between "changes" and "flags" is confidence. Confident \
+corrections go in "changes" and are auto-applied; uncertain ones go in \
+"flags" with the same fields plus a "reason", and wait for human review. Do \
+not put the same segment in both lists.
+- DO NOT flag for text issues. Trust the segment text. Text-vs-source coverage \
+(missing fragments, hallucinations, garbled or extraneous content) is verified \
+and repaired by a separate `revise` phase — duplicating that here just adds \
+noise. Even if a segment's text looks wrong, garbled, or absent from the \
+source, do NOT flag it.
 """
 
     user_content = f"""\
@@ -952,17 +1112,58 @@ also correct its speaker/instruction.
 """
 
     captured_flags: list[ReviewFlag] = []
+    captured_mutations: list[tuple[int, str]] = []
+    captured_invalid_instructions: list[tuple[int, str]] = []
 
     def parse_changes(data: list | dict) -> List[ScriptSegment]:
         captured_flags.clear()
+        captured_mutations.clear()
+        captured_invalid_instructions.clear()
         for f in _extract_flags_list(data):
             if not isinstance(f, dict):
                 continue
             idx = f.get("index", f.get("i"))
             reason = f.get("reason") or f.get("r") or ""
-            if isinstance(idx, int) and 0 <= idx < len(segments):
-                captured_flags.append(ReviewFlag(index=idx, reason=str(reason)))
-        return _apply_review_changes(segments, _extract_changes_list(data))
+            if not isinstance(idx, int) or not (0 <= idx < len(segments)):
+                continue
+            cur = segments[idx]
+            # flags share the change shape (speaker/instruction at top level);
+            # also accept legacy nested "suggestion" form.
+            src = f["suggestion"] if isinstance(f.get("suggestion"), dict) else f
+            emitted_text = src.get("text", src.get("t"))
+            if (
+                isinstance(emitted_text, str)
+                and emitted_text.strip() != cur.text.strip()
+            ):
+                captured_mutations.append((idx, emitted_text))
+            speaker = src.get("speaker", src.get("s"))
+            instruction = src.get("instruction", src.get("in"))
+            # drop invalid instruction suggestions and echoes of the current
+            # value — otherwise the reviewer sees a "suggestion" that's
+            # identical to the on-disk segment and has nothing to apply.
+            if isinstance(instruction, str) and instruction not in EMOTION_KEYS:
+                instruction = None
+            if isinstance(speaker, str) and speaker == cur.speaker:
+                speaker = None
+            if isinstance(instruction, str) and instruction == cur.instruction:
+                instruction = None
+            suggestion: Optional[dict] = None
+            if speaker is not None or instruction is not None:
+                suggestion = {
+                    "speaker": speaker or cur.speaker,
+                    "instruction": (
+                        instruction if instruction is not None else cur.instruction
+                    ),
+                }
+            captured_flags.append(
+                ReviewFlag(index=idx, reason=str(reason), suggestion=suggestion)
+            )
+        merged, mutations, invalid_instructions = _apply_review_changes(
+            segments, _extract_changes_list(data)
+        )
+        captured_mutations.extend(mutations)
+        captured_invalid_instructions.extend(invalid_instructions)
+        return merged
 
     messages: List[dict[str, str]] = [
         {"role": "system", "content": system_prompt},
@@ -979,7 +1180,153 @@ also correct its speaker/instruction.
         label="review",
         expected_shape=REVIEW_CHANGES_SHAPE,
     )
-    return corrected, list(captured_flags)
+    return (
+        corrected,
+        list(captured_flags),
+        list(captured_mutations),
+        list(captured_invalid_instructions),
+    )
+
+
+_NORM_TEXT_RE = re.compile(r"\s+")
+
+
+def _normalize_text(s: str) -> str:
+    """collapse all whitespace for text-faithfulness comparison."""
+    return _NORM_TEXT_RE.sub("", s)
+
+
+def split_mixed_segment(
+    segment: ScriptSegment,
+    context_before: str,
+    context_after: str,
+    characters_list: List[Character],
+    api_base: Optional[str] = None,
+    api_key: Optional[str] = None,
+    model: str = DEFAULT_LLM_MODEL,
+    thinking_budget: int = DEFAULT_THINKING_BUDGET,
+) -> tuple[List[ScriptSegment], Optional[str]]:
+    """split a segment that mixes narration and dialogue into multiple segments.
+
+    text-preserving: the concatenation of returned segments' text must equal
+    the input segment's text exactly (whitespace differences are tolerated).
+
+    returns (segments, flag_reason). if the LLM disputes the split request
+    (e.g. believes the segment is not actually mixed), it can respond with a
+    flag instead of segments — flag_reason carries the disagreement text and
+    segments is empty. caller is expected to surface the flag for human review.
+    """
+    cast_str = _format_cast_list(characters_list)
+
+    system_prompt = f"""\
+Split the INPUT SEGMENT below at NARRATION/DIALOGUE BOUNDARIES ONLY. The \
+concatenation of your output segments' "text" MUST exactly equal the INPUT \
+SEGMENT's "text", word-for-word and in the same order. Do NOT add, remove, \
+reword, or reorder any text — only SPLIT it.
+
+[Character List]
+{cast_str}
+
+{SCRIPT_GENERATION_COMMON}
+
+Split Rules (these OVERRIDE any general guidance about segment length or \
+sentence count):
+
+- Split ONLY where the speaker changes — i.e. between narration prose and a \
+character's quoted dialogue, or between two different characters' quoted \
+lines. These are the only legitimate split points.
+- DO NOT split for length, readability, sentence count, or style. A long \
+narration block stays as ONE segment. A long single-speaker quote stays as \
+ONE segment. Length is NOT a reason to split.
+- DO NOT split mid-sentence, mid-clause, or anywhere inside a single speaker's \
+continuous text. The 2–3-sentence-per-segment guidance above does NOT apply \
+here — your job is structural repair, not stylistic re-segmentation.
+- CRITICAL: Output text MUST be a faithful split of the INPUT SEGMENT text \
+ONLY. Never include words from the surrounding context segments.
+- Use the surrounding script segments to determine speaker attribution and \
+instruction for each part, but output text comes ONLY from the INPUT SEGMENT.
+
+If you genuinely believe the INPUT SEGMENT does NOT contain a \
+narration/dialogue boundary and should NOT be split (e.g. the quoted text is \
+a single speaker's full line with no narration, the "quotes" are scare \
+quotes / titles / not actual dialogue, the entire segment is one continuous \
+voice, or you cannot identify a faithful split), respond with this shape \
+instead of "segments":
+
+```
+{{"flag": {{"reason": "<short explanation of why this should not be split>"}}}}
+```
+
+This pushes the segment to a human reviewer rather than forcing a split. \
+Prefer flagging over guessing or splitting for length.
+"""
+
+    input_json = json.dumps(
+        {
+            "speaker": segment.speaker,
+            "text": segment.text,
+            "instruction": segment.instruction,
+        },
+        ensure_ascii=False,
+    )
+
+    user_content = f"""
+--- SURROUNDING SCRIPT BEFORE (JSON, for context only) ---
+{context_before}
+
+--- INPUT SEGMENT (split this into multiple segments; text concatenation MUST match) ---
+{input_json}
+--- END INPUT SEGMENT ---
+
+--- SURROUNDING SCRIPT AFTER (JSON, for context only) ---
+{context_after}
+"""
+
+    expected = _normalize_text(segment.text)
+
+    def parse_split(data: list | dict) -> tuple[List[ScriptSegment], Optional[str]]:
+        if isinstance(data, dict) and isinstance(data.get("flag"), dict):
+            reason = data["flag"].get("reason") or "no reason given"
+            return [], str(reason)
+        return _parse_script_segments(data), None
+
+    def validate_split(
+        result: tuple[List[ScriptSegment], Optional[str]],
+    ) -> list[str]:
+        segs, flag = result
+        if flag is not None:
+            return []  # disagreement flag is always accepted
+        errors = _validate_script_segments(segs, characters_list)
+        if len(segs) < 2:
+            errors.append(
+                "must produce at least 2 segments (the input was a single "
+                "segment that needs SPLITTING). if you believe no split is "
+                'needed, respond with {"flag": {"reason": "..."}} instead.'
+            )
+        joined = _normalize_text("".join(s.text for s in segs))
+        if joined != expected:
+            errors.append(
+                f"text concatenation does not match input segment "
+                f"(got {len(joined)} non-ws chars, expected {len(expected)}). "
+                f"output text MUST be a faithful split of input text only."
+            )
+        return errors
+
+    messages: List[dict[str, str]] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
+    ]
+    return _query_llm_validated(
+        messages,
+        parse_split,
+        validate_fn=validate_split,
+        model=model,
+        api_base=api_base,
+        api_key=api_key,
+        thinking_budget=thinking_budget,
+        label="split",
+        expected_shape=SCRIPT_EXPECTED_SHAPE,
+    )
 
 
 def fix_missing_segment(

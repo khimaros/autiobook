@@ -1,8 +1,29 @@
 # ROADMAP
 
 ```
+[x] fix review clobbering the shared audit log: run_review was the only writer that did not load-then-append, so each per-chapter (in fact per-batch) save overwrote audit.json with just its own findings, destroying earlier chapters' results plus cast_merge and revise flag entries. review-authored entries now carry phase="review" and are replaced only for the chapters that invocation owns
+
+[x] fix review rejecting valid llm output when a batch's first segment carries punctuation drift (straight vs typographic apostrophe): _locate_span used an exact substring find where _validate_segments aligns on word tokens, so the segment failed to locate and the span start skipped forward to the next segment that did, cutting the segment's own source out of the window it was then validated against. widened location to fall back on the same token alignment, and pinned the span start at the cursor when text cannot be placed
+
+[x] fix extract duplicating whole documents when a non-content wrapper (section/article) sits between a content tag and its nested content tags (div > section > p); the container branch took get_text() on non-content children, leaking the entire subtree which was then emitted again tag by tag. doubled the extracted text for 45/48 documents in the mercy of gods and 64/79 in children of time, which in turn made review reject valid llm output as hallucinated
+
+[x] fix epub3 read-along highlight trailing one paragraph behind the audio: anchors were computed as positions in the emitted-paragraph list but used to index the content-tag walk, and the two diverge as soon as any content tag emits no text (a wrapper div). every fragment id landed on the preceding element. also drop the subfolder and _readalong suffix: output is now export/<slug>.epub
+
+[x] seed: persist the resolved seed in the workdir (seed.json) so resuming a book idempotently reuses it; random on first run, --seed/AUTIOBOOK_SEED override and are recorded; expose --seed on dramatize and the other workdir commands
+
+[ ] export --epub3: carry the speaker onto injected chunk spans (data-speaker plus a declared aob: prefix) so the read-along records who says what; emotion deliberately excluded as a performance direction rather than a property of the text
+
+[x] export --epub3: wrap each chunk's exact text in an injected span so its <par> uses the recorded clip times instead of a proportional estimate (90.6% of chunks on neuromancer; the rest fall back to paragraph anchoring when the range crosses inline markup). skip a chapter whose extract/ no longer matches the extractor, which silently misplaced every span in it
+
+[x] export --epub3: split a chunk that crosses a paragraph break into one <par> per paragraph, apportioned by character count, instead of anchoring it only where it starts and leaving the later paragraph never highlighted while its audio played
 [ ] audition command: add --audition-line flag to override per-character audition lines
 
+[x] export --epub3: emit an epub3 with media overlays (SMIL) so readers highlight text in sync with the narration; granularity follows the audio chunk boundaries already recorded in the timing manifest, coarsened to the narrowest containing element when no per-chunk anchor exists; upgrades epub2 sources to 3.0
+[x] config: collapse the three independent 500ms inter-chunk pause definitions (config.PARAGRAPH_PAUSE_MS, pooling.PAUSE_MS_BETWEEN_CHUNKS, audio.concatenate_audio default) into one shared constant; they must agree or every timing in the manifest silently skews
+
+[x] cast generation: let the LLM fold two previously-distinct cast entries into one via a top-level "merges" directive; apply and log to review/audit.json as kind="cast_merge"
+
+[x] review: ignore invalid instruction values from the LLM (keep original rather than silently resetting to "neutral"); log to review/audit.json as kind="invalid_instruction"
 [x] export: skip per-chapter export work when state.json shows everything is up to date (no print, no mp3 lyric rewrite); back-fill loop only touches chapters missing the .srt sidecar
 [x] review: record per-batch validation rejections to review/audit.json as kind="validation" so the reviewer can see when LLM output was rolled back due to missing/hallucinated text
 [x] --accept support in every dramatize phase (cast, audition, emote, script, revise, review, perform, retake, export): re-stamp existing artifacts as fresh under current hashes or skip the phase entirely

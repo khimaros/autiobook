@@ -266,6 +266,14 @@ def export_m4b(
     return len(chapters), 0
 
 
+def _book_slug(title: str) -> str:
+    """slugify book title for folder name: lowercase alnum with dashes."""
+    import re
+
+    s = "".join(c if c.isalnum() or c in " -_" else "" for c in title).strip().lower()
+    return re.sub(r"[\s_]+", "-", s) or "untitled"
+
+
 def export_audiobook(
     workdir: Path,
     output_dir: Path,
@@ -277,13 +285,18 @@ def export_audiobook(
 ) -> tuple[int, int]:
     """export all chapters as mp3 files with cover art.
 
+    `output_dir` is treated as the parent — the actual artifacts (mp3, cover,
+    srt, optional m4b) are written under output_dir/<book-slug>/ so multiple
+    books exported from sibling workdirs don't collide.
+
     accept=True skips re-encoding; existing mp3s are re-stamped as fresh under
     the current wav/metadata hash.
     """
     from .resume import ResumeManager, compute_hash, get_command_dir, list_chapters
 
-    output_dir.mkdir(parents=True, exist_ok=True)
     meta = load_metadata(workdir)
+    output_dir = output_dir / _book_slug(meta["title"])
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     # find first available source dir
     source_dir = next(

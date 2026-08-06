@@ -34,6 +34,9 @@ SAMPLE_RATE = 24000
 
 # llm settings
 DEFAULT_LLM_MODEL = os.getenv("AUTIOBOOK_LLM_MODEL", "openai/gpt-4o")
+# review uses a stricter pass over already-generated scripts; defaults to the
+# main llm model but can be overridden separately for cost/quality tuning.
+DEFAULT_REVIEW_LLM_MODEL = os.getenv("AUTIOBOOK_REVIEW_LLM_MODEL", DEFAULT_LLM_MODEL)
 DEFAULT_THINKING_BUDGET = int(os.getenv("AUTIOBOOK_LLM_THINKING_BUDGET", "16384"))
 LLM_TIMEOUT = int(os.getenv("AUTIOBOOK_LLM_TIMEOUT", "600"))
 LLM_MAX_RETRIES = 3
@@ -55,8 +58,31 @@ CAST_CHUNK_OVERLAP_WORDS = int(os.getenv("AUTIOBOOK_CAST_CHUNK_OVERLAP_WORDS", "
 
 # seed for reproducibility (tts + llm). unset → generate one concrete random
 # seed per process so the exact value can be logged and recorded with output.
+# a workdir's resolved seed is persisted to SEED_FILE and reused on later runs,
+# so resuming a book stays reproducible without pinning AUTIOBOOK_SEED by hand.
 _seed_env = os.getenv("AUTIOBOOK_SEED")
 DEFAULT_SEED = int(_seed_env) if _seed_env else random.randint(1, 2**31 - 1)
+SEED_FILE = "seed.json"
+
+_active_seed: int | None = None
+
+
+def active_seed() -> int:
+    """seed in effect for this process.
+
+    resolved from the workdir once the command line is parsed; falls back to
+    the import-time default for commands that have no workdir. consumers read
+    it lazily (default_factory / None sentinel) because module-level defaults
+    would bind before the workdir is known.
+    """
+    return DEFAULT_SEED if _active_seed is None else _active_seed
+
+
+def set_active_seed(seed: int) -> None:
+    """pin the seed for the remainder of this process."""
+    global _active_seed
+    _active_seed = seed
+
 
 # tts http settings
 TTS_HTTP_TIMEOUT = int(os.getenv("AUTIOBOOK_TTS_TIMEOUT", "300"))
@@ -65,7 +91,9 @@ TTS_HTTP_TIMEOUT = int(os.getenv("AUTIOBOOK_TTS_TIMEOUT", "300"))
 # synthesis finishes. 16 frames ≈ 1.28s audio; recommended range 8-32.
 TTS_STREAM_BATCH_SIZE = int(os.getenv("AUTIOBOOK_TTS_STREAM_BATCH_SIZE", "0"))
 
-# audio processing
+# audio processing. PARAGRAPH_PAUSE_MS is the single source of truth for the
+# silence inserted between chunks: chapter assembly and the timing manifest must
+# use the same value or every cue/overlay offset drifts by 500ms per chunk.
 PARAGRAPH_PAUSE_MS = 500
 CHAPTER_PAUSE_MS = 1000
 
@@ -75,6 +103,21 @@ UNSAFE_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 # logging
 LOG_FILE = "autiobook.log"
+
+# epub3 media overlay export
+EPUB_EXT = ".epub"
+SMIL_EXT = ".smil"
+OVERLAY_DIR = "autiobook"  # in-epub folder for generated smil + audio
+OVERLAY_ID_PREFIX = "aob"  # generated fragment ids, e.g. id="aob12"
+# reserved epub3 vocabulary; readers apply this class to the active fragment.
+OVERLAY_ACTIVE_CLASS = "-epub-media-overlay-active"
+OVERLAY_HIGHLIGHT_CSS = (
+    f".{OVERLAY_ACTIVE_CLASS} {{ background: rgba(255, 214, 0, 0.35); }}"
+)
+NAV_FILE = "nav.xhtml"
+# embedded audio dominates read-along epub size, so it defaults well below the
+# standalone mp3 bitrate: a novel at 192k would run past a gigabyte.
+EPUB3_BITRATE = "64k"
 
 # file extensions
 TXT_EXT = ".txt"

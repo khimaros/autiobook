@@ -30,6 +30,7 @@ class Chapter:
     index: int
     title: str
     text: str
+    href: str = ""  # source document within the epub, for media-overlay anchoring
 
     @property
     def word_count(self) -> int:
@@ -61,41 +62,86 @@ class Book:
             "author": self.author,
             "language": self.language,
             "chapters": [
-                {"index": c.index, "title": c.title, "filename_base": c.filename_base}
+                {
+                    "index": c.index,
+                    "title": c.title,
+                    "filename_base": c.filename_base,
+                    "href": c.href,
+                }
                 for c in self.chapters
             ],
         }
 
 
-def extract_text_from_html(html_content: bytes) -> str:
-    """convert html content to clean plain text."""
-    soup = BeautifulSoup(html_content, "lxml")
+def content_soup(html_content: bytes) -> BeautifulSoup:
+    """parse html and drop non-content tags.
 
+    shared by extraction and media-overlay anchoring so both walk an identical
+    tag ordering; the anchor index would otherwise not survive the round trip.
+    """
+    soup = BeautifulSoup(html_content, "lxml")
     for tag in soup.find_all(SKIP_TAGS):
         tag.decompose()
+    return soup
 
-    paragraphs = []
-    for tag in soup.find_all(CONTENT_TAGS):
-        if tag.find(CONTENT_TAGS):
-            # container with nested content tags
-            # extract text from non-content children to avoid skipping mixed content
-            parts = []
-            for child in tag.children:
-                # child.name is None for NavigableString (text nodes)
-                name = getattr(child, "name", None)
-                if name is None or name not in CONTENT_TAGS:
-                    parts.append(child.get_text())
 
-            text = " ".join("".join(parts).split())
-            if text:
-                paragraphs.append(text)
-            continue
+def loose_text(node: object) -> str:
+    """text of a node excluding any nested content-tag subtrees.
 
-        text = " ".join(tag.get_text().split())
+    those subtrees are emitted separately by the main walk, so pulling them in
+    here would duplicate them. recursing (rather than taking get_text() on a
+    non-content child) keeps wrappers that are not themselves content tags --
+    section, article, blockquote -- transparent instead of leaking their whole
+    subtree, which otherwise doubles the entire document.
+    """
+    parts = []
+    for child in node.children:  # type: ignore[attr-defined]
+        # child.name is None for NavigableString (text nodes)
+        name = getattr(child, "name", None)
+        if name is None:
+            parts.append(child.get_text())
+        elif name not in CONTENT_TAGS:
+            parts.append(loose_text(child))
+    return "".join(parts)
+
+
+def iter_content_paragraphs(soup: BeautifulSoup):
+    """yield (tag_index, tag, text) for each paragraph the extractor emits.
+
+    tag_index is the position within soup.find_all(CONTENT_TAGS). callers that
+    need the source element -- speaker hints, media overlays -- walk this
+    directly rather than re-deriving the ordering.
+    """
+    for idx, tag in enumerate(soup.find_all(CONTENT_TAGS)):
+        # a container holding nested content tags contributes only its own
+        # loose text; the nested tags are emitted on their own iterations.
+        text = loose_text(tag) if tag.find(CONTENT_TAGS) else tag.get_text()
+        text = " ".join(text.split())
         if text:
-            paragraphs.append(text)
+            yield idx, tag, text
 
-    return "\n\n".join(paragraphs)
+
+def extract_paragraphs_from_html(html_content: bytes) -> list[tuple[int, str]]:
+    """extract (tag_index, text) for each content paragraph."""
+    return [
+        (idx, text)
+        for idx, _tag, text in iter_content_paragraphs(content_soup(html_content))
+    ]
+
+
+def paragraph_bounds(paragraphs: list[tuple[int, str]]) -> list[tuple[int, int]]:
+    """char ranges of each paragraph within the "\\n\\n"-joined chapter text."""
+    bounds = []
+    pos = 0
+    for _, text in paragraphs:
+        bounds.append((pos, pos + len(text)))
+        pos += len(text) + 2
+    return bounds
+
+
+def extract_text_from_html(html_content: bytes) -> str:
+    """convert html content to clean plain text."""
+    return "\n\n".join(text for _, text in extract_paragraphs_from_html(html_content))
 
 
 def extract_title_from_html(html_content: bytes) -> str | None:
@@ -162,7 +208,9 @@ def parse_epub(path: Path) -> tuple[Book, bytes | None]:
 
         idx = len(book.chapters) + 1
         title = extract_title_from_html(content) or f"Chapter {idx}"
-        book.chapters.append(Chapter(index=idx, title=title, text=text))
+        book.chapters.append(
+            Chapter(index=idx, title=title, text=text, href=item.get_name())
+        )
 
     return book, extract_cover(eb)
 
@@ -194,8 +242,12 @@ def ensure_extracted(epub_path: Path, workdir: Path, force: bool = False) -> Non
     book, cover_data = parse_epub(epub_path)
     save_extracted(book, workdir, cover_data)
 
+    # the source path is recorded so `export --epub3` can reopen the original
+    # epub to rebuild it with media overlays.
     with open(state_path, "w") as f:
-        json.dump({"epub_hash": epub_hash}, f, indent=2)
+        json.dump(
+            {"epub_hash": epub_hash, "epub_path": str(epub_path.resolve())}, f, indent=2
+        )
 
 
 def save_extracted(book: Book, workdir: Path, cover_data: bytes | None = None) -> None:
@@ -240,5 +292,20 @@ def load_metadata(workdir: Path) -> dict:
             safe_title = UNSAFE_FILENAME_CHARS.sub("_", title)
             safe_title = safe_title.strip().replace(" ", "_")[:50]
             c["filename_base"] = f"{idx:02d}_{safe_title}"
+        c.setdefault("href", "")
 
     return data
+
+
+def source_epub_path(workdir: Path) -> Path | None:
+    """path to the epub this workdir was extracted from, if still recorded."""
+    from .resume import get_command_dir
+
+    state_path = get_command_dir(workdir, "extract") / "state.json"
+    if not state_path.exists():
+        return None
+    try:
+        recorded = json.loads(state_path.read_text()).get("epub_path")
+    except (OSError, ValueError):
+        return None
+    return Path(recorded) if recorded else None

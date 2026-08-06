@@ -18,7 +18,7 @@ from .audio import (
     load_segment,
     save_segment,
 )
-from .config import SAMPLE_RATE
+from .config import PARAGRAPH_PAUSE_MS, SAMPLE_RATE
 from .resume import ResumeManager, compute_hash
 
 SEGMENT_STATE_PREFIX = "segment:"
@@ -274,9 +274,6 @@ def _synthesize_batch(
         resume.save()
 
 
-PAUSE_MS_BETWEEN_CHUNKS = 500
-
-
 def timing_manifest_path(wav_path: Path) -> Path:
     """path to the chunk-timing manifest for a chapter wav."""
     return wav_path.with_suffix(wav_path.suffix + ".timing.json")
@@ -316,14 +313,13 @@ def _iter_cues(chunks: list[dict[str, Any]]):
 
 
 def write_subtitles(wav_path: Path, chunks: list[dict[str, Any]]) -> None:
-    """write SRT and VTT files next to the chapter wav.
+    """write an SRT file next to the chapter wav.
 
-    both formats use CRLF line endings and a trailing blank line after every
-    cue (including the last) — strict parsers like GStreamer's srtparse and
-    some players' autoloader reject looser variants.
+    uses CRLF line endings and a trailing blank line after every cue
+    (including the last) — strict parsers like GStreamer's srtparse and some
+    players' autoloader reject looser variants.
     """
     srt_parts: list[str] = []
-    vtt_parts: list[str] = ["WEBVTT\r\n\r\n"]
     prev_end = -1.0
     for idx, (start, end, body) in enumerate(_iter_cues(chunks), start=1):
         # guard against non-monotonic/zero-length cues that confuse parsers.
@@ -339,11 +335,7 @@ def write_subtitles(wav_path: Path, chunks: list[dict[str, Any]]) -> None:
             f"{_format_ts(start, ',')} --> {_format_ts(end, ',')}\r\n"
             f"{body}\r\n\r\n"
         )
-        vtt_parts.append(
-            f"{_format_ts(start, '.')} --> {_format_ts(end, '.')}\r\n" f"{body}\r\n\r\n"
-        )
     srt_path(wav_path).write_text("".join(srt_parts), encoding="utf-8")
-    vtt_path(wav_path).write_text("".join(vtt_parts), encoding="utf-8")
 
 
 def write_timing_manifest(
@@ -352,7 +344,7 @@ def write_timing_manifest(
     hashes: list[str],
     chunk_meta: list[dict[str, Any]] | None,
     sample_rate: int = SAMPLE_RATE,
-    pause_ms: int = PAUSE_MS_BETWEEN_CHUNKS,
+    pause_ms: int = PARAGRAPH_PAUSE_MS,
 ) -> None:
     """write a timing manifest (JSON) for a chapter wav.
 

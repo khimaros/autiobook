@@ -3,7 +3,8 @@
 import difflib
 import json
 import re
-from dataclasses import dataclass
+import sys
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, List, Optional, cast
 
@@ -21,6 +22,7 @@ from .config import (
     CAST_FILE,
     DEFAULT_CAST,
     DEFAULT_LLM_MODEL,
+    DEFAULT_REVIEW_LLM_MODEL,
     DEFAULT_THINKING_BUDGET,
     EMOTION_SEP,
     RETAINED_SPEAKERS,
@@ -34,12 +36,14 @@ from .config import (
 )
 from .epub import load_metadata
 from .llm import (
+    CastMerge,
     Character,
     ScriptSegment,
     fix_missing_segment,
     generate_cast,
     process_script_chunk,
     review_script_batch,
+    split_mixed_segment,
     split_text_smart,
 )
 from .pooling import AudioTask, process_audio_pipeline
@@ -278,6 +282,81 @@ def _merge_character_into_cast(
     return "added"
 
 
+def _apply_cast_merge(
+    merge: CastMerge,
+    cast_map: dict[str, Character],
+    alias_map: dict[str, str],
+    verbose: bool = False,
+) -> dict | None:
+    """apply an llm-directed merge, returning an audit-ready record or None.
+
+    characters named in `merge.from_` are removed from the cast and their
+    aliases (plus their canonical names) are added to the survivor named
+    `merge.into`. missing references are skipped with a verbose warning.
+    """
+    into_key = merge.into.lower()
+    target = cast_map.get(into_key)
+    if target is None and into_key in alias_map:
+        target = cast_map.get(alias_map[into_key])
+    if target is None:
+        if verbose:
+            print(f"  skip merge: unknown 'into' {merge.into!r}")
+        return None
+
+    folded: list[str] = []
+    skipped: list[str] = []
+    existing_aliases = set(target.aliases or [])
+    canon_low = target.name.casefold()
+
+    for src in merge.from_:
+        src_key = src.lower()
+        source = cast_map.get(src_key)
+        if source is None and src_key in alias_map:
+            source_key = alias_map[src_key]
+            if source_key != target.name.lower():
+                source = cast_map.get(source_key)
+                src_key = source_key
+        if source is None or source is target:
+            skipped.append(src)
+            continue
+        new_aliases = {source.name, *(source.aliases or [])}
+        for a in new_aliases:
+            if a.casefold() != canon_low:
+                existing_aliases.add(a)
+        del cast_map[src_key]
+        for a_low, owner_low in list(alias_map.items()):
+            if owner_low == src_key:
+                alias_map[a_low] = target.name.lower()
+        alias_map[source.name.lower()] = target.name.lower()
+        folded.append(source.name)
+
+    if not folded:
+        if verbose and skipped:
+            print(
+                f"  skip merge into '{target.name}': no valid sources "
+                f"(skipped: {', '.join(skipped)})"
+            )
+        return None
+
+    target.aliases = sorted(existing_aliases) if existing_aliases else None
+    if verbose:
+        print(
+            f"  merged into '{target.name}': "
+            + ", ".join(repr(n) for n in folded)
+            + (f" (reason: {merge.reason})" if merge.reason else "")
+        )
+        if skipped:
+            print(f"    skipped unknown: {', '.join(skipped)}")
+
+    return {
+        "kind": "cast_merge",
+        "into": target.name,
+        "from": folded,
+        "skipped": skipped,
+        "reason": merge.reason,
+    }
+
+
 def _get_chapters_to_analyze(
     chapter_map: dict[int, Path],
     chapters: list[int] | None,
@@ -370,10 +449,18 @@ def _process_cast_batch(
     verbose: bool,
     thinking_budget: int = DEFAULT_THINKING_BUDGET,
     progress: Any = None,
+    merge_events: list[dict] | None = None,
 ) -> int:
-    """process a single batch of chapters, chunked for coreference context."""
+    """process a single batch of chapters, chunked for coreference context.
+
+    llm-directed merges are applied to `cast_map`/`alias_map` and, if
+    `merge_events` is provided, recorded for audit-log persistence.
+    """
     chunks = _batch_chunks(batch_chapters, chapter_map)
     total_found = 0
+    batch_label = ",".join(
+        chapter_map[n].stem for n in batch_chapters if n in chapter_map
+    )
     for ci, chunk in enumerate(chunks):
         if progress is not None:
             progress.set_postfix_str(
@@ -391,7 +478,7 @@ def _process_cast_batch(
             + (f" (also known as: {', '.join(c.aliases)})" if c.aliases else "")
             for c in current_cast
         )
-        chunk_cast = generate_cast(
+        chunk_cast, chunk_merges = generate_cast(
             chunk,
             api_base,
             api_key,
@@ -401,6 +488,15 @@ def _process_cast_batch(
         )
         for c in chunk_cast:
             _merge_character_into_cast(c, cast_map, alias_map, verbose=verbose)
+        for m in chunk_merges:
+            event = _apply_cast_merge(m, cast_map, alias_map, verbose=verbose)
+            if event is not None and merge_events is not None:
+                event = {
+                    **event,
+                    "batch": batch_label,
+                    "chunk": ci + 1,
+                }
+                merge_events.append(event)
         total_found += len(chunk_cast)
         _save_cast_narrator_first(workdir, cast_map)
         if progress is not None:
@@ -473,6 +569,7 @@ def run_cast_generation(
     total_chunks = sum(len(_batch_chunks(b, chapter_map)) for b in batches)
     progress = tqdm(total=total_chunks, desc="cast", unit="chunk")
 
+    merge_events: list[dict] = []
     try:
         for batch_chapters in batches:
             _process_cast_batch(
@@ -487,6 +584,7 @@ def run_cast_generation(
                 verbose,
                 thinking_budget,
                 progress=progress,
+                merge_events=merge_events,
             )
 
             for num in batch_chapters:
@@ -496,7 +594,18 @@ def run_cast_generation(
     finally:
         progress.close()
 
+    if merge_events:
+        _append_cast_merge_audit(workdir, merge_events)
+
     return list(cast_map.values())
+
+
+def _append_cast_merge_audit(workdir: Path, events: list[dict]) -> None:
+    """persist cast merge events to review/audit.json."""
+    audit_path = _audit_path(workdir)
+    entries = _load_audit(audit_path)
+    entries.extend(events)
+    _save_audit(audit_path, entries)
 
 
 def _emote_tasks(
@@ -1397,11 +1506,11 @@ def _check_unresolved_flags(
     ignore: bool = False,
     chapters: list[int] | None = None,
 ) -> None:
-    """raise if review/audit.json contains unresolved flags, unless ignored.
+    """raise if audit/audit.json contains unresolved flags, unless ignored.
 
     when `chapters` is given, only flags for those chapters are considered.
     """
-    audit_path = get_command_dir(workdir, "review") / "audit.json"
+    audit_path = _audit_path(workdir)
     entries = _load_audit(audit_path)
     flags = [e for e in entries if e.get("kind") == "flag"]
     if chapters is not None:
@@ -1824,6 +1933,7 @@ def cmd_revise(args):
         fix_hallucinated=True,
         verbose=args.verbose,
         thinking_budget=args.thinking_budget,
+        force=getattr(args, "force", False),
         accept=getattr(args, "accept", False),
     )
 
@@ -1944,6 +2054,139 @@ def _fill_missing_fragments(
     return added
 
 
+# matches a quoted span: ascii double quotes OR smart double quotes. single
+# quotes are skipped since they double as apostrophes in contractions.
+_QUOTED_SPAN_RE = re.compile(r'"[^"]*"|“[^”]*”', re.DOTALL)
+
+
+def _is_mixed_quote_segment(text: str) -> bool:
+    """true if segment contains a quoted span alongside substantive unquoted text,
+    i.e. narration and dialogue that should have been split into separate segments."""
+    if not _QUOTED_SPAN_RE.search(text):
+        return False
+    remainder = _QUOTED_SPAN_RE.sub("", text)
+    return bool(re.search(r"\w", remainder))
+
+
+def _find_mixed_quote_segments(
+    segments: List[ScriptSegment],
+) -> list[tuple[int, ScriptSegment]]:
+    """return (index, segment) for segments mixing narration with embedded quoted
+    speech. skips Retained speakers (not voiced, quote structure irrelevant)."""
+    out: list[tuple[int, ScriptSegment]] = []
+    for idx, seg in enumerate(segments):
+        if seg.speaker in RETAINED_SPEAKERS:
+            continue
+        if _is_mixed_quote_segment(seg.text):
+            out.append((idx, seg))
+    return out
+
+
+def _seg_text_hash(text: str) -> str:
+    """stable hash of segment text only — used to dedup LLM split decisions
+    across revise runs even when the chapter rehashes for unrelated reasons."""
+    return compute_hash(text)
+
+
+def _split_mixed_quote_segments(
+    segments: List[ScriptSegment],
+    cast: List[Character],
+    api_base: str | None,
+    api_key: str | None,
+    model: str | None,
+    verbose: bool,
+    thinking_budget: int = DEFAULT_THINKING_BUDGET,
+    declined_hashes: set[str] | None = None,
+) -> tuple[int, list[tuple[int, ScriptSegment, str]]]:
+    """split mixed-quote segments via LLM, in-place.
+
+    returns (segments_added, flags) where flags is a list of (idx, seg, reason)
+    for segments the LLM declined to split — caller surfaces them for human
+    review. processes in reverse so flagging an earlier segment never disrupts
+    indices of later splits.
+    """
+    # the offending segment carries both narration and dialogue, so neighbors
+    # only need to anchor speaker attribution. one segment each side is enough.
+    context_segs = 1
+    declined_hashes = declined_hashes or set()
+    mixed = _find_mixed_quote_segments(segments)
+    if not mixed:
+        return 0, []
+    # filter out segments the LLM has already declined in a prior run.
+    pending = [
+        (idx, seg)
+        for idx, seg in mixed
+        if _seg_text_hash(seg.text) not in declined_hashes
+    ]
+    skipped_prior = len(mixed) - len(pending)
+    if skipped_prior:
+        print(f"  skipping {skipped_prior} previously-declined mixed segment(s)")
+    if not pending:
+        return 0, []
+    added = 0
+    flags: list[tuple[int, ScriptSegment, str]] = []
+    bar = tqdm(total=len(pending), desc="split", unit="seg")
+    try:
+        for idx, seg in reversed(pending):
+            if verbose:
+                tqdm.write(f"  splitting seg {idx + 1} ({seg.speaker}): {seg.text}")
+            context_before = _segments_to_context(segments, idx - context_segs, idx)
+            context_after = _segments_to_context(
+                segments, idx + 1, idx + 1 + context_segs
+            )
+            try:
+                new_segs, disagreement = split_mixed_segment(
+                    seg,
+                    context_before,
+                    context_after,
+                    cast,
+                    api_base,
+                    api_key,
+                    model or DEFAULT_LLM_MODEL,
+                    thinking_budget,
+                )
+            except Exception as e:
+                tqdm.write(f"  seg {idx + 1}: failed: {e}")
+                raise
+            if disagreement:
+                tqdm.write(
+                    f"  seg {idx + 1}: declined to split — flagging for "
+                    f"human review ({disagreement})"
+                )
+                flags.append((idx, seg, disagreement))
+                bar.update(1)
+                continue
+            if not new_segs or len(new_segs) < 2:
+                raise RuntimeError(
+                    f"split returned {len(new_segs)} segment(s); expected >= 2 "
+                    f"for seg {idx + 1}"
+                )
+            tqdm.write(f"  seg {idx + 1}: split into {len(new_segs)} segment(s):")
+            for j, s in enumerate(new_segs, start=1):
+                instr = f"/{s.instruction}" if s.instruction else ""
+                preview = s.text if verbose else _truncate(s.text, 100)
+                tqdm.write(f"    [{j}] ({s.speaker}{instr}): {preview}")
+            segments[idx : idx + 1] = new_segs
+            added += len(new_segs) - 1
+            bar.update(1)
+    finally:
+        bar.close()
+    return added, flags
+
+
+def _revise_chapter_hash(
+    source_text: str, script_text: str, cast: List[Character]
+) -> str:
+    """canonical revise freshness key: source + on-disk script + cast identity."""
+    return compute_hash(
+        {
+            "source": source_text,
+            "script": script_text,
+            "cast": [(c.name, tuple(c.aliases or ())) for c in cast],
+        }
+    )
+
+
 def run_revise(
     workdir: Path,
     api_base: str | None = None,
@@ -1952,18 +2195,20 @@ def run_revise(
     chapters: list[int] | None = None,
     fix_missing: bool = True,
     fix_hallucinated: bool = True,
+    fix_mixed: bool = True,
     verbose: bool = False,
     thinking_budget: int = DEFAULT_THINKING_BUDGET,
+    force: bool = False,
     accept: bool = False,
 ) -> None:
-    """fix script issues by filling missing segments and removing hallucinated ones.
+    """fix script issues by filling missing segments, removing hallucinations,
+    and splitting mixed narration+dialogue segments. tracks per-chapter freshness
+    in revise/state.json and persists the LLM's declined-split decisions across
+    runs so they aren't re-flagged on every pass.
 
-    accept=True skips validation/repair entirely — the on-disk scripts are
-    trusted as-is.
+    accept=True re-stamps existing scripts as fresh under the current hash
+    without doing any work.
     """
-    if accept:
-        print("revise: skipped (--accept)")
-        return
     cast = load_cast(workdir)
     extract_dir, script_dir = (
         get_command_dir(workdir, "extract"),
@@ -1975,7 +2220,38 @@ def run_revise(
         print(msg)
         raise RuntimeError(msg)
 
-    total_added, total_removed = 0, 0
+    resume = ResumeManager.for_command(workdir, "revise", force=force)
+
+    if accept:
+        accepted = 0
+        for txt_path in txt_files:
+            try:
+                num = int(txt_path.stem.split("_")[0])
+            except ValueError:
+                continue
+            if chapters and num not in chapters:
+                continue
+            script_path = script_dir / (txt_path.stem + SCRIPT_EXT)
+            if not script_path.exists():
+                continue
+            chapter_hash = _revise_chapter_hash(
+                txt_path.read_text(encoding="utf-8"),
+                script_path.read_text(encoding="utf-8"),
+                cast,
+            )
+            prior = resume.state.get(str(num)) or {}
+            resume.update(
+                str(num),
+                chapter_hash,
+                declined=list(prior.get("declined", [])),
+            )
+            accepted += 1
+        resume.save()
+        print(f"revise: accepted {accepted} existing chapter(s)")
+        return
+
+    total_added, total_removed, total_split, total_flagged = 0, 0, 0, 0
+    audit_path = _audit_path(workdir)
     for txt_path in txt_files:
         try:
             num = int(txt_path.stem.split("_")[0])
@@ -1987,11 +2263,53 @@ def run_revise(
         if not script_path.exists():
             continue
 
-        result = validate_script(txt_path, script_path)
-        if not result.missing and not result.hallucinated:
+        source_text = txt_path.read_text(encoding="utf-8")
+        pre_hash = _revise_chapter_hash(
+            source_text, script_path.read_text(encoding="utf-8"), cast
+        )
+        if resume.is_fresh(str(num), pre_hash):
             continue
+        prior = resume.state.get(str(num)) or {}
+        declined_hashes: set[str] = set(prior.get("declined", []))
 
+        result = validate_script(txt_path, script_path)
         segments = load_script(script_path)
+        mixed = _find_mixed_quote_segments(segments)
+        if mixed and fix_mixed:
+            print(
+                f"\n{txt_path.name}: {len(mixed)} mixed-quote segment(s) "
+                f"(narration + embedded dialogue)..."
+            )
+            split_added, split_flags = _split_mixed_quote_segments(
+                segments,
+                cast,
+                api_base,
+                api_key,
+                model,
+                verbose,
+                thinking_budget,
+                declined_hashes=declined_hashes,
+            )
+            total_split += split_added
+            save_script(script_path, segments)
+            if split_flags:
+                entries = _load_audit(audit_path)
+                for idx, seg, reason in split_flags:
+                    entries.append(
+                        {
+                            "kind": "flag",
+                            "chapter": txt_path.stem,
+                            "segment": idx + 1,
+                            "reason": f"revise: LLM declined mixed-quote split: {reason}",
+                            "text": seg.text,
+                        }
+                    )
+                    declined_hashes.add(_seg_text_hash(seg.text))
+                _save_audit(audit_path, entries)
+                total_flagged += len(split_flags)
+            # source coverage may have shifted; re-validate before missing/halluc.
+            result = validate_script(txt_path, script_path)
+
         if fix_hallucinated and result.hallucinated:
             print(
                 f"\n{txt_path.name}: removing {len(result.hallucinated)} hallucination(s)..."
@@ -2027,11 +2345,25 @@ def run_revise(
                         f"llm fix attempt"
                     )
 
+        # mark chapter complete under the post-revise script hash. next run
+        # with the same on-disk script will short-circuit at is_fresh().
+        post_hash = _revise_chapter_hash(
+            source_text, script_path.read_text(encoding="utf-8"), cast
+        )
+        resume.update(str(num), post_hash, declined=sorted(declined_hashes))
+        resume.save()
+
     summary_parts = []
     if fix_missing and total_added > 0:
         summary_parts.append(f"added {total_added} segment(s)")
     if fix_hallucinated and total_removed > 0:
         summary_parts.append(f"removed {total_removed} segment(s)")
+    if total_split > 0:
+        summary_parts.append(f"split {total_split} mixed-quote segment(s)")
+    if total_flagged > 0:
+        summary_parts.append(
+            f"flagged {total_flagged} mixed-quote segment(s) for review"
+        )
 
     if summary_parts:
         print(f"\nrevise: {', '.join(summary_parts)}")
@@ -2046,33 +2378,55 @@ def _locate_span(source: str, batch_texts: list[str], cursor: int) -> tuple[int,
     """find the source-text span covering the batch's texts starting at cursor.
 
     returns (start, end) in source coordinates. walks each batch text forward
-    from the cursor; on a miss, falls back to searching the normalized source.
+    from the cursor, widening the match from an exact hit, to whitespace
+    drift, to the token alignment _validate_segments uses -- a segment the
+    validator accepts must not fail to locate here, or it gets checked against
+    a span that omits it and can only come back hallucinated.
     if nothing locates, the span degenerates to the cursor → end-of-source.
     """
-    start = cursor
+    start: int | None = None
     end = cursor
     cur = cursor
     for t in batch_texts:
         needle = t.strip()
         if not needle:
             continue
+        length = len(needle)
         idx = source.find(needle, cur)
         if idx < 0:
             # fallback: try normalized whitespace match
             norm_needle = _WS_RE.sub(" ", needle)
             norm_tail = _WS_RE.sub(" ", source[cur:])
             ni = norm_tail.find(norm_needle)
-            if ni < 0:
-                continue
-            # approximate: advance cursor by the length of the normalized match
-            idx = cur + ni
-        if start == cursor and idx >= cursor:
+            if ni >= 0:
+                # approximate: advance cursor by the length of the normalized match
+                idx = cur + ni
+            else:
+                # punctuation drift (smart quotes, dashes, ellipses) survives
+                # token alignment but defeats a substring search.
+                located = _find_text_in_source(needle, source, cur)
+                if located is None:
+                    # text we cannot place must not push the span past source
+                    # it covers; pin the start where the last batch ended.
+                    if start is None:
+                        start = cursor
+                    continue
+                idx, seg_end = located
+                length = seg_end - idx
+        if start is None and idx >= cursor:
             start = idx
-        cur = idx + len(needle)
+        cur = idx + length
         end = cur
+    if start is None:
+        start = cursor
     if end <= start:
         end = len(source)
     return start, end
+
+
+def _audit_path(workdir: Path) -> Path:
+    """canonical audit log path."""
+    return get_command_dir(workdir, "audit") / "audit.json"
 
 
 def _save_audit(audit_path: Path, entries: list[dict]) -> None:
@@ -2098,6 +2452,27 @@ def _load_audit(audit_path: Path) -> list[dict]:
     except (OSError, _json.JSONDecodeError):
         return []
     return data if isinstance(data, list) else []
+
+
+REVIEW_AUDIT_PHASE = "review"
+
+
+def _save_review_audit(audit_path: Path, audit: list[dict], reviewed: set[str]) -> None:
+    """persist review findings without discarding other phases' entries.
+
+    every phase shares one audit log, but review is the only writer holding a
+    whole set of entries at once, so it replaces its own prior findings for the
+    chapters it just processed and leaves everything else in place: cast merges,
+    revise's quote-structure flags (which review never inspects, and which gate
+    perform), and other chapters' results.
+    """
+    entries = [
+        e
+        for e in _load_audit(audit_path)
+        if not (e.get("phase") == REVIEW_AUDIT_PHASE and e.get("chapter") in reviewed)
+    ]
+    entries.extend(audit)
+    _save_audit(audit_path, entries)
 
 
 def _edit_script_and_validate(workdir: Path, chapter_stem: str) -> None:
@@ -2139,42 +2514,245 @@ def _edit_script_and_validate(workdir: Path, chapter_stem: str) -> None:
         print("  validate: OK")
 
 
-def _print_audit_entry(idx: int, total: int, e: dict) -> None:
-    """render a single audit entry with source context for the human reviewer."""
+AUDIT_CONTEXT_LINES_BEFORE = 6
+AUDIT_CONTEXT_LINES_AFTER = 6
+
+
+def _focused_context(
+    source: str,
+    needle: str,
+    before_lines: int = AUDIT_CONTEXT_LINES_BEFORE,
+    after_lines: int = AUDIT_CONTEXT_LINES_AFTER,
+) -> str:
+    """return source text around the first occurrence of `needle`, expanded to
+    full-line boundaries, with `before_lines` newlines before and `after_lines`
+    newlines after. empty if needle isn't found (even after whitespace norm)."""
+    if not source or not needle:
+        return ""
+    needle_s = needle.strip()
+    pos = source.find(needle_s)
+    if pos < 0:
+        npos = _WS_RE.sub(" ", source).find(_WS_RE.sub(" ", needle_s))
+        if npos < 0:
+            return ""
+        # whitespace-normalized positions don't map exactly back to original,
+        # but they're close enough for line-windowed context.
+        pos = min(max(npos, 0), len(source) - 1)
+    start = pos
+    for _ in range(before_lines + 1):
+        nl = source.rfind("\n", 0, start)
+        if nl < 0:
+            start = 0
+            break
+        start = nl
+    if start > 0:
+        start += 1
+    end = pos + len(needle_s)
+    for _ in range(after_lines):
+        nl = source.find("\n", end)
+        if nl < 0:
+            end = len(source)
+            break
+        end = nl + 1
+    return source[start:end]
+
+
+def _audit_current_segment(workdir: Path, e: dict) -> ScriptSegment | None:
+    """load the current on-disk segment referenced by an audit entry, or None."""
+    chapter = e.get("chapter") or ""
+    seg_no = e.get("segment")
+    if not chapter or not isinstance(seg_no, int) or seg_no < 1:
+        return None
+    script_path = get_command_dir(workdir, "script") / (chapter + SCRIPT_EXT)
+    if not script_path.exists():
+        return None
+    try:
+        segments = load_script(script_path)
+    except Exception:
+        return None
+    idx = seg_no - 1
+    if idx >= len(segments):
+        return None
+    return segments[idx]
+
+
+def _audit_context_for(workdir: Path, e: dict) -> str:
+    """compute focused source context for an audit entry, with fallback to the
+    batch source_span saved at write time."""
+    chapter = e.get("chapter") or ""
+    text = e.get("text") or ""
+    if chapter and text:
+        chapter_txt = get_command_dir(workdir, "extract") / (chapter + TXT_EXT)
+        if chapter_txt.exists():
+            try:
+                src = chapter_txt.read_text(encoding="utf-8")
+            except OSError:
+                src = ""
+            ctx = _focused_context(src, text)
+            if ctx:
+                return ctx
+    return e.get("source_span") or ""
+
+
+def _summarize_audit_entry(idx: int, total: int, e: dict) -> str:
+    """one-line summary of an audit entry for the interactive prompt."""
     kind = e.get("kind", "flag")
-    print()
-    header = f"[{idx + 1}/{total}] ({kind}) {e.get('chapter')} seg {e.get('segment')}"
-    print(header)
+    if kind == "cast_merge":
+        return (
+            f"[{idx + 1}/{total}] (cast_merge) "
+            f"{', '.join(e.get('from', []))} -> {e.get('into', '')}"
+        )
+    head = f"[{idx + 1}/{total}] ({kind}) {e.get('chapter')} seg {e.get('segment')}"
     if kind == "flag":
-        print(f"  reason: {e.get('reason', '')}")
+        sug = " [+suggestion]" if e.get("suggested") else ""
+        return f"{head}{sug}: {e.get('reason', '')}"
+    if kind == "validation":
+        return (
+            f"{head}: batch {e.get('batch', '?')} rejected "
+            f"({e.get('missing', 0)} missing, "
+            f"{e.get('hallucinated', 0)} hallucinated)"
+        )
+    if kind == "hallucination":
+        return f"{head}: LLM tried to rewrite text"
+    return (
+        f"{head}: {e.get('field', '?')} "
+        f"{e.get('before', '')!r} -> {e.get('after', '')!r}"
+    )
+
+
+def _format_audit_entry(
+    idx: int, total: int, e: dict, workdir: Path | None = None
+) -> str:
+    """render a single audit entry as text for the human reviewer."""
+    kind = e.get("kind", "flag")
+    if kind == "cast_merge":
+        out: list[str] = [
+            "",
+            f"[{idx + 1}/{total}] (cast_merge) batch {e.get('batch', '?')} "
+            f"chunk {e.get('chunk', '?')}",
+            f"  into: {e.get('into', '')}",
+            f"  from: {', '.join(e.get('from', []))}",
+        ]
+        if e.get("skipped"):
+            out.append(f"  skipped: {', '.join(e.get('skipped', []))}")
+        if e.get("reason"):
+            out.append(f"  reason: {e.get('reason', '')}")
+        return "\n".join(out)
+    out = [
+        "",
+        f"[{idx + 1}/{total}] ({kind}) {e.get('chapter')} seg {e.get('segment')}",
+    ]
+    if kind == "flag":
+        out.append(f"  reason: {e.get('reason', '')}")
     elif kind == "edit":
-        print(
+        out.append(
             f"  {e.get('field', '?')}: "
             f"{e.get('before', '')!r} -> {e.get('after', '')!r}"
         )
     elif kind == "validation":
-        print(
+        out.append(
             f"  batch {e.get('batch', '?')} rejected: "
             f"{e.get('missing', 0)} missing, "
             f"{e.get('hallucinated', 0)} hallucinated"
         )
         for t in e.get("missing_text", [])[:3]:
-            print(f"    missing: {_truncate(t)}")
+            out.append(f"    missing: {_truncate(t)}")
+    elif kind == "hallucination":
+        out.append(f"  reason: {e.get('reason', '')}")
+        attempted = e.get("attempted_text", "")
+        if attempted:
+            out.append(f"  attempted_text: {attempted}")
     text = e.get("text", "")
     if text:
-        print(f"  text: {text}")
-    span = e.get("source_span", "")
+        out.append(f"  text: {text}")
+    suggested = e.get("suggested")
+    if suggested is not None:
+        # show the current on-disk segment being replaced so the reviewer can
+        # eyeball current vs. suggested before applying.
+        cur = _audit_current_segment(workdir, e) if workdir is not None else None
+        if cur is not None:
+            current = {
+                "speaker": cur.speaker,
+                "instruction": cur.instruction,
+                "text": cur.text,
+            }
+            out.append("  current:")
+            for line in json.dumps(current, indent=2, ensure_ascii=False).splitlines():
+                out.append(f"  | {line}")
+        out.append("  suggested:")
+        for line in json.dumps(suggested, indent=2, ensure_ascii=False).splitlines():
+            out.append(f"  | {line}")
+    span = (
+        _audit_context_for(workdir, e)
+        if workdir is not None
+        else e.get("source_span", "")
+    )
     if span:
-        print("  --- source context ---")
+        out.append("  --- source context ---")
         for line in span.splitlines():
-            print(f"  | {line}")
-        print("  --- end source context ---")
+            out.append(f"  | {line}")
+        out.append("  --- end source context ---")
+    return "\n".join(out)
+
+
+def _show_via_pager(text: str) -> None:
+    """render `text` through $PAGER (default less -R); fall back to print on error.
+
+    no -F: always launch the pager so navigation/quit are consistent regardless
+    of entry length. -R passes raw control chars so colors/escapes survive.
+    """
+    import os
+    import shlex
+    import subprocess
+
+    if not sys.stdout.isatty():
+        print(text)
+        return
+    pager_env = os.environ.get("PAGER", "less -R")
+    cmd = shlex.split(pager_env)
+    if not cmd:
+        print(text)
+        return
+    try:
+        subprocess.run(cmd, input=text, text=True, check=False)
+    except (OSError, FileNotFoundError):
+        print(text)
+
+
+def _apply_flag_suggestion(workdir: Path, e: dict) -> bool:
+    """apply an LLM-suggested speaker/instruction correction from a flag entry
+    to the on-disk script. text is never modified. returns True on success."""
+    sug = e.get("suggested") or {}
+    chapter = e.get("chapter") or ""
+    seg_no = e.get("segment")
+    if not chapter or not isinstance(seg_no, int) or seg_no < 1:
+        print("  apply: entry missing chapter/segment; skipping")
+        return False
+    script_path = get_command_dir(workdir, "script") / (chapter + SCRIPT_EXT)
+    if not script_path.exists():
+        print(f"  apply: script not found: {script_path}")
+        return False
+    segments = load_script(script_path)
+    idx = seg_no - 1
+    if idx >= len(segments):
+        print(f"  apply: segment {seg_no} out of range (script has {len(segments)})")
+        return False
+    cur = segments[idx]
+    new_speaker = sug.get("speaker") or cur.speaker
+    new_instruction = sug.get("instruction")
+    if new_instruction is None:
+        new_instruction = cur.instruction
+    segments[idx] = ScriptSegment(
+        speaker=new_speaker, text=cur.text, instruction=new_instruction or ""
+    )
+    save_script(script_path, segments)
+    return True
 
 
 def cmd_audit(args) -> None:
     """walk through the review audit log (flags by default; edits with --all)."""
     workdir = Path(args.workdir)
-    audit_path = get_command_dir(workdir, "review") / "audit.json"
+    audit_path = _audit_path(workdir)
     entries = _load_audit(audit_path)
     if not entries:
         print(f"audit: no entries at {audit_path}")
@@ -2185,28 +2763,73 @@ def cmd_audit(args) -> None:
         print(f"audit: cleared {len(entries)} entry(s) from {audit_path}")
         return
 
-    # default: flags + validation rejections. --all: include edit records too.
+    # default: flags + validations + hallucinations. --all: include edit records.
     visible = (
         entries
         if args.all
-        else [e for e in entries if e.get("kind") in ("flag", "validation")]
+        else [
+            e
+            for e in entries
+            if e.get("kind") in ("flag", "validation", "hallucination")
+        ]
     )
     if not visible:
         print(f"audit: no flags at {audit_path} (use --all to show edits)")
         return
 
+    # auto-dismiss flags whose stored suggestion is just an echo of the on-disk
+    # segment — there is nothing to apply, so keeping them in the audit just
+    # wastes the reviewer's attention. the review LLM frequently re-emits the
+    # current speaker/instruction in a flag even when it has no real correction.
+    auto_dismissed = 0
+    kept: list[dict] = []
+    for e in visible:
+        if e.get("kind") != "flag" or not e.get("suggested"):
+            kept.append(e)
+            continue
+        cur = _audit_current_segment(workdir, e)
+        suggested = e.get("suggested") or {}
+        if cur is not None and (
+            suggested.get("speaker", cur.speaker) == cur.speaker
+            and suggested.get("instruction", cur.instruction) == cur.instruction
+        ):
+            entries.remove(e)
+            auto_dismissed += 1
+            continue
+        kept.append(e)
+    if auto_dismissed:
+        _save_audit(audit_path, entries)
+        print(
+            f"audit: WARNING: auto-dismissed {auto_dismissed} flag(s) whose "
+            f"suggestion echoed the current on-disk segment (nothing to apply)"
+        )
+    visible = kept
+    if not visible:
+        print(f"audit: no remaining flags at {audit_path}")
+        return
+
     if args.list:
         for e in visible:
             kind = e.get("kind", "flag")
+            if kind == "cast_merge":
+                print(
+                    f"cast merge (batch {e.get('batch', '?')}): "
+                    f"{', '.join(e.get('from', []))} -> {e.get('into', '')}"
+                    + (f"  ({e.get('reason')})" if e.get("reason") else "")
+                )
+                continue
             head = f"{e.get('chapter', '?')} seg {e.get('segment', '?')} ({kind})"
             if kind == "flag":
-                print(f"{head}: {e.get('reason', '')}")
+                sug = " [+suggestion]" if e.get("suggested") else ""
+                print(f"{head}{sug}: {e.get('reason', '')}")
             elif kind == "validation":
                 print(
                     f"{head}: batch {e.get('batch', '?')} rejected "
                     f"({e.get('missing', 0)} missing, "
                     f"{e.get('hallucinated', 0)} hallucinated)"
                 )
+            elif kind == "hallucination":
+                print(f"{head}: LLM tried to rewrite text")
             else:
                 print(
                     f"{head}: {e.get('field', '?')} "
@@ -2217,12 +2840,49 @@ def cmd_audit(args) -> None:
     idx = 0
     while idx < len(visible):
         e = visible[idx]
-        _print_audit_entry(idx, len(visible), e)
-        choice = (
-            input("  [k]eep / [e]dit / [d]ismiss / [n]ext / [q]uit> ").strip().lower()
+        print()
+        print(_summarize_audit_entry(idx, len(visible), e))
+        has_suggestion = bool(e.get("suggested")) and e.get("kind") == "flag"
+        if has_suggestion:
+            cur = _audit_current_segment(workdir, e)
+            suggested = e.get("suggested") or {}
+            # treat echo suggestions (identical to current on-disk segment) as
+            # no-op so we don't offer an [a]pply that would change nothing.
+            if cur is not None and (
+                suggested.get("speaker", cur.speaker) == cur.speaker
+                and suggested.get("instruction", cur.instruction) == cur.instruction
+            ):
+                has_suggestion = False
+            if cur is not None:
+                print(
+                    f"  current:   speaker={cur.speaker!r} "
+                    f"instruction={cur.instruction!r}"
+                )
+            print(
+                f"  suggested: speaker={suggested.get('speaker', '')!r} "
+                f"instruction={suggested.get('instruction', '')!r}"
+            )
+            text = (cur.text if cur is not None else e.get("text", "")) or ""
+            if text:
+                print(f"  text: {_truncate(text)}")
+        prompt = (
+            "  [p]ager / "
+            + ("[a]pply / " if has_suggestion else "")
+            + "[k]eep / [e]dit / [d]ismiss / [n]ext / [q]uit> "
         )
+        choice = input(prompt).strip().lower()
         if choice in ("q", "quit"):
             break
+        if choice in ("p", "pager"):
+            _show_via_pager(_format_audit_entry(idx, len(visible), e, workdir))
+            continue
+        if has_suggestion and choice in ("a", "apply"):
+            if _apply_flag_suggestion(workdir, e):
+                entries.remove(e)
+                visible.pop(idx)
+                _save_audit(audit_path, entries)
+                print("  applied.")
+            continue
         if choice in ("e", "edit"):
             chapter = e.get("chapter", "")
             if chapter:
@@ -2240,10 +2900,12 @@ def cmd_audit(args) -> None:
 
     flags_left = sum(1 for e in entries if e.get("kind") == "flag")
     validation_left = sum(1 for e in entries if e.get("kind") == "validation")
-    edits_left = len(entries) - flags_left - validation_left
+    halluc_left = sum(1 for e in entries if e.get("kind") == "hallucination")
+    edits_left = len(entries) - flags_left - validation_left - halluc_left
     print(
         f"audit: {flags_left} flag(s), {validation_left} validation(s), "
-        f"{edits_left} edit(s) remaining at {audit_path}"
+        f"{halluc_left} hallucination(s), {edits_left} edit(s) "
+        f"remaining at {audit_path}"
     )
 
 
@@ -2307,7 +2969,10 @@ def run_review(
     total_chapters = 0
     total_batches = 0
     audit: list[dict] = []
-    audit_path = get_command_dir(workdir, "review") / "audit.json"
+    audit_path = _audit_path(workdir)
+    # chapters this invocation has taken ownership of; their prior review
+    # entries are replaced on save, everything else in the log is preserved.
+    reviewed: set[str] = set()
 
     for txt_path in txt_files:
         try:
@@ -2356,6 +3021,18 @@ def run_review(
                 f"in batches of {batch_size}..."
             )
 
+        reviewed.add(txt_path.stem)
+        if start_batch:
+            # resuming mid-chapter: carry forward findings already recorded for
+            # the batches this run will not redo, since taking ownership of the
+            # chapter replaces whatever is on disk for it.
+            audit.extend(
+                e
+                for e in _load_audit(audit_path)
+                if e.get("phase") == REVIEW_AUDIT_PHASE
+                and e.get("chapter") == txt_path.stem
+            )
+
         total_for_chapter = (len(segments) + batch_size - 1) // batch_size
         bar = tqdm(
             total=total_for_chapter,
@@ -2369,14 +3046,21 @@ def run_review(
             start, end = _locate_span(source, [s.text for s in batch], cursor)
             span = source[start:end] if end > start else source[cursor:]
             batch_flags: list = []
+            batch_mutations: list[tuple[int, str]] = []
+            batch_invalid_instructions: list[tuple[int, str]] = []
             try:
-                corrected, batch_flags = review_script_batch(
+                (
+                    corrected,
+                    batch_flags,
+                    batch_mutations,
+                    batch_invalid_instructions,
+                ) = review_script_batch(
                     span,
                     batch,
                     cast,
                     api_base=api_base,
                     api_key=api_key,
-                    model=model or DEFAULT_LLM_MODEL,
+                    model=model or DEFAULT_REVIEW_LLM_MODEL,
                     thinking_budget=thinking_budget,
                 )
             except Exception as e:
@@ -2396,12 +3080,14 @@ def run_review(
                     audit.append(
                         {
                             "kind": "validation",
+                            "phase": REVIEW_AUDIT_PHASE,
                             "chapter": txt_path.stem,
                             "segment": i + 1,
                             "batch": bnum,
                             "missing": len(result.missing),
                             "hallucinated": len(result.hallucinated),
                             "missing_text": [t for t, *_ in result.missing[:5]],
+                            "suggested": [asdict(s) for s in corrected],
                             "source_span": span,
                         }
                     )
@@ -2417,30 +3103,82 @@ def run_review(
                         audit.append(
                             {
                                 "kind": "edit",
+                                "phase": REVIEW_AUDIT_PHASE,
                                 "chapter": txt_path.stem,
                                 "segment": seg_no,
                                 "field": field,
                                 "before": before,
                                 "after": after,
                                 "text": a.text,
+                                "suggested": asdict(b),
                                 "source_span": span,
                             }
                         )
             # record LLM-emitted human-review flags.
             for f in batch_flags:
                 seg_no = i + f.index + 1
+                entry = {
+                    "kind": "flag",
+                    "phase": REVIEW_AUDIT_PHASE,
+                    "chapter": txt_path.stem,
+                    "segment": seg_no,
+                    "reason": f.reason,
+                    "text": batch[f.index].text if f.index < len(batch) else "",
+                    "source_span": span,
+                }
+                if f.suggestion:
+                    entry["suggested"] = {
+                        **f.suggestion,
+                        "text": batch[f.index].text if f.index < len(batch) else "",
+                    }
+                audit.append(entry)
+                tqdm.write(f"  flag: {txt_path.stem} seg {seg_no}: {f.reason}")
+            # record LLM hallucination attempts (text mutations the review LLM
+            # tried to make; text on disk is preserved regardless).
+            for idx, attempted in batch_mutations:
+                seg_no = i + idx + 1
                 audit.append(
                     {
-                        "kind": "flag",
+                        "kind": "hallucination",
+                        "phase": REVIEW_AUDIT_PHASE,
                         "chapter": txt_path.stem,
                         "segment": seg_no,
-                        "reason": f.reason,
-                        "text": batch[f.index].text if f.index < len(batch) else "",
+                        "reason": "review LLM attempted to modify segment text",
+                        "text": batch[idx].text if idx < len(batch) else "",
+                        "attempted_text": attempted,
                         "source_span": span,
                     }
                 )
-                tqdm.write(f"  flag: {txt_path.stem} seg {seg_no}: {f.reason}")
-            _save_audit(audit_path, audit)
+                tqdm.write(
+                    f"  hallucination: {txt_path.stem} seg {seg_no}: "
+                    f"LLM tried to rewrite text"
+                )
+            # record invalid instruction values the review LLM tried to apply;
+            # the original instruction is preserved regardless.
+            for idx, attempted in batch_invalid_instructions:
+                seg_no = i + idx + 1
+                orig = batch[idx] if idx < len(batch) else None
+                audit.append(
+                    {
+                        "kind": "invalid_instruction",
+                        "phase": REVIEW_AUDIT_PHASE,
+                        "chapter": txt_path.stem,
+                        "segment": seg_no,
+                        "reason": (
+                            f"review LLM emitted invalid instruction "
+                            f"{attempted!r}; kept original"
+                        ),
+                        "text": orig.text if orig else "",
+                        "attempted_instruction": attempted,
+                        "before": orig.instruction if orig else "",
+                        "source_span": span,
+                    }
+                )
+                tqdm.write(
+                    f"  invalid instruction: {txt_path.stem} seg {seg_no}: "
+                    f"LLM emitted {attempted!r}; kept original"
+                )
+            _save_review_audit(audit_path, audit, reviewed)
             new_segments.extend(corrected)
             cursor = end
             total_batches += 1
@@ -2467,19 +3205,20 @@ def run_review(
                     tqdm.write(f"  batch {bnum}: {len(changed)} change(s)")
                     for idx, a, b in changed:
                         seg_no = i + idx + 1
+                        tqdm.write(
+                            f"    seg {seg_no} ({a.speaker}/{a.instruction}): "
+                            f"{a.text}"
+                        )
                         if a.speaker != b.speaker:
-                            tqdm.write(
-                                f"    seg {seg_no} speaker: "
-                                f"{a.speaker!r} -> {b.speaker!r}"
-                            )
+                            tqdm.write(f"      speaker: {a.speaker!r} -> {b.speaker!r}")
                         if a.instruction != b.instruction:
                             tqdm.write(
-                                f"    seg {seg_no} instruction: "
+                                f"      instruction: "
                                 f"{a.instruction!r} -> {b.instruction!r}"
                             )
                         if a.text != b.text:
-                            tqdm.write(f"    seg {seg_no} text: {a.text!r}")
-                            tqdm.write(f"      ->   {b.text!r}")
+                            tqdm.write(f"      text: {a.text!r}")
+                            tqdm.write(f"        ->   {b.text!r}")
             bar.update(1)
         bar.close()
 
@@ -2492,10 +3231,11 @@ def run_review(
         flags_count = sum(1 for e in audit if e.get("kind") == "flag")
         edits_count = sum(1 for e in audit if e.get("kind") == "edit")
         validation_count = sum(1 for e in audit if e.get("kind") == "validation")
+        halluc_count = sum(1 for e in audit if e.get("kind") == "hallucination")
         print(
             f"review: {flags_count} flag(s), {edits_count} edit(s), "
-            f"{validation_count} validation(s) written to "
-            f"{audit_path}; run `autiobook audit <workdir>` to inspect"
+            f"{validation_count} validation(s), {halluc_count} hallucination(s) "
+            f"written to {audit_path}; run `autiobook audit <workdir>` to inspect"
         )
 
     if total_chapters == 0:
@@ -2518,7 +3258,7 @@ def cmd_review(args):
         workdir,
         api_base=args.api_base,
         api_key=args.api_key,
-        model=args.model,
+        model=getattr(args, "review_model", None) or args.model,
         chapters=chapters,
         batch_size=getattr(args, "batch_size", None) or REVIEW_BATCH_SIZE,
         verbose=args.verbose,
@@ -2560,6 +3300,7 @@ def _run_script_phases(
     api_base: str | None,
     api_key: str | None,
     model: str | None,
+    review_model: str | None,
     verbose: bool,
     force: bool,
     thinking_budget: int,
@@ -2598,6 +3339,7 @@ def _run_script_phases(
         chapters,
         verbose=verbose,
         thinking_budget=thinking_budget,
+        force=force or redo_phase == "revise",
         accept=accept,
     )
     _step_if_changed(step, "revise", get_command_dir(workdir, "script"), before)
@@ -2608,7 +3350,7 @@ def _run_script_phases(
             workdir,
             api_base=api_base,
             api_key=api_key,
-            model=model,
+            model=review_model or model,
             chapters=chapters,
             verbose=verbose,
             force=force or redo_phase == "review",
@@ -2669,6 +3411,7 @@ def dramatize_book(
     api_base: str | None = None,
     api_key: str | None = None,
     model: str | None = None,
+    review_model: str | None = None,
     chapters: list[int] | None = None,
     design_config: Any = None,
     clone_config: Any = None,
@@ -2755,6 +3498,7 @@ def dramatize_book(
         api_base=api_base,
         api_key=api_key,
         model=model,
+        review_model=review_model,
         verbose=verbose,
         force=force,
         thinking_budget=thinking_budget,

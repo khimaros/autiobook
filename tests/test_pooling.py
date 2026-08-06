@@ -407,7 +407,7 @@ class TestSegmentDeduplication:
 class TestSubtitles:
     """tests for srt/vtt emission."""
 
-    def test_write_subtitles_srt_and_vtt(self, temp_workdir):
+    def test_write_subtitles_srt(self, temp_workdir):
         chunks = [
             {"start_s": 0.0, "end_s": 1.5, "text": "Hello world."},
             {"start_s": 2.0, "end_s": 3.25, "text": "Second line.", "speaker": "Alice"},
@@ -421,10 +421,8 @@ class TestSubtitles:
         assert "2\n00:00:02,000 --> 00:00:03,250\n[Alice] Second line." in srt
         assert "3\n" not in srt  # empty chunk skipped
 
-        vtt = vtt_path(wav).read_text()
-        assert vtt.startswith("WEBVTT\n")
-        assert "00:00:00.000 --> 00:00:01.500\nHello world." in vtt
-        assert "00:00:02.000 --> 00:00:03.250\n[Alice] Second line." in vtt
+        # vtt output is disabled
+        assert not vtt_path(wav).exists()
 
     def test_pipeline_does_not_emit_subtitles(self, mock_engine, temp_workdir):
         # subtitles are emitted during export, not during perform/synthesize.

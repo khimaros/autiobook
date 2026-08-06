@@ -1,7 +1,6 @@
 """cli entry point for autiobook."""
 
 import argparse
-import os
 import sys
 from pathlib import Path
 
@@ -14,6 +13,7 @@ from .config import (  # noqa: E402
     BASE_MODEL,
     DEFAULT_BITRATE,
     DEFAULT_MODEL,
+    EPUB3_BITRATE,
     VOICE_DESIGN_MODEL,
 )
 from .epub import ensure_extracted, parse_epub  # noqa: E402
@@ -203,6 +203,7 @@ def cmd_dramatize(args):
             api_base=args.api_base,
             api_key=args.api_key,
             model=args.model,
+            review_model=getattr(args, "review_model", None),
             chapters=chapters,
             design_config=design_config,
             clone_config=clone_config,
@@ -289,6 +290,19 @@ def cmd_export(args):
     """convert wav files to mp3 with metadata."""
     workdir = Path(args.workdir)
     output_dir = Path(args.output) if args.output else workdir / "export"
+
+    if getattr(args, "epub3", False):
+        from .overlay import export_epub3
+
+        print(f"export: building read-along epub3 in {output_dir}/...")
+        if not export_epub3(
+            workdir,
+            output_dir,
+            bitrate=args.epub3_bitrate,
+            epub_path=Path(args.epub) if getattr(args, "epub", None) else None,
+        ):
+            sys.exit(1)
+        return
 
     print(f"export: exporting chapters to {output_dir}/...")
     new, skipped = export_audiobook(
@@ -844,6 +858,27 @@ def main():
                     {"action": "store_true", "help": "export as m4b audiobook"},
                 ),
                 (
+                    ("--epub3",),
+                    {
+                        "action": "store_true",
+                        "help": "export a read-along epub3 with media overlays",
+                    },
+                ),
+                (
+                    ("--epub",),
+                    {
+                        "help": "source epub for --epub3 (defaults to the one "
+                        "recorded at extract time)"
+                    },
+                ),
+                (
+                    ("--epub3-bitrate",),
+                    {
+                        "default": EPUB3_BITRATE,
+                        "help": "mp3 bitrate for audio embedded in the epub3",
+                    },
+                ),
+                (
                     ("--accept",),
                     {
                         "action": "store_true",
@@ -953,10 +988,14 @@ def main():
         p.set_defaults(func=func)
 
     args = parser.parse_args()
-    from .config import DEFAULT_SEED
+    from .config import SEED_FILE, set_active_seed
+    from .utils import resolve_seed, workdir_from_args
 
-    origin = "env" if os.getenv("AUTIOBOOK_SEED") else "random"
-    print(f"seed: {DEFAULT_SEED} ({origin}); set AUTIOBOOK_SEED to reproduce")
+    workdir = workdir_from_args(args)
+    seed, origin = resolve_seed(workdir, getattr(args, "seed", None))
+    set_active_seed(seed)
+    where = f"; recorded in {workdir / SEED_FILE}" if workdir else ""
+    print(f"seed: {seed} ({origin}){where}")
     try:
         args.func(args)
     except KeyboardInterrupt:

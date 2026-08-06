@@ -11,6 +11,7 @@ from .config import (
     BASE_MODEL,
     DEFAULT_LLM_MODEL,
     DEFAULT_MODEL,
+    DEFAULT_REVIEW_LLM_MODEL,
     DEFAULT_SPEAKER,
     DEFAULT_THINKING_BUDGET,
     LOG_FILE,
@@ -246,6 +247,13 @@ def add_common_args(parser: argparse.ArgumentParser, group: str = "all"):
             help="llm model name",
         )
         g.add_argument(
+            "--review-llm-model",
+            default=DEFAULT_REVIEW_LLM_MODEL,
+            dest="review_model",
+            help="llm model name for the review phase "
+            "(defaults to $AUTIOBOOK_REVIEW_LLM_MODEL or the main --llm-model)",
+        )
+        g.add_argument(
             "--thinking-budget",
             type=int,
             default=DEFAULT_THINKING_BUDGET,
@@ -261,6 +269,12 @@ def add_common_args(parser: argparse.ArgumentParser, group: str = "all"):
             "--force",
             action="store_true",
             help="ignore resume state and force processing",
+        )
+        g.add_argument(
+            "--seed",
+            type=int,
+            help="seed for tts and llm (recorded in the workdir and reused on "
+            "later runs; 0 disables seeding)",
         )
 
     if group in ["all", "pipeline"]:
@@ -309,13 +323,59 @@ def find_redo_phase(workdir: Path, phases: list[str]) -> str | None:
 def get_pipeline_paths(args) -> tuple[Path, Path]:
     """get epub_path and workdir from args, inferring if needed."""
     epub_path = Path(args.epub)
-    if args.output:
+    if getattr(args, "output", None):
         workdir = Path(args.output)
     else:
         # infer workdir: /path/to/book.epub -> /path/to/book_output/
         workdir = epub_path.parent / (epub_path.stem + "_output")
 
     return epub_path, workdir
+
+
+def workdir_from_args(args) -> Path | None:
+    """workdir this command operates on, or None if it has no workdir."""
+    if getattr(args, "workdir", None):
+        return Path(args.workdir)
+    if getattr(args, "epub", None):
+        return get_pipeline_paths(args)[1]
+    return None
+
+
+def resolve_seed(workdir: Path | None, flag_seed: int | None) -> tuple[int, str]:
+    """determine this run's seed and record it in the workdir.
+
+    precedence: --seed, then AUTIOBOOK_SEED, then the seed already recorded for
+    the book, then a fresh random one. the resolved value is written back so
+    resuming a book reuses it without anyone having to pin it by hand.
+    """
+    from .config import DEFAULT_SEED, SEED_FILE
+    from .resume import load_state, save_state
+
+    env_seed = os.getenv("AUTIOBOOK_SEED")
+    if flag_seed is not None:
+        explicit, origin = flag_seed, "--seed"
+    elif env_seed:
+        explicit, origin = int(env_seed), "env"
+    else:
+        explicit, origin = None, "random"
+
+    if workdir is None:
+        return (DEFAULT_SEED if explicit is None else explicit), origin
+
+    path = workdir / SEED_FILE
+    raw = load_state(path).get("seed")
+    stored = raw if isinstance(raw, int) else None
+
+    if explicit is None:
+        if stored is not None:
+            return stored, "stored"
+        explicit = DEFAULT_SEED
+    elif stored is not None and stored != explicit:
+        print(f"seed: replacing seed {stored} recorded for this book")
+
+    workdir.mkdir(parents=True, exist_ok=True)
+    save_state(path, {"seed": explicit})
+    return explicit, origin
 
 
 def get_chapters(args) -> list[int] | None:

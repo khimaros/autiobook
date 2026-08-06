@@ -104,6 +104,15 @@ creates:
 - `workdir/export/NN_Title.mp3` - mp3 files with id3 tags
 - `workdir/export/state.json` - resumability state
 
+`--epub3` instead rebuilds the source epub as a read-along with media
+overlays, so readers highlight text in sync with the narration:
+
+```
+autiobook export workdir/ --epub3
+```
+
+creates `workdir/export/<slug>.epub`.
+
 ### convert
 
 run all phases (extract → synthesize → retake → export).
@@ -119,8 +128,12 @@ autiobook convert book.epub -o workdir/
 parses epub files using ebooklib, extracts chapter text using beautifulsoup.
 
 key types:
-- `Chapter(index, title, text)` - single chapter data
+- `Chapter(index, title, text, href)` - single chapter data
 - `Book(title, author, chapters)` - parsed book data
+
+`extract_paragraphs_from_html` returns `(tag_index, text)` per paragraph;
+the index is the position within the content-tag walk and is what lets
+`overlay.py` map a span of extracted text back to its source element.
 
 ### tts.py
 
@@ -162,6 +175,30 @@ mp3 export with id3 metadata.
 - id3 tags: title, album, artist, track number
 - filename format: `NN_Chapter_Title.mp3`
 
+### overlay.py
+
+epub3 media overlay (read-along) export.
+
+- anchors each timing-manifest chunk to a source element via the same
+  token alignment `dramatize.py` uses to validate scripts
+- merges chunks sharing an element into one `<par>`, since a `<par>` binds
+  exactly one text fragment to one audio clip
+- clip ranges extend to meet the next `<par>` so inter-chunk pauses play
+  rather than being skipped
+- copies the source epub entry-for-entry, touching only the narrated
+  documents, the package document, and the new smil/audio files
+- upgrades epub2 sources to 3.0, deriving a nav document from the ncx
+
+granularity follows the audio chunk boundaries: each chunk's exact text is
+wrapped in an injected `<span>` so its `<par>` carries the recorded clip
+times rather than an estimate. on a representative novel 90.6% of chunks
+place this way; the rest fall back to the containing paragraph, apportioned
+by character count, when the range crosses inline markup or a paragraph
+break. injection is refused unless the element's collapsed text matches the
+paragraph the offsets were computed against, and a chapter whose `extract/`
+no longer matches the extractor is skipped outright -- both mismatches would
+otherwise place every span in the chapter at an arbitrary offset.
+
 ### main.py
 
 cli entry point with subcommands.
@@ -182,8 +219,16 @@ cli entry point with subcommands.
 
 - `MAX_CHUNK_SIZE = 500` - max chars per tts chunk
 - `SAMPLE_RATE = 24000` - qwen3-tts output rate
-- `PARAGRAPH_PAUSE_MS = 500` - pause between paragraphs
+- `PARAGRAPH_PAUSE_MS = 500` - pause between chunks; chapter assembly and the
+  timing manifest must agree on this or every cue and overlay offset drifts
 - `DEFAULT_BITRATE = "192k"` - mp3 encoding bitrate
+- `EPUB3_BITRATE = "64k"` - audio embedded in a read-along epub3
+- `SEED_FILE = "seed.json"` - per-book seed, resolved once and reused
+
+the seed is resolved in `main()` once the workdir is known, then pinned with
+`config.set_active_seed`. tts and llm read it lazily (`field(default_factory=
+active_seed)` and a `None` sentinel) because module-level defaults would bind
+at import, long before the command line is parsed.
 
 ## workdir structure
 
@@ -191,6 +236,7 @@ Intermediate files are organized into subdirectories by command:
 
 ```
 workdir/
+├── seed.json              # seed recorded for this book, reused on resume
 ├── extract/               # extracted text and metadata
 │   ├── metadata.json
 │   ├── cover.jpg

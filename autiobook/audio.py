@@ -8,6 +8,7 @@ import numpy as np
 import soundfile as sf  # type: ignore
 
 from .config import (
+    PARAGRAPH_PAUSE_MS,
     SAMPLE_RATE,
     SEGMENTS_DIR,
     WAV_EXT,
@@ -17,7 +18,7 @@ from .config import (
 def concatenate_audio(
     audio_chunks: list[np.ndarray],
     sample_rate: int = SAMPLE_RATE,
-    pause_duration_ms: int = 500,
+    pause_duration_ms: int = PARAGRAPH_PAUSE_MS,
 ) -> np.ndarray:
     """concatenate audio chunks with pauses between them."""
     if not audio_chunks:

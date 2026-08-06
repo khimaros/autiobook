@@ -454,6 +454,127 @@ class TestParseCastList:
             _parse_cast_list({"foo": "bar"})
 
 
+class TestParseCastMerges:
+    """tests for llm-directed cast merges parsing/validation."""
+
+    def _char(self, name="X"):
+        return {"name": name, "description": "d", "audition_line": "a"}
+
+    def test_no_merges(self):
+        from autiobook.llm import _parse_cast_response
+
+        chars, merges = _parse_cast_response({"characters": [self._char("A")]})
+        assert [c.name for c in chars] == ["A"]
+        assert merges == []
+
+    def test_merges_parsed(self):
+        from autiobook.llm import _parse_cast_response
+
+        chars, merges = _parse_cast_response(
+            {
+                "characters": [],
+                "merges": [
+                    {"into": "Tam", "from": ["The Fair One"], "reason": "same person"}
+                ],
+            }
+        )
+        assert chars == []
+        assert len(merges) == 1
+        assert merges[0].into == "Tam"
+        assert merges[0].from_ == ["The Fair One"]
+        assert merges[0].reason == "same person"
+
+    def test_abbreviated_keys(self):
+        from autiobook.llm import _parse_cast_response
+
+        _, merges = _parse_cast_response(
+            {"characters": [], "m": [{"i": "Tam", "f": "Tamlin"}]}
+        )
+        assert merges[0].into == "Tam"
+        assert merges[0].from_ == ["Tamlin"]
+
+    def test_empty_from_rejected(self):
+        from autiobook.llm import _parse_cast_response
+
+        with pytest.raises(ValueError, match="non-empty"):
+            _parse_cast_response(
+                {"characters": [], "merges": [{"into": "Tam", "from": []}]}
+            )
+
+    def test_validate_detects_into_equals_from(self):
+        from autiobook.llm import (
+            CastMerge,
+            Character,
+            _validate_cast_response,
+        )
+
+        chars = [Character(name="Tam", description="d", audition_line="a")]
+        merges = [CastMerge(into="Tam", from_=["tam"])]
+        errors = _validate_cast_response((chars, merges))
+        assert any("equals" in e for e in errors)
+
+
+class TestApplyCastMerge:
+    """tests for _apply_cast_merge folding behavior."""
+
+    def _mk(self, name, aliases=None):
+        from autiobook.llm import Character
+
+        return Character(name=name, description="d", audition_line="a", aliases=aliases)
+
+    def _maps(self, cast):
+        cast_map = {c.name.lower(): c for c in cast}
+        alias_map = {
+            a.lower(): c.name.lower() for c in cast if c.aliases for a in c.aliases
+        }
+        return cast_map, alias_map
+
+    def test_basic_fold(self):
+        from autiobook.dramatize import _apply_cast_merge
+        from autiobook.llm import CastMerge
+
+        tam = self._mk("Tam", aliases=["Tammy"])
+        tamlin = self._mk("Tamlin", aliases=["The Fair One"])
+        cast_map, alias_map = self._maps([tam, tamlin])
+
+        event = _apply_cast_merge(
+            CastMerge(into="Tam", from_=["Tamlin"], reason="same person"),
+            cast_map,
+            alias_map,
+        )
+        assert event is not None
+        assert event["into"] == "Tam"
+        assert event["from"] == ["Tamlin"]
+        assert "tamlin" not in cast_map
+        assert "Tamlin" in (tam.aliases or [])
+        assert "The Fair One" in (tam.aliases or [])
+        assert alias_map["tamlin"] == "tam"
+        assert alias_map["the fair one"] == "tam"
+
+    def test_skip_unknown_into(self):
+        from autiobook.dramatize import _apply_cast_merge
+        from autiobook.llm import CastMerge
+
+        tam = self._mk("Tam")
+        cast_map, alias_map = self._maps([tam])
+        event = _apply_cast_merge(
+            CastMerge(into="Nobody", from_=["Tam"]), cast_map, alias_map
+        )
+        assert event is None
+        assert "tam" in cast_map
+
+    def test_skip_unknown_from(self):
+        from autiobook.dramatize import _apply_cast_merge
+        from autiobook.llm import CastMerge
+
+        tam = self._mk("Tam")
+        cast_map, alias_map = self._maps([tam])
+        event = _apply_cast_merge(
+            CastMerge(into="Tam", from_=["Ghost"]), cast_map, alias_map
+        )
+        assert event is None
+
+
 class TestResolveSpeakers:
     """tests for permissive speaker resolution."""
 

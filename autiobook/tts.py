@@ -15,13 +15,13 @@ from tqdm import tqdm  # type: ignore
 from .audio import concatenate_audio, get_segments_dir
 from .config import (
     DEFAULT_MODEL,
-    DEFAULT_SEED,
     DEFAULT_SPEAKER,
     MAX_CHUNK_SIZE,
     PARAGRAPH_PAUSE_MS,
     SAMPLE_RATE,
     TXT_EXT,
     WAV_EXT,
+    active_seed,
 )
 from .epub import load_metadata
 from .pooling import AudioTask, process_audio_pipeline
@@ -111,7 +111,7 @@ class TTSConfig:
     do_sample: bool = True
     temperature: float | None = None
     max_new_tokens: int = 2048
-    seed: int = DEFAULT_SEED
+    seed: int = field(default_factory=active_seed)
 
 
 class TTSEngine:
@@ -397,19 +397,27 @@ def _perform_synthesis(
 
     # check if we should look for a voice
     voice_name = getattr(engine.config, "voice", None)
-    if voice_name:
-        # look in audition/ for the per-character base voice
+    if voice_name and pending:
+        # look in audition/ for the per-character base voice. a missing
+        # reference is fatal rather than a fall-through to preset synthesis:
+        # --speaker has already selected the clone model, which carries no
+        # preset voices, so the request would fail thousands of segments in.
         workdir = pending[0][0].parent.parent
-        p = get_command_dir(workdir, "audition") / f"{voice_name}{WAV_EXT}"
-        if p.exists():
-            voice_path = p
-            # try to load cast to get text
-            from .dramatize import load_cast
+        voice_path = get_command_dir(workdir, "audition") / f"{voice_name}{WAV_EXT}"
+        if not voice_path.exists():
+            raise FileNotFoundError(
+                f"--speaker {voice_name}: no voice reference at {voice_path}; "
+                f"run `autiobook audition {workdir}` to create it, or drop "
+                "--speaker to synthesize with a preset voice"
+            )
 
-            cast = load_cast(workdir)
-            char = next((c for c in cast if c.name == voice_name), None)
-            if char:
-                voice_text = char.audition_line
+        # try to load cast to get text
+        from .dramatize import load_cast
+
+        cast = load_cast(workdir)
+        char = next((c for c in cast if c.name == voice_name), None)
+        if char:
+            voice_text = char.audition_line
 
     for txt_path, wav_path in pending:
         text = txt_path.read_text(encoding="utf-8")
