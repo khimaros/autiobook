@@ -363,6 +363,9 @@ def _run_directed_design(
 
     accepted = 0
     skipped = 0
+    # bound before the loop: a resumed run skips every character, so nothing
+    # inside the body executes and the post-loop check still has to read it.
+    quit_requested = False
     for char in cast:
         final = voices_dir / f"{char.name}{WAV_EXT}"
         text = audition_line or char.audition_line
@@ -384,7 +387,6 @@ def _run_directed_design(
         # navigated away from before its synth completed.
         takes: list[list[Any]] = []
         cursor = -1
-        quit_requested = False
         # what to do at top of next iteration: "new" (generate at end),
         # "restream" (re-stream takes[cursor]), or None (just prompt).
         next_action: str | None = "new"

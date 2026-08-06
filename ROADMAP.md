@@ -1,6 +1,10 @@
 # ROADMAP
 
 ```
+[x] fix UnboundLocalError crashing `audition --directed` on a resumed run: quit_requested was bound inside the per-character loop, after the skip `continue`, so a fully-cached cast reached the post-loop check with the name unbound. bound before the loop; the per-character reset was unreachable and removed
+
+[x] cast --verbose: show the voice prompt on new characters, diff every field update (including voice, which was silently dropped when merging into an existing character), report proposed audition_line changes that were kept, name unchanged characters, and summarise each chunk's outcome
+
 [x] cast: split Character.description into a high-level character description and a targeted voice-design prompt, so the text fed to VoiceDesign is purely acoustic instead of half backstory; audition's interactive editor adjusts the voice prompt and is rebound from [d]escribe to [e]dit
 
 [x] fix review clobbering the shared audit log: run_review was the only writer that did not load-then-append, so each per-chapter (in fact per-batch) save overwrote audit.json with just its own findings, destroying earlier chapters' results plus cast_merge and revise flag entries. review-authored entries now carry phase="review" and are replaced only for the chapters that invocation owns

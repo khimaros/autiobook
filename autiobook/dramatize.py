@@ -4,6 +4,7 @@ import difflib
 import json
 import re
 import sys
+from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, List, Optional, cast
@@ -181,14 +182,24 @@ def load_script(script_path: Path) -> List[ScriptSegment]:
 def _find_existing_character(
     c: Character, cast_map: dict[str, Character], alias_map: dict[str, str]
 ) -> tuple[Optional[Character], Optional[str]]:
-    """find an existing character that matches the given one."""
+    """find an existing character that matches the given one.
+
+    the second element names the form we matched under when it was not the
+    canonical name, which is what distinguishes a merge from a plain update.
+    an exact name match is checked first: re-emitting a character along with
+    the aliases it already owns is an update, not a merge.
+    """
     key = c.name.lower()
 
-    # 1. name is an alias
+    # 1. exact match on the canonical name
+    if key in cast_map:
+        return cast_map[key], None
+
+    # 2. name is an alias of an existing character
     if key in alias_map:
         return cast_map[alias_map[key]], c.name
 
-    # 2. any of character's aliases match existing
+    # 3. any of this character's aliases match an existing one
     if c.aliases:
         for alias in c.aliases:
             a_low = alias.lower()
@@ -197,8 +208,16 @@ def _find_existing_character(
             if a_low in alias_map:
                 return cast_map[alias_map[a_low]], c.name
 
-    # 3. exact match
-    return cast_map.get(key), None
+    return None, None
+
+
+def _field_diff(label: str, old: str, new: str) -> list[str]:
+    """before/after lines for a long text field.
+
+    voice prompts and descriptions run to a sentence or more, so an inline
+    `old -> new` is unreadable at the width these are reviewed in.
+    """
+    return [f"{label}:", f"  - {old!r}", f"  + {new!r}"]
 
 
 def _merge_character_into_cast(
@@ -253,18 +272,39 @@ def _merge_character_into_cast(
             alias_map[a.lower()] = existing_low
 
         if c.description and c.description != existing.description:
-            diff_parts.append(
-                f"description: {existing.description!r} -> {c.description!r}"
+            diff_parts.extend(
+                _field_diff("description", existing.description, c.description)
             )
             existing.description = c.description
 
-        if verbose and diff_parts:
-            label = "merged" if merge_source else "updated"
-            print(f"  {label} '{existing.name}':")
-            for part in diff_parts:
-                print(f"    {part}")
+        # the voice prompt is what reaches the tts model, so a refined one has
+        # to land; it was previously dropped on the floor for existing cast.
+        if c.voice and c.voice != existing.voice_prompt():
+            diff_parts.extend(_field_diff("voice", existing.voice_prompt(), c.voice))
+            existing.voice = c.voice
 
-        return "merged" if merge_source else ("updated" if diff_parts else "unchanged")
+        # the audition line is only a sample sentence, and changing it
+        # invalidates the audition hash. keep the first one and say so rather
+        # than re-generating every character's voice on a cosmetic reword.
+        if verbose and c.audition_line and c.audition_line != existing.audition_line:
+            diff_parts.append(
+                f"audition_line: kept {existing.audition_line!r} "
+                f"(llm proposed {c.audition_line!r})"
+            )
+
+        if verbose:
+            if diff_parts:
+                label = "merged" if merge_source else "updated"
+                print(f"  {label} '{existing.name}':")
+                for part in diff_parts:
+                    print(f"    {part}")
+            else:
+                print(f"  unchanged '{existing.name}'")
+
+        # the kept-audition_line note is informational; it must not make an
+        # otherwise-unchanged character look updated.
+        changed = any(not p.startswith("audition_line: kept") for p in diff_parts)
+        return "merged" if merge_source else ("updated" if changed else "unchanged")
 
     # new character: drop any aliases that duplicate the canonical name
     canon_low = c.name.casefold()
@@ -276,10 +316,13 @@ def _merge_character_into_cast(
         print(f"  added new character: '{c.name}'")
         if clean_aliases:
             print(f"    aliases: {', '.join(repr(a) for a in clean_aliases)}")
-        if c.description:
-            print(f"    description: {c.description!r}")
-        if c.audition_line:
-            print(f"    audition_line: {c.audition_line!r}")
+        for label, value in (
+            ("description", c.description),
+            ("voice", c.voice_prompt()),
+            ("audition_line", c.audition_line),
+        ):
+            if value:
+                print(f"    {label}: {value!r}")
     cast_map[c.name.lower()] = c
     for alias in clean_aliases:
         alias_map[alias.lower()] = c.name.lower()
@@ -490,8 +533,22 @@ def _process_cast_batch(
             existing_cast_summary=summary,
             thinking_budget=thinking_budget,
         )
+        if verbose:
+            print(
+                f"  chunk {ci + 1}/{len(chunks)} of {batch_label}: "
+                f"llm returned {len(chunk_cast)} character(s), "
+                f"{len(chunk_merges)} merge(s); {len(cast_map)} known"
+            )
+        outcomes: Counter[str] = Counter()
         for c in chunk_cast:
-            _merge_character_into_cast(c, cast_map, alias_map, verbose=verbose)
+            outcomes[
+                _merge_character_into_cast(c, cast_map, alias_map, verbose=verbose)
+            ] += 1
+        if verbose and outcomes:
+            print(
+                "  chunk result: "
+                + ", ".join(f"{n} {k}" for k, n in sorted(outcomes.items()))
+            )
         for m in chunk_merges:
             event = _apply_cast_merge(m, cast_map, alias_map, verbose=verbose)
             if event is not None and merge_events is not None:
