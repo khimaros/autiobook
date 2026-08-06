@@ -122,6 +122,8 @@ generate a full cast performance using an openai-compatible llm
 autiobook extract book.epub -o workdir/
 
 # 2. generate cast list (using llm)
+#    each character gets a description (who they are) and a separate
+#    voice prompt; only the voice prompt is sent to the tts model
 autiobook cast workdir/ --api-key sk-...
 
 # 3. generate base voice per character (review/edit characters.json first if needed)

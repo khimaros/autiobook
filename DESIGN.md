@@ -58,7 +58,12 @@ dramatize accepts `--strict` as a rollup for `--revise --retake --callback`; con
 
 advanced workflow for multi-speaker dramatization. pipeline order: cast → audition → emote → script → revise → perform → retake.
 
-- `cast`: generates `characters.json` from text sample using LLM.
+- `cast`: generates `characters.json` from text sample using LLM. each entry
+  carries a `description` (who they are) and a separate `voice` (the
+  VoiceDesign prompt). only `voice` reaches the tts model, so backstory prose
+  cannot dilute the acoustic traits being asked for; a cast written before the
+  split has no `voice` key and falls back to `description`, which keeps its
+  generated voices and cached segments identical.
 - `audition`: generates `audition/Character.wav` using `Qwen3-TTS-VoiceDesign` with the character description only (no emotion hints). this is the canonical per-character voice identity and serves as a fallback ref clip during perform when an emotion variant is missing. `--callback` validates inline.
 - `emote`: generates `emote/Character__emotion.wav` per emotion using `Qwen3-TTS-VoiceDesign` with the description plus an emotion instruct. these are the per-emotion ref clips that perform clones from. reuses the per-character seed recorded by audition so every variant rides the same voice trajectory; a changed audition seed invalidates the emote via the task hash. `--callback` validates inline.
 - `callback`: post-hoc audio quality scan for `audition/` and `emote/` wavs (base files and per-emotion variants); deletes offenders and regenerates (mirrors `retake` for chapter segments). `--dry-run` reports only; `--prune` deletes without regenerating.
@@ -67,6 +72,10 @@ advanced workflow for multi-speaker dramatization. pipeline order: cast → audi
 - `perform`: synthesizes audio using `Qwen3-TTS-Base` voice cloning from scripts + voice samples.
 
 ### audition / emote
+
+the interactive audition prompt offers `[e]dit`, which opens `$EDITOR` on the
+voice prompt and re-synthesizes; accepting a take writes the revised prompt
+back to `characters.json`.
 
 `audition` produces one base file per character (`audition/{name}.wav`) using `design_voice` with the character description, tracked in `audition/state.json`. `emote` then produces per-emotion variants (`emote/{name}__{emotion}.wav`) using `design_voice` with the description plus an emotion instruction, tracked in `emote/state.json` keyed `{name}/{emotion}`. emote reads the seed recorded in `audition/state.json` for each character and reuses it, so the base file and all emotion variants stay on the same voice trajectory; that seed also feeds the emote task hash, so bumping an audition seed forces re-emote. both phases honor `--callback` and archive rejected takes to `{phase}/rejected/`.
 

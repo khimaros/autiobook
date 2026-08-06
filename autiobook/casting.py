@@ -174,6 +174,7 @@ def run_casting(
 
         print(f"\n=== {char.name} ===")
         print(f"  {char.description}")
+        print(f"  voice: {char.voice_prompt()}")
         print(f"  line: {char.audition_line!r}")
 
         cast_voice = None

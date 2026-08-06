@@ -1,6 +1,8 @@
 # ROADMAP
 
 ```
+[x] cast: split Character.description into a high-level character description and a targeted voice-design prompt, so the text fed to VoiceDesign is purely acoustic instead of half backstory; audition's interactive editor adjusts the voice prompt and is rebound from [d]escribe to [e]dit
+
 [x] fix review clobbering the shared audit log: run_review was the only writer that did not load-then-append, so each per-chapter (in fact per-batch) save overwrote audit.json with just its own findings, destroying earlier chapters' results plus cast_merge and revise flag entries. review-authored entries now carry phase="review" and are replaced only for the chapters that invocation owns
 
 [x] fix review rejecting valid llm output when a batch's first segment carries punctuation drift (straight vs typographic apostrophe): _locate_span used an exact substring find where _validate_segments aligns on word tokens, so the segment failed to locate and the span start skipped forward to the next segment that did, cutting the segment's own source out of the window it was then validated against. widened location to fall back on the same token alignment, and pinned the span start at the cursor when text cannot be placed

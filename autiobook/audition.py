@@ -149,7 +149,7 @@ def run_audition(
     for char in tqdm(cast, desc="auditioning voices"):
         wav_path = voices_dir / f"{char.name}{WAV_EXT}"
         text = audition_line or char.audition_line
-        instruct = char.description
+        instruct = char.voice_prompt()
 
         task_data = {
             "name": char.name,
@@ -221,7 +221,7 @@ def _run_directed_design(
     """interactive voice-design casting: regenerate takes until user approves.
 
     for each character, synthesize a take with (description, seed), play it,
-    and prompt y/n/d/s/q. 'next' picks a new random seed; 'describe' edits
+    and prompt y/n/e/s/q. 'next' picks a new random seed; 'edit' revises
     the description and retries.
     """
     import random
@@ -366,7 +366,7 @@ def _run_directed_design(
     for char in cast:
         final = voices_dir / f"{char.name}{WAV_EXT}"
         text = audition_line or char.audition_line
-        instruct = char.description
+        instruct = char.voice_prompt()
 
         task_data = {"name": char.name, "description": instruct, "text": text}
         task_hash = compute_hash(task_data)
@@ -487,7 +487,7 @@ def _run_directed_design(
 
             pos = f"{cursor + 1}/{len(takes)}"
             ans = _prompt(
-                f"  [{pos}] [y]es / [n]ext / [p]rev / [r]eplay / [d]escribe / [s]kip / [q]uit: "
+                f"  [{pos}] [y]es / [n]ext / [p]rev / [r]eplay / [e]dit / [s]kip / [q]uit: "
             )
             # resolve any pending streaming synth. y/r need full audio so we
             # wait. nav actions (n/p/d) don't wait — but if the synth already
@@ -558,10 +558,10 @@ def _run_directed_design(
                     wav_sha256=wav_sha256(final),
                 )
                 resume.save()
-                if cur_instruct != char.description:
-                    char.description = cur_instruct
+                if cur_instruct != char.voice_prompt():
+                    char.voice = cur_instruct
                     save_cast(workdir, cast)
-                    print("  updated cast description")
+                    print("  updated cast voice")
                 accepted += 1
                 print(f"  accepted (seed={cur_seed})")
                 break
@@ -585,11 +585,11 @@ def _run_directed_design(
                 if pregen is not None:
                     pregen.ensure_running()
                 continue
-            if ans in ("d", "describe"):
+            if ans in ("e", "edit"):
                 new_desc = _edit_description(instruct)
                 if new_desc != instruct:
                     instruct = new_desc
-                    print(f"  description: {instruct}")
+                    print(f"  voice: {instruct}")
                     if pregen is not None:
                         pregen.set_target(text, instruct)
                 config.seed = random.randint(1, 2**31 - 1)
@@ -679,7 +679,7 @@ def _accept_existing(
             task_hash = compute_hash(
                 {
                     "name": char.name,
-                    "description": char.description,
+                    "description": char.voice_prompt(),
                     "text": char.audition_line,
                 }
             )
@@ -687,7 +687,7 @@ def _accept_existing(
                 char.name,
                 task_hash,
                 character=char.name,
-                prompt=char.description,
+                prompt=char.voice_prompt(),
                 audition_line=char.audition_line,
                 seed=int(prior_entry.get("seed", 0) or 0),
                 wav_sha256=wav_sha256(wav_path),

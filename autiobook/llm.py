@@ -48,9 +48,21 @@ def retry_with_backoff(
 @dataclass
 class Character:
     name: str
-    description: str  # visual/vocal description for VoiceDesign
+    description: str  # who they are: role, condition, what a listener should sense
     audition_line: str  # short text to generate the reference voice
     aliases: list[str] | None = None  # alternate names for the same character
+    # the prompt actually sent to VoiceDesign. kept separate from `description`
+    # so it stays purely acoustic -- backstory prose in the design prompt
+    # dilutes the traits the model is being asked to produce.
+    voice: str = ""
+
+    def voice_prompt(self) -> str:
+        """design prompt for this character, falling back to the description.
+
+        casts written before the split carry a combined blob in `description`;
+        using it keeps their generated voices byte-identical.
+        """
+        return self.voice or self.description
 
 
 @dataclass
@@ -155,7 +167,8 @@ def _extract_inline_reasoning(content: str) -> str:
 
 # common keys that follow a value in script/cast segments; used for JSON repair.
 _SEGMENT_KEYS = (
-    r"speaker|text|instruction|name|description|audition_line|aliases|s|t|i|n|d|a|al"
+    r"speaker|text|instruction|name|description|voice|audition_line|aliases"
+    r"|s|t|i|n|d|v|a|al"
 )
 
 # matches `\", \"key"` or `\", "key"` where the LLM failed to close a string value
@@ -430,17 +443,17 @@ key "characters" whose value is a list of character definitions.
 For each character (new OR updated) output a definition with the following:
 
 - name: Full canonical name
-- description: A voice-design prompt written as a short paragraph (2-3 \
-sentences). Open with a compact backstory clause that MOTIVATES the voice \
-— role, condition, or defining circumstance that a listener would hear in \
-the delivery (e.g. a former soldier gone to seed, a centenarian sustained \
-by serums, an addict slackened by a hypnotic). Then describe the voice \
-itself: gender, age, pitch, speed, volume, accent, texture/timbre, \
-clarity, fluency, emotion, tone, and the audible personality traits. \
-Every backstory detail must pay for itself by explaining a vocal trait — \
-skip anything that doesn't (plot twists, physical appearance unrelated \
-to voice, relationships, goals). Ground every claim in the prose; do not \
-invent unsupported traits.
+- description: ONE sentence on who they are — role, condition, or defining \
+circumstance that a listener would hear in the delivery (e.g. a former \
+soldier gone to seed, a centenarian sustained by serums, an addict \
+slackened by a hypnotic). Every detail must pay for itself by explaining a \
+vocal trait; skip plot twists, appearance unrelated to voice, \
+relationships, and goals. Ground every claim in the prose.
+- voice: The voice-design prompt, and ONLY the voice. A single sentence of \
+comma-separated acoustic traits: gender, age, pitch, speed, volume, accent, \
+texture/timbre, clarity, fluency, tone, and audible personality. NO \
+backstory, NO narrative, NO character name — those belong in description \
+and dilute the design prompt.
 - audition_line: A sample line for this character. It should be two full sentences long.
 - aliases: Alternate forms the NARRATOR uses to refer to this character in \
 narration — i.e. names that appear in speaker-attribution tags ("said X", \
@@ -455,11 +468,11 @@ specific character as the speaker or subject? If not, omit it.
 
 Example: {{"characters": [{{"name": "Mirabel Thatcher-Quinn", \
 "description": "A burnt-out field medic in her late twenties, still \
-running on triage reflexes and too much black coffee. Female voice with \
-a moderately low pitch, deliberate conversational pace that clips into \
-urgency under pressure, and a flat American Midwestern accent. Dry, \
-sardonic tone with clear articulation; resilient but audibly worn \
-personality.", \
+running on triage reflexes and too much black coffee.", \
+"voice": "Female, late twenties, moderately low pitch, deliberate \
+conversational pace that clips into urgency, flat American Midwestern \
+accent, slightly roughened timbre, clear articulation, dry sardonic tone, \
+resilient but audibly worn.", \
 "audition_line": "I don't belong here. Let's just go.", \
 "aliases": ["Mirabel", "Mira", "Thatcher-Quinn"]}}]}}
 
@@ -499,7 +512,7 @@ reveals 'the medic' is Mirabel"}}]}}
         api_key=api_key,
         thinking_budget=thinking_budget,
         label="cast",
-        expected_shape='{"characters": [{"name": ..., "description": ..., '
+        expected_shape='{"characters": [{"name": ..., "description": ..., "voice": ..., '
         '"audition_line": ..., "aliases": [...]}, ...], '
         '"merges": [{"into": ..., "from": [...], "reason": ...}]}',
     )
@@ -511,6 +524,8 @@ _CHARACTER_KEYS = {
     "n",
     "description",
     "d",
+    "voice",
+    "v",
     "audition_line",
     "a",
     "aliases",
@@ -550,6 +565,7 @@ def _parse_cast_list(data: list | dict) -> List[Character]:
                 description=str(c.get("description", c.get("d", ""))),
                 audition_line=str(c.get("audition_line", c.get("a", ""))),
                 aliases=c.get("aliases", c.get("al")),
+                voice=str(c.get("voice", c.get("v", ""))),
             )
         )
     return results
@@ -629,6 +645,8 @@ def _validate_cast_list(characters: List[Character]) -> list[str]:
     for i, c in enumerate(characters):
         if not c.description:
             errors.append(f"character {i} ({c.name}): missing 'description'")
+        if not c.voice:
+            errors.append(f"character {i} ({c.name}): missing 'voice'")
         if not c.audition_line:
             errors.append(f"character {i} ({c.name}): missing 'audition_line'")
 

@@ -201,7 +201,8 @@ EMOTION_SEP = "__"
 DEFAULT_CAST = [
     {
         "name": "Narrator",
-        "description": (
+        "description": "The book's narrating voice.",
+        "voice": (
             "Warm, articulate male voice; mature age; measured slow pace; "
             "authoritative yet compassionate."
         ),
@@ -212,7 +213,8 @@ DEFAULT_CAST = [
     },
     {
         "name": "Extra Female",
-        "description": "Neutral, casual, female voice, older adult; lower than average pitch.",
+        "description": "An unnamed or minor female character.",
+        "voice": "Neutral, casual, female voice, older adult; lower than average pitch.",
         "audition_line": (
             "I really don't think we should be going in there without a map; "
             "honestly, it looks dangerous."
@@ -220,7 +222,8 @@ DEFAULT_CAST = [
     },
     {
         "name": "Extra Male",
-        "description": (
+        "description": "An unnamed or minor male character.",
+        "voice": (
             "Gruff, textured baritone voice; older adult; relaxed slow speed; weary but kind."
         ),
         "audition_line": (

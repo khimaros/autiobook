@@ -65,13 +65,14 @@ def save_cast(workdir: Path, cast: List[Character]) -> None:
         char_data = {
             "name": c.name,
             "description": c.description,
+            "voice": c.voice_prompt(),
             "audition_line": c.audition_line,
             "aliases": c.aliases,
         }
         characters.append(char_data)
 
     data = {
-        "version": 4,
+        "version": 5,
         "characters": characters,
     }
 
@@ -89,6 +90,7 @@ def load_cast(workdir: Path) -> List[Character]:
                 name=c["name"],
                 description=c["description"],
                 audition_line=c["audition_line"],
+                voice=c["voice"],
             )
             for c in DEFAULT_CAST
         ]
@@ -106,6 +108,7 @@ def load_cast(workdir: Path) -> List[Character]:
                     description=c["description"],
                     audition_line=c["audition_line"],
                     aliases=c.get("aliases"),
+                    voice=c.get("voice", ""),
                 )
             )
         return chars_legacy
@@ -119,6 +122,7 @@ def load_cast(workdir: Path) -> List[Character]:
                 description=c["description"],
                 audition_line=c["audition_line"],
                 aliases=c.get("aliases"),
+                voice=c.get("voice", ""),
             )
         )
     return chars_dict
@@ -474,7 +478,7 @@ def _process_cast_batch(
             )
         current_cast = list(cast_map.values())
         summary = "\n".join(
-            f"- {c.name}: {c.description}"
+            f"- {c.name}: {c.description} | voice: {c.voice_prompt()}"
             + (f" (also known as: {', '.join(c.aliases)})" if c.aliases else "")
             for c in current_cast
         )
@@ -617,7 +621,7 @@ def _emote_tasks(
     for emotion, (emotion_instruct, sample_line) in VOICE_EMOTIONS.items():
         filename = f"{char.name}{EMOTION_SEP}{emotion}"
         resume_key = f"{char.name}/{emotion}"
-        instruct = f"{char.description}; {emotion_instruct}"
+        instruct = f"{char.voice_prompt()}; {emotion_instruct}"
         text = audition_line or sample_line
         tasks.append((filename, resume_key, text, instruct))
     return tasks
@@ -656,7 +660,7 @@ def _accept_existing_emotes(
             task_hash = compute_hash(
                 {
                     "name": char.name,
-                    "description": char.description,
+                    "description": char.voice_prompt(),
                     "text": text,
                     "instruct": emote_instruct,
                     "audition_seed": intro_seed,
@@ -783,7 +787,7 @@ def run_emotes(
 
             task_data = {
                 "name": char.name,
-                "description": char.description,
+                "description": char.voice_prompt(),
                 "text": text,
                 "instruct": emote_instruct,
                 "audition_seed": intro_seed,
@@ -1299,7 +1303,7 @@ def _perform_pooled(
         name: compute_hash(
             {
                 "name": char.name,
-                "description": char.description,
+                "description": char.voice_prompt(),
                 "audition_line": char.audition_line,
             }
         )
