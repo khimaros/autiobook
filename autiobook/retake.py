@@ -19,8 +19,14 @@ from .resume import get_command_dir
 SILENCE_MEAN_ABS = 0.001
 CLICK_FIRST_SAMPLE = 0.05
 TRUNC_LAST_SAMPLE = 0.05
-CLIP_COUNT = 10
 CLIP_THRESHOLD = 0.99
+# clipping is a flat-topped waveform: a RUN of consecutive samples pinned at
+# full scale. counting samples instead penalises peak-normalized backends,
+# whose takes graze the ceiling a few isolated samples at a time and accumulate
+# more of them the longer the take runs -- so the same voice passes at 3s and
+# fails at 12s. 16 samples is 0.67ms at 24khz: well below anything audible as
+# distortion, well above the 6-sample maximum measured across clean takes.
+CLIP_RUN_SAMPLES = 16
 
 # "noisy" detects flat, loud-throughout audio — characteristic of voice-clone
 # ref-text leaks. tight rule fires on any duration; loose rule requires ≥3s
@@ -40,8 +46,17 @@ class SegmentMetrics:
     peak: float
     first_sample: float
     last_sample: float
-    n_clipped: int
+    clip_run: int  # longest consecutive span at full scale
     categories: list[str] = field(default_factory=list)
+
+
+def longest_run(mask: np.ndarray) -> int:
+    """length of the longest consecutive True span in a boolean mask."""
+    if mask.size == 0:
+        return 0
+    padded = np.concatenate(([False], mask, [False]))
+    edges = np.flatnonzero(padded[1:] != padded[:-1])
+    return int((edges[1::2] - edges[::2]).max()) if edges.size else 0
 
 
 def categorize_audio(audio: np.ndarray, sr: int = SAMPLE_RATE) -> list[str]:
@@ -59,7 +74,7 @@ def categorize_audio(audio: np.ndarray, sr: int = SAMPLE_RATE) -> list[str]:
     crest = peak / rms if rms > 0 else float("inf")
     median_abs = float(np.median(np.abs(audio)))
     duration_s = n / sr if sr else 0.0
-    n_clipped = int(np.sum(np.abs(audio) >= CLIP_THRESHOLD))
+    clip_run = longest_run(np.abs(audio) >= CLIP_THRESHOLD)
 
     cats: list[str] = []
     if mean_abs < SILENCE_MEAN_ABS:
@@ -68,7 +83,7 @@ def categorize_audio(audio: np.ndarray, sr: int = SAMPLE_RATE) -> list[str]:
         cats.append("click")
     if abs(ls) > TRUNC_LAST_SAMPLE:
         cats.append("truncated")
-    if n_clipped > CLIP_COUNT:
+    if clip_run >= CLIP_RUN_SAMPLES:
         cats.append("clipping")
     tight = crest < NOISY_CREST_TIGHT and median_abs > NOISY_MED_TIGHT
     loose = (
@@ -135,7 +150,7 @@ def analyze_segment(path: Path) -> SegmentMetrics:
     ls = float(audio[-1]) if n else 0.0
     mean_abs = float(np.mean(np.abs(audio))) if n else 0.0
     peak = float(np.max(np.abs(audio))) if n else 0.0
-    n_clipped = int(np.sum(np.abs(audio) >= CLIP_THRESHOLD)) if n else 0
+    clip_run = longest_run(np.abs(audio) >= CLIP_THRESHOLD) if n else 0
 
     return SegmentMetrics(
         path=path,
@@ -144,7 +159,7 @@ def analyze_segment(path: Path) -> SegmentMetrics:
         peak=peak,
         first_sample=fs,
         last_sample=ls,
-        n_clipped=n_clipped,
+        clip_run=clip_run,
         categories=categorize_audio(audio, sr),
     )
 
@@ -202,7 +217,7 @@ def format_metrics(m: SegmentMetrics, segment: dict[str, str] | None = None) -> 
     line = (
         f"[{cats:28s}] {short} "
         f"ma={m.mean_abs:.4f} fs={m.first_sample:+.3f} "
-        f"ls={m.last_sample:+.3f} clip={m.n_clipped} dur={m.duration_s:.1f}s"
+        f"ls={m.last_sample:+.3f} cliprun={m.clip_run} dur={m.duration_s:.1f}s"
     )
     if segment:
         speaker = segment.get("speaker") or "?"
@@ -328,7 +343,7 @@ def run_retake(
                 "peak": o.peak,
                 "first_sample": o.first_sample,
                 "last_sample": o.last_sample,
-                "n_clipped": o.n_clipped,
+                "clip_run": o.clip_run,
                 "script_path": sm[0] if sm else None,
                 "script_idx": sm[1] if sm else None,
                 "segment": segment,

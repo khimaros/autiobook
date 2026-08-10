@@ -12,7 +12,6 @@ def build(**kw):
     base = {
         "name": "Ratz",
         "description": "A gruff bartender.",
-        "audition_line": "Sure, kid.",
         "voice": "Male, sixties, low rasping baritone.",
     }
     base.update(kw)
@@ -58,12 +57,12 @@ class TestVoiceMerge:
 
     def test_pre_split_existing_compares_against_its_description(self):
         """an existing character with no voice uses description as the prompt."""
-        existing = Character(
-            name="Ratz", description="Low rasping baritone.", audition_line="Sure."
-        )
+        existing = Character(name="Ratz", description="Low rasping baritone.")
         cast_map, alias_map = make_cast(existing)
+        # the line is held equal so only the voice/description path is in play
         incoming = build(
-            description="Low rasping baritone.", voice="Low rasping baritone."
+            description="Low rasping baritone.",
+            voice="Low rasping baritone.",
         )
 
         result = _merge_character_into_cast(incoming, cast_map, alias_map)
@@ -93,31 +92,6 @@ class TestMatchLabelling:
         assert _merge_character_into_cast(incoming, cast_map, alias_map) == "merged"
 
 
-class TestAuditionLine:
-    def test_proposed_change_is_kept_not_applied(self):
-        """changing it would re-generate the voice for a cosmetic reword."""
-        existing = build()
-        cast_map, alias_map = make_cast(existing)
-        result = _merge_character_into_cast(
-            build(audition_line="Something entirely different."), cast_map, alias_map
-        )
-        assert existing.audition_line == "Sure, kid."
-        assert result == "unchanged"
-
-    def test_proposed_change_is_reported(self, capsys):
-        existing = build()
-        cast_map, alias_map = make_cast(existing)
-        _merge_character_into_cast(
-            build(audition_line="Something entirely different."),
-            cast_map,
-            alias_map,
-            verbose=True,
-        )
-        out = capsys.readouterr().out
-        assert "audition_line: kept" in out
-        assert "Something entirely different" in out
-
-
 class TestReporting:
     def test_new_character_shows_its_voice(self, capsys):
         cast_map: dict = {}
@@ -139,3 +113,64 @@ class TestReporting:
         cast_map, alias_map = make_cast(existing)
         _merge_character_into_cast(build(voice="New voice."), cast_map, alias_map)
         assert capsys.readouterr().out == ""
+
+
+class TestAliasStopwords:
+    """a pronoun alias captures every segment the script attributes to it."""
+
+    def test_pronoun_is_dropped_from_a_new_character(self):
+        cast_map: dict = {}
+        alias_map: dict = {}
+
+        _merge_character_into_cast(
+            build(aliases=["the bartender", "he", "him"]), cast_map, alias_map
+        )
+
+        assert cast_map["ratz"].aliases == ["the bartender"]
+        assert "he" not in alias_map
+
+    def test_pronoun_is_dropped_from_an_update(self):
+        existing = build()
+        cast_map, alias_map = make_cast(existing)
+
+        _merge_character_into_cast(build(aliases=["she"]), cast_map, alias_map)
+
+        assert existing.aliases is None
+        assert "she" not in alias_map
+
+    def test_stored_pronoun_is_cleaned_on_the_next_pass(self):
+        """casts already carrying one are fixed rather than grandfathered."""
+        existing = build(aliases=["the bartender", "her"])
+        cast_map, alias_map = make_cast(existing)
+
+        _merge_character_into_cast(build(), cast_map, alias_map)
+
+        assert existing.aliases == ["the bartender"]
+
+    def test_multiword_alias_containing_a_pronoun_survives(self):
+        """only whole aliases match: 'her ladyship' is a naming form."""
+        cast_map: dict = {}
+        alias_map: dict = {}
+
+        _merge_character_into_cast(
+            build(aliases=["her ladyship", "the old man"]), cast_map, alias_map
+        )
+
+        assert cast_map["ratz"].aliases == ["her ladyship", "the old man"]
+
+    def test_punctuated_and_capitalised_pronouns_are_caught(self):
+        cast_map: dict = {}
+        alias_map: dict = {}
+
+        _merge_character_into_cast(
+            build(aliases=["He.", " THEY "]), cast_map, alias_map
+        )
+
+        assert cast_map["ratz"].aliases is None
+
+    def test_prompt_forbids_pronouns(self, cast_prompt):
+        prompt, _ = cast_prompt()
+
+        assert "NEVER a pronoun" in prompt
+        for word in ('"he"', '"she"', '"them"'):
+            assert word in prompt

@@ -172,11 +172,13 @@ class TestDetailedValidationLogic:
         assert len(result.hallucinated) == 1
 
     def test_empty_segments(self):
+        # the whole source is missing, and it is reported verbatim so the fix
+        # pass converts real text instead of a placeholder
         source = "Text."
         segments = []
         result = _validate_segments(source, segments)
         assert len(result.missing) == 1
-        assert result.missing[0][0] == "no segments provided"
+        assert result.missing[0][0] == source
 
     def test_mixed_content_boundary_cleanliness(self):
         # Ensure missing text doesn't include boundary punctuation from found segments

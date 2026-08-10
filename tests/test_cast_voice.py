@@ -25,14 +25,13 @@ class TestVoicePrompt:
         c = Character(
             name="X",
             description="A tired medic.",
-            audition_line="Hi.",
             voice="Low, gravelly.",
         )
         assert c.voice_prompt() == "Low, gravelly."
 
     def test_falls_back_to_description(self):
         """a pre-split cast has its design prompt in description."""
-        c = Character(name="X", description="Low, gravelly voice.", audition_line="Hi.")
+        c = Character(name="X", description="Low, gravelly voice.")
         assert c.voice_prompt() == "Low, gravelly voice."
 
 
@@ -42,7 +41,6 @@ class TestCastRoundTrip:
             Character(
                 name="Mira",
                 description="A burnt-out field medic.",
-                audition_line="Let's go.",
                 voice="Female, late twenties, low pitch.",
             )
         ]
@@ -59,7 +57,6 @@ class TestCastRoundTrip:
                 {
                     "name": "Ratz",
                     "description": "Gruff bartender; low, wet, rasping baritone.",
-                    "audition_line": "Sure.",
                 }
             ],
             version=4,
@@ -76,7 +73,6 @@ class TestCastRoundTrip:
                 {
                     "name": "Ratz",
                     "description": "Low rasping baritone.",
-                    "audition_line": "Sure.",
                 }
             ],
             version=4,
@@ -89,7 +85,7 @@ class TestCastRoundTrip:
         d = tmp_path / "cast"
         d.mkdir(parents=True)
         (d / CAST_FILE).write_text(
-            json.dumps([{"name": "A", "description": "Soft.", "audition_line": "Hi."}]),
+            json.dumps([{"name": "A", "description": "Soft."}]),
             encoding="utf-8",
         )
         assert load_cast(tmp_path)[0].voice_prompt() == "Soft."
@@ -111,7 +107,6 @@ class TestParsing:
                         "name": "Mira",
                         "description": "A medic.",
                         "voice": "Female, low pitch.",
-                        "audition_line": "Hi there.",
                     }
                 ]
             }
@@ -125,9 +120,7 @@ class TestParsing:
         assert chars[0].voice == "Low."
 
     def test_missing_voice_is_a_validation_error(self):
-        errors = _validate_cast_list(
-            [Character(name="M", description="A medic.", audition_line="Hi.")]
-        )
+        errors = _validate_cast_list([Character(name="M", description="A medic.")])
         assert any("voice" in e for e in errors)
 
     def test_complete_character_validates(self):
@@ -136,9 +129,60 @@ class TestParsing:
                 Character(
                     name="M",
                     description="A medic.",
-                    audition_line="Hi.",
                     voice="Low, clipped.",
                 )
             ]
         )
         assert errors == []
+
+
+class TestVoicePromptDimensions:
+    """the voice spec tracks what Qwen3-TTS VoiceDesign documents reading.
+
+    measured across 75 audition takes, volume descriptors moved rms by 1.3 dB
+    between "quiet" and "loud" (se 1.17) -- indistinguishable from noise, and
+    volume is absent from the vendor's list of controllable dimensions.
+    """
+
+    def test_documented_dimensions_are_named(self, cast_prompt):
+        prompt, _ = cast_prompt()
+
+        for dimension in ("gender:", "age:", "pitch:", "speed:", "timbre:", "emotion:"):
+            assert dimension in prompt
+
+    def test_documented_vocabulary_is_offered(self, cast_prompt):
+        """the model's own words, as a starting point rather than a ceiling."""
+        prompt, _ = cast_prompt()
+
+        for word in ("slightly high", "slightly fast", "husky", "resonant", "composed"):
+            assert word in prompt
+
+    def test_accent_is_required_not_conditional(self, cast_prompt):
+        """making it conditional emptied it: 0/8 of a translated novel's cast
+        got an accent, because no dialect is rendered in the prose."""
+        prompt, _ = cast_prompt()
+
+        assert "accent: always name one" in prompt
+
+    def test_distinctiveness_is_demanded(self, cast_prompt):
+        """closed vocabularies collide: two middle-aged men landed on the same
+        five words, differing only in speed."""
+        prompt, _ = cast_prompt()
+
+        assert "audibly nobody else" in prompt
+        assert "add a short distinguishing phrase" in prompt
+
+    def test_volume_is_ruled_out(self, cast_prompt):
+        prompt, _ = cast_prompt()
+
+        assert "Do NOT describe volume or loudness" in prompt
+
+    def test_example_voice_uses_the_vocabulary(self, cast_prompt):
+        """the example is the strongest steer, so it must not model the old style."""
+        prompt, _ = cast_prompt()
+        start = prompt.index('"voice": "Female')
+        example = prompt[start : prompt.index('"aliases"', start)]
+
+        assert "volume" not in example.lower()
+        for word in ("young adult", "slightly low pitch", "husky timbre"):
+            assert word in example

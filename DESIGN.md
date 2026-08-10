@@ -58,15 +58,31 @@ dramatize accepts `--strict` as a rollup for `--revise --retake --callback`; con
 
 advanced workflow for multi-speaker dramatization. pipeline order: cast → audition → emote → script → revise → perform → retake.
 
+the head phases (cast, audition, emote) always run across every selected chapter before the tail begins. cast in particular is never sliced per chapter: the script phase keys its resume hash on the whole cast, so a character discovered while casting chapter N would invalidate the scripts of chapters 1..N-1 and the run would never converge. `--chapter-wise` completes the tail (script → revise → review → perform → retake → export) for chapter 1 before chapter 2 starts; the default runs each tail phase across all chapters.
+
 - `cast`: generates `characters.json` from text sample using LLM. each entry
   carries a `description` (who they are) and a separate `voice` (the
   VoiceDesign prompt). only `voice` reaches the tts model, so backstory prose
   cannot dilute the acoustic traits being asked for; a cast written before the
   split has no `voice` key and falls back to `description`, which keeps its
   generated voices and cached segments identical.
+- the `voice` spec asks only for dimensions Qwen3-TTS VoiceDesign is documented
+  to read (gender, age, pitch, speed, timbre, emotion, plus accent), offers the
+  vendor's own value sets, and rules out volume: it is absent from the vendor's
+  list, and across 75 audition takes here a "quiet" description averaged
+  -21.5 dBFS rms against -20.2 for "loud", which is noise. the value sets are a
+  starting point, not a ceiling -- held to strictly they collide, since a cast
+  has more characters than the vocabulary has words -- so the spec requires an
+  accent for everyone and invites a distinguishing phrase, and points at the
+  cast summary already in context to keep two characters from sharing a voice.
+- by default every reference clip speaks the same sentence (`AUDITION_SAMPLE_LINE`, the neutral emotion's sample line; emote clips use their own emotion's), so clips differ only in voice. `Character.audition_text()` resolves the precedence: a run-wide `--audition-line`, then a per-character `audition_line` set by hand in `characters.json` (or `design --text`), then the shared line. the llm is told not to propose one and any it proposes is dropped on parse, so by default the field only ever changes when a person changes it -- accent and delivery belong in `voice`, which is what reaches VoiceDesign. `--llm-audition-lines` (on `cast` and `dramatize`) asks the model for one instead, and the merge applies it only where none is set, so a hand-written line is never overwritten; `design --text` overwrites deliberately. perform reads `ref_text` from the audition/emote resume entry, which records what each clip was actually rendered with.
 - `audition`: generates `audition/Character.wav` using `Qwen3-TTS-VoiceDesign` with the character description only (no emotion hints). this is the canonical per-character voice identity and serves as a fallback ref clip during perform when an emotion variant is missing. `--callback` validates inline.
 - `emote`: generates `emote/Character__emotion.wav` per emotion using `Qwen3-TTS-VoiceDesign` with the description plus an emotion instruct. these are the per-emotion ref clips that perform clones from. reuses the per-character seed recorded by audition so every variant rides the same voice trajectory; a changed audition seed invalidates the emote via the task hash. `--callback` validates inline.
 - `callback`: post-hoc audio quality scan for `audition/` and `emote/` wavs (base files and per-emotion variants); deletes offenders and regenerates (mirrors `retake` for chapter segments). `--dry-run` reports only; `--prune` deletes without regenerating.
+  clipping is judged by the longest consecutive run at full scale, not by a
+  count of loud samples: a backend that peak-normalizes every clip grazes the
+  ceiling in isolated samples, and a count of those grows with take length,
+  failing long segments while passing the same voice in short ones.
 - `script`: rewrites text into `NN_Title.json` script with speaker attribution using LLM. Supports `--validate` for iterative fixing of missing or hallucinated segments during generation.
 - `revise`: review and repair scripts. compares script to source, then fills missing segments via LLM and removes hallucinated segments. `--dry-run` reports without modifying; `--prune` strips hallucinations but skips LLM fix-missing.
 - `perform`: synthesizes audio using `Qwen3-TTS-Base` voice cloning from scripts + voice samples.
@@ -84,6 +100,20 @@ are recorded to `review/audit.json` (`kind="invalid_instruction"` and
 the prompt asks for the same restraint, but a rule is not a guarantee: the
 shared script rules also say to narrate all unquoted text, and that broader
 instruction is what pulled blurbs out of Retained in the first place.
+
+an entry names its segment by number, but `revise` splits segments and
+renumbers everything after them, so the number goes stale. the recorded text
+is the stable identity: entries resolve by an unambiguous text match and fall
+back to the number only when the text is ambiguous or gone. resolving by
+number alone applied corrections to whichever line had drifted into that
+index.
+
+most flags reach the audit without a suggestion -- review flags what it could
+not decide, and a revise-declined split records only its reasoning -- so the
+walkthrough offers `[s]uggest`, which re-reviews that one segment with a few
+neighbours for context and stores whatever correction comes back as the
+entry's suggestion. it is on demand rather than a bulk pass: one llm call per
+flag the reader actually stops on.
 
 ### audition / emote
 
@@ -105,6 +135,8 @@ emotions generated: neutral, happy, sad, angry, fearful, surprised, whispering, 
 compares script segments against original text and repairs defects:
 - **missing**: text from source not present in any script segment → filled via LLM with surrounding context
 - **hallucinated**: script segments with text not found in source → removed
+- a script with no segments left reports the whole source as missing, so the fix pass always converts real text; removal re-validates in place rather than spending a retry
+- during script generation an emptied chunk is re-converted (at a shifted seed) rather than sent to the fix prompt, which is written for gaps with surrounding script
 - checkpoints after each revise step for resumability
 - `--dry-run`: report only (exits non-zero if issues found); no changes written
 - `--prune`: strip hallucinations only; skip the LLM fix-missing pass
@@ -210,6 +242,21 @@ response body is itself the stream and is read a buffer at a time. the
 `streaming` property hides which, so the interactive loops ask the engine
 rather than inspecting config.
 
+every request goes out through `_request`, which retries transient failures
+with the shared backoff in `utils.py` and only then converts an `HTTPError`
+into a `RuntimeError` carrying its body. what counts as transient is the
+`_retryable` predicate: connection resets, timeouts and http.client framing
+errors (a dropped socket raises `RemoteDisconnected` straight out of
+`getresponse()`, wrapped in nothing), plus the 429/5xx replies in
+`TTS_RETRY_STATUS`. anything else, notably the 4xx that carries an unknown
+voice or a bad body, fails on the first attempt -- the answer will not change
+and hosted providers bill for each send. a synthesis run is hours long, so a
+single blip that ends it costs the whole run.
+
+the streaming paths carry one extra rule: once a chunk has reached the
+`on_chunk` callback the request is no longer retryable, because a second
+attempt would replay the opening of a take that is already playing.
+
 ### dramatize.py
 
 orchestrates the dramatization workflow.
@@ -224,6 +271,8 @@ interface for LLM operations (cast and script generation).
 
 - uses openai-compatible API
 - provides structured output parsing for cast and scripts
+- bad replies (unparseable, wrong shape, failed validation) become a feedback turn in the same conversation and are retried; only transport errors go through backoff, the same `utils.retry_with_backoff` the tts client uses
+- a reply with empty content is salvaged from the reasoning field if it parses there, else fed back as a feedback turn -- re-sending an identical seeded body would only repeat it
 
 ### audio.py
 

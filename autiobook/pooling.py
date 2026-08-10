@@ -18,7 +18,7 @@ from .audio import (
     load_segment,
     save_segment,
 )
-from .config import PARAGRAPH_PAUSE_MS, SAMPLE_RATE
+from .config import EMOTION_SEP, PARAGRAPH_PAUSE_MS, SAMPLE_RATE
 from .resume import ResumeManager, compute_hash
 
 SEGMENT_STATE_PREFIX = "segment:"
@@ -94,7 +94,12 @@ def _log_verbose_tasks(batch: list[AudioTask]) -> None:
     """print voice and text for each task in the batch."""
     for t in batch:
         if t.preset_voice:
-            voice = f"preset:{t.preset_voice}"
+            # a preset voice id names the backend voice, not the speaker, so
+            # the speaker and emotion come from metadata to match the naming
+            # that clone mode gets from its reference wav stem
+            meta = t.metadata or {}
+            parts = [p for p in (meta.get("speaker"), meta.get("emotion")) if p]
+            voice = f"{EMOTION_SEP.join(parts)} preset:{t.preset_voice}".strip()
         elif t.voice_ref_audio:
             voice = t.voice_ref_audio.stem
         else:

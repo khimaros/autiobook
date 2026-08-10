@@ -80,6 +80,86 @@ class TestDetection:
         assert m.categories == []
 
 
+# int16 full scale: what a backend that peak-normalizes every clip emits
+INT16_CEILING = 32767 / 32768
+
+
+def _peak_normalized(duration_s: float = 12.0, grazes: int = 20) -> np.ndarray:
+    """a take from a backend that normalizes each clip to full scale.
+
+    isolated samples touch the ceiling; nothing is flat-topped. modelled on
+    measured hosted-provider output: peak 0.99997, runs of at most a few
+    samples, and more of them the longer the take runs.
+    """
+    a = _good(duration_s)
+    a = (a / np.max(np.abs(a)) * INT16_CEILING).astype(np.float32)
+    for i in range(grazes):
+        start = 1000 + i * 500
+        a[start : start + 4] = INT16_CEILING
+    a[0] = 0.0
+    a[-1] = 0.0
+    return a
+
+
+class TestClippingIsRunBased:
+    """clipping is a flat-topped waveform, not a tally of loud samples.
+
+    a peak-normalizing backend grazes full scale a few isolated samples at a
+    time, and a plain count turns that into a failure that grows with take
+    length -- the same voice passing at 3s and failing at 12s.
+    """
+
+    def test_isolated_ceiling_grazes_are_not_clipping(self, tmp_path):
+        from autiobook.retake import analyze_segment
+
+        p = tmp_path / "normalized.wav"
+        _write(p, _peak_normalized())
+        m = analyze_segment(p)
+        assert "clipping" not in m.categories
+        assert m.peak >= 0.99
+
+    def test_verdict_does_not_depend_on_duration(self, tmp_path):
+        from autiobook.retake import categorize_audio
+
+        short = categorize_audio(_peak_normalized(3.0, grazes=5))
+        long = categorize_audio(_peak_normalized(12.0, grazes=40))
+        assert "clipping" not in short
+        assert "clipping" not in long
+
+    def test_flat_topped_run_is_clipping(self, tmp_path):
+        from autiobook.retake import CLIP_RUN_SAMPLES, categorize_audio
+
+        a = _good()
+        a[100 : 100 + CLIP_RUN_SAMPLES] = 1.0
+        assert "clipping" in categorize_audio(a)
+
+    def test_run_just_under_threshold_passes(self):
+        from autiobook.retake import CLIP_RUN_SAMPLES, categorize_audio
+
+        a = _good()
+        a[100 : 100 + CLIP_RUN_SAMPLES - 1] = 1.0
+        assert "clipping" not in categorize_audio(a)
+
+
+class TestLongestRun:
+    def test_counts_the_longest_span(self):
+        from autiobook.retake import longest_run
+
+        mask = np.array([1, 1, 0, 1, 1, 1, 0, 1], dtype=bool)
+        assert longest_run(mask) == 3
+
+    def test_empty_and_all_false(self):
+        from autiobook.retake import longest_run
+
+        assert longest_run(np.array([], dtype=bool)) == 0
+        assert longest_run(np.zeros(10, dtype=bool)) == 0
+
+    def test_all_true(self):
+        from autiobook.retake import longest_run
+
+        assert longest_run(np.ones(10, dtype=bool)) == 10
+
+
 def _flat_loud(duration_s: float) -> np.ndarray:
     """flat, loud-throughout noise — fires the tight noisy rule at any duration."""
     n = int(SAMPLE_RATE * duration_s)

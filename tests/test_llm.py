@@ -410,7 +410,7 @@ class TestParseCastList:
     """tests for cast list parsing across the shapes LLMs emit."""
 
     def _char(self, name="X"):
-        return {"name": name, "description": "d", "audition_line": "a"}
+        return {"name": name, "description": "d"}
 
     def test_bare_list(self):
         from autiobook.llm import _parse_cast_list
@@ -441,8 +441,8 @@ class TestParseCastList:
         from autiobook.llm import _parse_cast_list
 
         data = {
-            "Tam": {"description": "d", "audition_line": "a"},
-            "Seth": {"description": "d2", "audition_line": "a2"},
+            "Tam": {"description": "d"},
+            "Seth": {"description": "d2"},
         }
         result = _parse_cast_list(data)
         assert sorted(c.name for c in result) == ["Seth", "Tam"]
@@ -458,7 +458,7 @@ class TestParseCastMerges:
     """tests for llm-directed cast merges parsing/validation."""
 
     def _char(self, name="X"):
-        return {"name": name, "description": "d", "audition_line": "a"}
+        return {"name": name, "description": "d"}
 
     def test_no_merges(self):
         from autiobook.llm import _parse_cast_response
@@ -508,7 +508,7 @@ class TestParseCastMerges:
             _validate_cast_response,
         )
 
-        chars = [Character(name="Tam", description="d", audition_line="a")]
+        chars = [Character(name="Tam", description="d")]
         merges = [CastMerge(into="Tam", from_=["tam"])]
         errors = _validate_cast_response((chars, merges))
         assert any("equals" in e for e in errors)
@@ -520,7 +520,7 @@ class TestApplyCastMerge:
     def _mk(self, name, aliases=None):
         from autiobook.llm import Character
 
-        return Character(name=name, description="d", audition_line="a", aliases=aliases)
+        return Character(name=name, description="d", aliases=aliases)
 
     def _maps(self, cast):
         cast_map = {c.name.lower(): c for c in cast}
@@ -585,11 +585,10 @@ class TestResolveSpeakers:
             Character(
                 name="Hubert Vernon Espinoza",
                 description="d",
-                audition_line="a",
                 aliases=["Hubert, Etc.", "Espinoza"],
             ),
-            Character(name="Seth", description="d", audition_line="a"),
-            Character(name="Limpopo", description="d", audition_line="a"),
+            Character(name="Seth", description="d"),
+            Character(name="Limpopo", description="d"),
         ]
 
     def _seg(self, speaker):
@@ -648,8 +647,8 @@ class TestResolveSpeakers:
         from autiobook.llm import Character, resolve_speakers
 
         cast = [
-            Character(name="John Smith", description="d", audition_line="a"),
-            Character(name="John Doe", description="d", audition_line="a"),
+            Character(name="John Smith", description="d"),
+            Character(name="John Doe", description="d"),
         ]
         seg = self._seg("John")
         errors = resolve_speakers([seg], cast)

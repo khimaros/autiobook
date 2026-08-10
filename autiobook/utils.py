@@ -3,10 +3,11 @@
 import argparse
 import os
 import re
+import time
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, List
+from typing import Any, Callable, List, TypeVar
 
 from .config import (
     BASE_MODEL,
@@ -25,6 +26,34 @@ from .config import (
     TTS_DIRECTIONS,
     VOICE_DESIGN_MODEL,
 )
+
+T = TypeVar("T")
+
+
+def retry_with_backoff(
+    fn: Callable[[], T],
+    max_retries: int,
+    initial_delay: float,
+    retryable: Callable[[Exception], bool] | None = None,
+    report: Callable[[str], None] = print,
+    label: str = "api error",
+) -> T:
+    """call fn, retrying with exponential backoff until it stops failing.
+
+    `retryable` decides which errors are worth another attempt; what it rejects
+    propagates immediately, as does the last attempt's failure.
+    """
+    delay = initial_delay
+    for _ in range(max_retries):
+        try:
+            return fn()
+        except Exception as e:
+            if retryable is not None and not retryable(e):
+                raise
+            report(f"  {label}: {e}, retrying in {delay:.1f}s...")
+            time.sleep(delay)
+            delay *= 2
+    return fn()
 
 
 class Logger:
@@ -87,6 +116,18 @@ def dir_mtime(path: Path) -> float:
         if f.is_file():
             latest = max(latest, f.stat().st_mtime)
     return latest
+
+
+def prompt_choice(msg: str) -> str:
+    """read a menu choice, normalized to lowercase.
+
+    EOF and ^C read as quit: a closed or non-interactive stdin should end the
+    walkthrough, not raise out of it.
+    """
+    try:
+        return input(msg).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return "q"
 
 
 def normalize_tts_text(text: str) -> str:
@@ -311,6 +352,15 @@ def add_common_args(parser: argparse.ArgumentParser, group: str = "all"):
             type=int,
             default=DEFAULT_THINKING_BUDGET,
             help="tokens for extended thinking (0 = unlimited)",
+        )
+
+    if group in ["all", "cast"]:
+        g.add_argument(
+            "--llm-audition-lines",
+            action="store_true",
+            help="let the llm write an audition line per character. only used "
+            "for characters that have none; a line already in characters.json "
+            "is never overwritten",
         )
 
     if group in ["all", "runtime"]:

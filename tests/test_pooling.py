@@ -11,6 +11,7 @@ from autiobook.audio import save_segment
 from autiobook.config import SAMPLE_RATE
 from autiobook.pooling import (
     AudioTask,
+    _log_verbose_tasks,
     process_audio_pipeline,
     srt_path,
     vtt_path,
@@ -441,3 +442,46 @@ class TestSubtitles:
 
         assert not srt_path(wav).exists()
         assert not vtt_path(wav).exists()
+
+
+class TestVerboseLogging:
+    """tests for the per-task voice label in verbose perform output."""
+
+    def _lines(self, tasks):
+        with patch("autiobook.pooling.tqdm.write") as w:
+            _log_verbose_tasks(tasks)
+        return [c.args[0] for c in w.call_args_list]
+
+    def test_preset_voice_names_speaker_and_emotion(self, temp_workdir):
+        task = AudioTask(
+            text="  hello there  ",
+            segment_hash="h1",
+            segments_dir=temp_workdir,
+            preset_voice="ash",
+            metadata={"speaker": "Alice", "emotion": "angry"},
+        )
+        assert self._lines([task]) == ["perform: [Alice__angry preset:ash] hello there"]
+
+    def test_preset_voice_without_metadata(self, temp_workdir):
+        task = AudioTask(
+            text="hello",
+            segment_hash="h1",
+            segments_dir=temp_workdir,
+            preset_voice="ash",
+        )
+        assert self._lines([task]) == ["perform: [preset:ash] hello"]
+
+    def test_clone_and_default_labels(self, temp_workdir):
+        tasks = [
+            AudioTask(
+                text="cloned",
+                segment_hash="h1",
+                segments_dir=temp_workdir,
+                voice_ref_audio=temp_workdir / "Alice__angry.wav",
+            ),
+            AudioTask(text="plain", segment_hash="h2", segments_dir=temp_workdir),
+        ]
+        assert self._lines(tasks) == [
+            "perform: [Alice__angry] cloned",
+            "perform: [(default)] plain",
+        ]

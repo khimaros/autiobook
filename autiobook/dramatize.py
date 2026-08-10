@@ -16,6 +16,8 @@ from .audio import (
     get_segments_dir,
 )
 from .config import (
+    ALIAS_STOPWORDS,
+    AUDITION_SAMPLE_LINE,
     BASE_MODEL,
     CAST_BATCH_SIZE,
     CAST_CHUNK_OVERLAP_WORDS,
@@ -34,6 +36,7 @@ from .config import (
     VOICE_DESIGN_MODEL,
     VOICE_EMOTIONS,
     WAV_EXT,
+    active_seed,
 )
 from .epub import load_metadata
 from .llm import (
@@ -49,7 +52,13 @@ from .llm import (
 )
 from .pooling import AudioTask, process_audio_pipeline
 from .resume import ResumeManager, compute_hash, get_command_dir, list_chapters
-from .utils import chunk_text, create_tts_engine, dir_mtime, get_chapters
+from .utils import (
+    chunk_text,
+    create_tts_engine,
+    dir_mtime,
+    get_chapters,
+    prompt_choice,
+)
 
 
 class ValidationError(RuntimeError):
@@ -67,13 +76,13 @@ def save_cast(workdir: Path, cast: List[Character]) -> None:
             "name": c.name,
             "description": c.description,
             "voice": c.voice_prompt(),
-            "audition_line": c.audition_line,
             "aliases": c.aliases,
+            "audition_line": c.audition_line,
         }
         characters.append(char_data)
 
     data = {
-        "version": 5,
+        "version": 6,
         "characters": characters,
     }
 
@@ -90,7 +99,6 @@ def load_cast(workdir: Path) -> List[Character]:
             Character(
                 name=c["name"],
                 description=c["description"],
-                audition_line=c["audition_line"],
                 voice=c["voice"],
             )
             for c in DEFAULT_CAST
@@ -107,9 +115,9 @@ def load_cast(workdir: Path) -> List[Character]:
                 Character(
                     name=c["name"],
                     description=c["description"],
-                    audition_line=c["audition_line"],
                     aliases=c.get("aliases"),
                     voice=c.get("voice", ""),
+                    audition_line=c.get("audition_line", ""),
                 )
             )
         return chars_legacy
@@ -121,9 +129,9 @@ def load_cast(workdir: Path) -> List[Character]:
             Character(
                 name=c["name"],
                 description=c["description"],
-                audition_line=c["audition_line"],
                 aliases=c.get("aliases"),
                 voice=c.get("voice", ""),
+                audition_line=c.get("audition_line", ""),
             )
         )
     return chars_dict
@@ -211,6 +219,27 @@ def _find_existing_character(
     return None, None
 
 
+def character_hash(char: Character) -> str:
+    """identity of a character's voice, for keying performed segments.
+
+    the audition line is deliberately absent: it is an input to producing a
+    reference clip, not to the performance, and `ref_wav_sha` already ties each
+    segment to the exact reference bytes. including it would discard every
+    performed segment for a character whenever a cast merge reworded the line.
+    """
+    return compute_hash({"name": char.name, "description": char.voice_prompt()})
+
+
+def _usable_alias(alias: str, canon_low: str) -> bool:
+    """false for an alias that is the character's own name or a stopword.
+
+    a pronoun alias is not a naming form, and it resolves script speakers, so
+    keeping one hands that character every segment attributed to the word.
+    """
+    norm = alias.strip().rstrip(".,;:").casefold()
+    return bool(norm) and norm != canon_low and norm not in ALIAS_STOPWORDS
+
+
 def _field_diff(label: str, old: str, new: str) -> list[str]:
     """before/after lines for a long text field.
 
@@ -225,8 +254,14 @@ def _merge_character_into_cast(
     cast_map: dict[str, Character],
     alias_map: dict[str, str],
     verbose: bool = False,
+    overwrite_audition_line: bool = False,
 ) -> str:
-    """merge a character into the cast, returns 'added', 'updated', or 'merged'."""
+    """merge a character into the cast, returns 'added', 'updated', or 'merged'.
+
+    an incoming audition line only fills a gap: llm-written lines (under
+    --llm-audition-lines) must not overwrite one a person wrote. `design --text`
+    sets overwrite_audition_line to change one deliberately.
+    """
     existing, merge_source = _find_existing_character(c, cast_map, alias_map)
 
     if existing:
@@ -234,11 +269,13 @@ def _merge_character_into_cast(
         # exclude canonical name from alias comparison — the LLM sometimes emits
         # the canonical name as its own alias, which is cleanup noise, not a diff.
         canon_low = existing.name.casefold()
-        old_aliases = {a for a in (existing.aliases or []) if a.casefold() != canon_low}
+        old_aliases = {
+            a for a in (existing.aliases or []) if _usable_alias(a, canon_low)
+        }
         new_aliases = set(old_aliases)
         if c.aliases:
-            new_aliases.update(a for a in c.aliases if a.casefold() != canon_low)
-        if merge_source and merge_source.casefold() != canon_low:
+            new_aliases.update(a for a in c.aliases if _usable_alias(a, canon_low))
+        if merge_source and _usable_alias(merge_source, canon_low):
             new_aliases.add(merge_source)
 
         # drop proposed aliases that conflict with other characters in the cast
@@ -283,14 +320,16 @@ def _merge_character_into_cast(
             diff_parts.extend(_field_diff("voice", existing.voice_prompt(), c.voice))
             existing.voice = c.voice
 
-        # the audition line is only a sample sentence, and changing it
-        # invalidates the audition hash. keep the first one and say so rather
-        # than re-generating every character's voice on a cosmetic reword.
-        if verbose and c.audition_line and c.audition_line != existing.audition_line:
-            diff_parts.append(
-                f"audition_line: kept {existing.audition_line!r} "
-                f"(llm proposed {c.audition_line!r})"
+        may_set_line = overwrite_audition_line or not existing.audition_line
+        if (
+            c.audition_line
+            and may_set_line
+            and c.audition_line != existing.audition_line
+        ):
+            diff_parts.extend(
+                _field_diff("audition_line", existing.audition_line, c.audition_line)
             )
+            existing.audition_line = c.audition_line
 
         if verbose:
             if diff_parts:
@@ -301,15 +340,14 @@ def _merge_character_into_cast(
             else:
                 print(f"  unchanged '{existing.name}'")
 
-        # the kept-audition_line note is informational; it must not make an
-        # otherwise-unchanged character look updated.
-        changed = any(not p.startswith("audition_line: kept") for p in diff_parts)
+        changed = bool(diff_parts)
         return "merged" if merge_source else ("updated" if changed else "unchanged")
 
-    # new character: drop any aliases that duplicate the canonical name
+    # new character: drop aliases that duplicate the canonical name or are
+    # pronouns rather than naming forms
     canon_low = c.name.casefold()
     clean_aliases = (
-        [a for a in c.aliases if a.casefold() != canon_low] if c.aliases else []
+        [a for a in c.aliases if _usable_alias(a, canon_low)] if c.aliases else []
     )
     c.aliases = clean_aliases or None
     if verbose:
@@ -319,7 +357,6 @@ def _merge_character_into_cast(
         for label, value in (
             ("description", c.description),
             ("voice", c.voice_prompt()),
-            ("audition_line", c.audition_line),
         ):
             if value:
                 print(f"    {label}: {value!r}")
@@ -497,6 +534,7 @@ def _process_cast_batch(
     thinking_budget: int = DEFAULT_THINKING_BUDGET,
     progress: Any = None,
     merge_events: list[dict] | None = None,
+    audition_lines: bool = False,
 ) -> int:
     """process a single batch of chapters, chunked for coreference context.
 
@@ -532,6 +570,7 @@ def _process_cast_batch(
             model or DEFAULT_LLM_MODEL,
             existing_cast_summary=summary,
             thinking_budget=thinking_budget,
+            audition_lines=audition_lines,
         )
         if verbose:
             print(
@@ -576,6 +615,7 @@ def run_cast_generation(
     force: bool = False,
     thinking_budget: int = DEFAULT_THINKING_BUDGET,
     accept: bool = False,
+    audition_lines: bool = False,
 ) -> List[Character]:
     """analyze book and generate cast list.
 
@@ -646,6 +686,7 @@ def run_cast_generation(
                 thinking_budget,
                 progress=progress,
                 merge_events=merge_events,
+                audition_lines=audition_lines,
             )
 
             for num in batch_chapters:
@@ -1002,6 +1043,26 @@ def process_script_chunk_with_validation(
 
         if result.hallucinated:
             _remove_hallucinations(segments, result.hallucinated)
+            # removal shifts every index after it, so the missing fragments
+            # have to be re-derived. doing it here rather than looping keeps
+            # the attempt, which a fully hallucinated chunk cannot spare.
+            result = validate_chunk(text_chunk, segments)
+
+        if not segments:
+            # the gap is the whole chunk and there is no surrounding script to
+            # place it against, so redo the conversion rather than ask the
+            # gap-filling prompt to do a job it is not written for. the seed
+            # moves with the attempt because an identical seeded request would
+            # only replay the reply that just failed.
+            segments = process_script_chunk(
+                text_chunk,
+                characters_list,
+                api_base,
+                api_key,
+                model,
+                thinking_budget,
+                seed=active_seed() + attempt,
+            )
             continue
 
         if result.missing:
@@ -1355,17 +1416,7 @@ def _perform_pooled(
     only_hashes: set[str] | None = None,
 ) -> None:
     """synthesize chapters using unified pooled batching and segment caching."""
-    # Pre-calculate character hashes for stable identification
-    char_hashes = {
-        name: compute_hash(
-            {
-                "name": char.name,
-                "description": char.voice_prompt(),
-                "audition_line": char.audition_line,
-            }
-        )
-        for name, char in cast_map.items()
-    }
+    char_hashes = {name: character_hash(char) for name, char in cast_map.items()}
 
     audition_dir = get_command_dir(voices_dir.parent, "audition")
 
@@ -1380,11 +1431,24 @@ def _perform_pooled(
     # swapped file) changes this sha and invalidates cached perform segments.
     emote_resume = ResumeManager.for_command(voices_dir.parent, "emote")
     emote_shas: dict[tuple[str, str], str] = {}
+    # what each ref clip actually says, recorded when it was rendered. ref_text
+    # describes the audio to the clone model, so it cannot come from the cast:
+    # a later merge can reword the line long after the wav was made.
+    emote_lines: dict[tuple[str, str], str] = {}
     for key, entry in emote_resume.state.items():
-        if isinstance(entry, dict) and "wav_sha256" in entry:
-            char_key, _, emo_key = key.partition("/")
-            if char_key and emo_key:
-                emote_shas[(char_key, emo_key)] = str(entry["wav_sha256"])
+        if not isinstance(entry, dict):
+            continue
+        char_key, _, emo_key = key.partition("/")
+        if not (char_key and emo_key):
+            continue
+        if "wav_sha256" in entry:
+            emote_shas[(char_key, emo_key)] = str(entry["wav_sha256"])
+        if entry.get("audition_line"):
+            emote_lines[(char_key, emo_key)] = str(entry["audition_line"])
+
+    from .audition import recorded_audition_lines
+
+    audition_lines = recorded_audition_lines(voices_dir.parent)
 
     chapter_data = []
     segments_dir = get_segments_dir(pending[0][1].parent)
@@ -1435,13 +1499,21 @@ def _perform_pooled(
                     ref_audio_path = audition_dir / f"{char_opt.name}{WAV_EXT}"
                     used_audition_base = True
 
-                # ref_text must match what's spoken in the reference clip
+                # ref_text must match what's spoken in the reference clip, so
+                # it comes from the record written when that clip was rendered.
+                # the standing sample line is the fallback for clips made
+                # before the record existed, and for --audition-line runs it is
+                # the record that carries the override.
                 if used_audition_base:
-                    ref_text = char_opt.audition_line if char_opt else None
+                    ref_text = audition_lines.get(char_name) or (
+                        char_opt.audition_text() if char_opt else AUDITION_SAMPLE_LINE
+                    )
                 else:
                     _, ref_text_default = VOICE_EMOTIONS.get(emotion, ("", ""))
-                    ref_text = ref_text_default or (
-                        char_opt.audition_line if char_opt else None
+                    ref_text = (
+                        emote_lines.get((char_name, emotion))
+                        or ref_text_default
+                        or AUDITION_SAMPLE_LINE
                     )
 
                 ref_wav_sha = emote_shas.get((char_name, emotion), "")
@@ -1523,6 +1595,7 @@ def cmd_cast(args):
         force=args.force,
         thinking_budget=args.thinking_budget,
         accept=getattr(args, "accept", False),
+        audition_lines=getattr(args, "llm_audition_lines", False),
     )
 
 
@@ -1697,9 +1770,13 @@ def _validate_segments(
 ) -> ValidationResult:
     """core validation logic shared by validate_chunk and validate_script."""
     if not segments:
-        return ValidationResult(
-            missing=[("no segments provided", 0, 0, "")], hallucinated=[]
-        )
+        # an empty script leaves the whole source uncovered. reporting the
+        # source itself rather than a placeholder matters: this fragment is
+        # handed to the llm as the text to convert, and a placeholder came
+        # back as a segment, was flagged as a hallucination, emptied the
+        # script again, and looped until the attempt budget ran out.
+        missing = [(source_text, 0, 0, source_text)] if source_text.strip() else []
+        return ValidationResult(missing=missing, hallucinated=[])
 
     source_tokens = _tokenize_with_positions(source_text)
     source_words = [t[0] for t in source_tokens]
@@ -1793,15 +1870,9 @@ def _validate_segments(
 
 def validate_script(txt_path: Path, script_path: Path) -> ValidationResult:
     """validate that script segments match the source text using fuzzy diffing."""
-    segments = load_script(script_path)
-    if not segments:
-        return ValidationResult(
-            missing=[(f"no script found for {txt_path.name}", 0, 0, "")],
-            hallucinated=[],
-        )
-
-    original_text = txt_path.read_text(encoding="utf-8")
-    return _validate_segments(original_text, segments)
+    return _validate_segments(
+        txt_path.read_text(encoding="utf-8"), load_script(script_path)
+    )
 
 
 def _truncate(text: str, max_len: int = 80) -> str:
@@ -2618,23 +2689,46 @@ def _focused_context(
     return source[start:end]
 
 
-def _audit_current_segment(workdir: Path, e: dict) -> ScriptSegment | None:
-    """load the current on-disk segment referenced by an audit entry, or None."""
+def _audit_load_script(workdir: Path, e: dict) -> List[ScriptSegment]:
+    """the on-disk script an audit entry refers to, or [] if unreadable."""
     chapter = e.get("chapter") or ""
-    seg_no = e.get("segment")
-    if not chapter or not isinstance(seg_no, int) or seg_no < 1:
-        return None
+    if not chapter:
+        return []
     script_path = get_command_dir(workdir, "script") / (chapter + SCRIPT_EXT)
     if not script_path.exists():
-        return None
+        return []
     try:
-        segments = load_script(script_path)
+        return load_script(script_path)
     except Exception:
-        return None
-    idx = seg_no - 1
-    if idx >= len(segments):
-        return None
-    return segments[idx]
+        return []
+
+
+def _audit_segment_index(e: dict, segments: List[ScriptSegment]) -> int | None:
+    """0-based index of the segment an audit entry refers to.
+
+    entries record a segment number, but revise's mixed-quote splitting inserts
+    segments and renumbers every one after them, so a stored number drifts out
+    of date. the recorded text is the stable identity: an unambiguous match on
+    it wins, and the number is only trusted when the text is gone.
+    """
+    seg_no = e.get("segment")
+    idx = seg_no - 1 if isinstance(seg_no, int) and seg_no >= 1 else None
+    in_range = idx is not None and 0 <= idx < len(segments)
+    text = (e.get("text") or "").strip()
+    if in_range and idx is not None and segments[idx].text.strip() == text:
+        return idx
+    if text:
+        matches = [i for i, s in enumerate(segments) if s.text.strip() == text]
+        if len(matches) == 1:
+            return matches[0]
+    return idx if in_range else None
+
+
+def _audit_current_segment(workdir: Path, e: dict) -> ScriptSegment | None:
+    """load the current on-disk segment referenced by an audit entry, or None."""
+    segments = _audit_load_script(workdir, e)
+    idx = _audit_segment_index(e, segments) if segments else None
+    return segments[idx] if idx is not None else None
 
 
 def _audit_context_for(workdir: Path, e: dict) -> str:
@@ -2653,6 +2747,116 @@ def _audit_context_for(workdir: Path, e: dict) -> str:
             if ctx:
                 return ctx
     return e.get("source_span") or ""
+
+
+# neighbouring segments sent along with a flagged one so the reviewer can see
+# who is speaking around it; the flag itself carries no such context.
+AUDIT_SUGGEST_CONTEXT = 3
+# neighbouring segments shown to the human for the same reason
+AUDIT_WINDOW_CONTEXT = 2
+
+
+def _audit_segment_window(
+    workdir: Path, e: dict, context: int = AUDIT_WINDOW_CONTEXT
+) -> list[tuple[int, ScriptSegment, bool]]:
+    """the flagged segment and its neighbours as (number, segment, flagged).
+
+    a flag names one segment, but judging it means seeing how the script broke
+    the passage up around it -- for a split decision the whole question is
+    where one segment ends and the next begins.
+    """
+    segments = _audit_load_script(workdir, e)
+    idx = _audit_segment_index(e, segments) if segments else None
+    if idx is None:
+        return []
+    start = max(0, idx - context)
+    end = min(len(segments), idx + context + 1)
+    return [(i + 1, segments[i], i == idx) for i in range(start, end)]
+
+
+def _format_segment_window(
+    window: list[tuple[int, ScriptSegment, bool]],
+    truncate: bool = True,
+    recorded_no: int | None = None,
+) -> list[str]:
+    """render a segment window, marking the flagged one with an arrow.
+
+    a flagged segment whose live number differs from the one the entry recorded
+    says the script was re-split after the flag was raised; the numbers in the
+    header and the window would otherwise silently disagree.
+    """
+    lines = []
+    for seg_no, seg, flagged in window:
+        instr = f"/{seg.instruction}" if seg.instruction else ""
+        text = _truncate(seg.text) if truncate else seg.text
+        lines.append(
+            f"  {'>' if flagged else ' '} {seg_no:>4} ({seg.speaker}{instr}): {text}"
+        )
+        if flagged and recorded_no is not None and seg_no != recorded_no:
+            lines.append(
+                f"       (recorded as seg {recorded_no}; script re-split since)"
+            )
+    return lines
+
+
+def _suggest_for_entry(workdir: Path, e: dict, args: Any) -> dict | None:
+    """ask the review llm to resolve one flagged segment, on demand.
+
+    most flags arrive without a suggestion -- a revise-declined split records
+    only its reasoning, and review flags what it could not decide. re-reviewing
+    the segment in place, with neighbours for context, turns "someone should
+    look at this" into a concrete speaker/instruction the walkthrough can
+    [a]pply. returns None when the llm proposes no change.
+    """
+    chapter = e.get("chapter") or ""
+    seg_no = e.get("segment")
+    if not chapter or not isinstance(seg_no, int) or seg_no < 1:
+        print("  suggest: entry has no chapter/segment")
+        return None
+
+    txt_path = get_command_dir(workdir, "extract") / (chapter + TXT_EXT)
+    segments = _audit_load_script(workdir, e)
+    if not segments or not txt_path.exists():
+        print(f"  suggest: missing script or source for {chapter}")
+        return None
+
+    idx = _audit_segment_index(e, segments)
+    if idx is None:
+        print(f"  suggest: segment {seg_no} out of range")
+        return None
+
+    start = max(0, idx - AUDIT_SUGGEST_CONTEXT)
+    window = segments[start : idx + AUDIT_SUGGEST_CONTEXT + 1]
+    local = idx - start
+    source = txt_path.read_text(encoding="utf-8")
+    span_start, span_end = _locate_span(source, [s.text for s in window], 0)
+    span = source[span_start:span_end] if span_end > span_start else source
+
+    model = str(
+        getattr(args, "review_model", None)
+        or getattr(args, "model", None)
+        or DEFAULT_REVIEW_LLM_MODEL
+    )
+    print(f"  suggest: asking {model}...")
+    corrected, flags, _muts, _instr, _retained = review_script_batch(
+        span,
+        window,
+        load_cast(workdir),
+        api_base=getattr(args, "api_base", None),
+        api_key=getattr(args, "api_key", None),
+        model=model,
+        thinking_budget=getattr(args, "thinking_budget", DEFAULT_THINKING_BUDGET),
+    )
+
+    cur = window[local]
+    new = corrected[local] if local < len(corrected) else cur
+    if new.speaker != cur.speaker or new.instruction != cur.instruction:
+        return {"speaker": new.speaker, "instruction": new.instruction}
+    # the reviewer may decline to correct but still flag; take its guess
+    for f in flags:
+        if f.index == local and f.suggestion:
+            return dict(f.suggestion)
+    return None
 
 
 def _summarize_audit_entry(idx: int, total: int, e: dict) -> str:
@@ -2743,6 +2947,16 @@ def _format_audit_entry(
         out.append("  suggested:")
         for line in json.dumps(suggested, indent=2, ensure_ascii=False).splitlines():
             out.append(f"  | {line}")
+    if workdir is not None:
+        window = _audit_segment_window(workdir, e)
+        if window:
+            out.append("  --- script segments ---")
+            out.extend(
+                _format_segment_window(
+                    window, truncate=False, recorded_no=e.get("segment")
+                )
+            )
+            out.append("  --- end script segments ---")
     span = (
         _audit_context_for(workdir, e)
         if workdir is not None
@@ -2794,8 +3008,10 @@ def _apply_flag_suggestion(workdir: Path, e: dict) -> bool:
         print(f"  apply: script not found: {script_path}")
         return False
     segments = load_script(script_path)
-    idx = seg_no - 1
-    if idx >= len(segments):
+    # resolved by text, not by the recorded number: applying a correction to
+    # the wrong segment because the script was re-split is silent corruption
+    idx = _audit_segment_index(e, segments)
+    if idx is None:
         print(f"  apply: segment {seg_no} out of range (script has {len(segments)})")
         return False
     cur = segments[idx]
@@ -2903,6 +3119,13 @@ def cmd_audit(args) -> None:
         e = visible[idx]
         print()
         print(_summarize_audit_entry(idx, len(visible), e))
+        # the script as it currently stands around the flag: the arrow marks the
+        # flagged segment, and its own line is the "current" state a suggestion
+        # would replace.
+        for line in _format_segment_window(
+            _audit_segment_window(workdir, e), recorded_no=e.get("segment")
+        ):
+            print(line)
         has_suggestion = bool(e.get("suggested")) and e.get("kind") == "flag"
         if has_suggestion:
             cur = _audit_current_segment(workdir, e)
@@ -2914,28 +3137,36 @@ def cmd_audit(args) -> None:
                 and suggested.get("instruction", cur.instruction) == cur.instruction
             ):
                 has_suggestion = False
-            if cur is not None:
-                print(
-                    f"  current:   speaker={cur.speaker!r} "
-                    f"instruction={cur.instruction!r}"
-                )
             print(
                 f"  suggested: speaker={suggested.get('speaker', '')!r} "
                 f"instruction={suggested.get('instruction', '')!r}"
             )
-            text = (cur.text if cur is not None else e.get("text", "")) or ""
-            if text:
-                print(f"  text: {_truncate(text)}")
+        # the conditional options lead, so the always-present ones keep the same
+        # order and position from one entry to the next
+        can_suggest = e.get("kind") == "flag" and not has_suggestion
         prompt = (
-            "  [p]ager / "
+            "  "
             + ("[a]pply / " if has_suggestion else "")
-            + "[k]eep / [e]dit / [d]ismiss / [n]ext / [q]uit> "
+            + ("[s]uggest / " if can_suggest else "")
+            + "[p]ager / [e]dit / [d]ismiss / [n]ext / [q]uit> "
         )
-        choice = input(prompt).strip().lower()
+        choice = prompt_choice(prompt)
         if choice in ("q", "quit"):
             break
         if choice in ("p", "pager"):
             _show_via_pager(_format_audit_entry(idx, len(visible), e, workdir))
+            continue
+        if can_suggest and choice in ("s", "suggest"):
+            try:
+                suggestion = _suggest_for_entry(workdir, e, args)
+            except Exception as exc:
+                print(f"  suggest: failed ({exc})")
+                continue
+            if suggestion is None:
+                print("  suggest: llm proposed no change")
+                continue
+            e["suggested"] = suggestion
+            _save_audit(audit_path, entries)
             continue
         if has_suggestion and choice in ("a", "apply"):
             if _apply_flag_suggestion(workdir, e):
@@ -2951,6 +3182,8 @@ def cmd_audit(args) -> None:
             else:
                 print("  edit: entry has no chapter; skipping")
             continue
+        # dismiss resolves the flag, so its chapter stops being deferred from
+        # perform. anything else advances and leaves the entry for a later pass.
         if choice in ("d", "dismiss"):
             entries.remove(e)
             visible.pop(idx)
@@ -3518,15 +3751,20 @@ def dramatize_book(
     directed: bool = False,
     accept: bool = False,
     ignore_flags: bool = False,
-    phase_wise: bool = False,
+    chapter_wise: bool = False,
+    audition_lines: bool = False,
     export_fn: Any = None,
 ) -> None:
     """run full dramatization pipeline.
 
-    by default every phase (cast → audition → [emote] → script → revise →
-    [review] → perform → retake → export) runs chapter-wise: all phases
-    complete for chapter 1 before chapter 2 begins. pass phase_wise=True to
-    instead run each phase across all chapters before advancing.
+    the head phases (cast → audition → [emote]) always run across every
+    selected chapter first. the tail (script → revise → [review] → perform →
+    retake → export) runs across all chapters too, unless chapter_wise=True,
+    which completes the whole tail for chapter 1 before chapter 2 begins.
+
+    cast is never sliced per chapter: the script phase keys its resume hash on
+    the whole cast, so a character discovered in chapter N would invalidate the
+    scripts of every chapter before it and the run would never converge.
     """
     from .audition import run_audition
 
@@ -3538,6 +3776,9 @@ def dramatize_book(
     emote_config = audition_config if preset_voices else design_config
 
     def _run_head(chs: list[int] | None) -> None:
+        """cast, then the voice phases. neither audition nor emote is
+        chapter-scoped -- both always cover the whole cast -- so this runs once
+        per invocation rather than once per chapter."""
         before = dir_mtime(get_command_dir(workdir, "cast"))
         run_cast_generation(
             workdir,
@@ -3549,6 +3790,7 @@ def dramatize_book(
             force=force or redo_phase == "cast",
             thinking_budget=thinking_budget,
             accept=accept,
+            audition_lines=audition_lines,
         )
         _step_if_changed(step, "cast", get_command_dir(workdir, "cast"), before)
 
@@ -3603,28 +3845,22 @@ def dramatize_book(
         accept=accept,
     )
 
-    if phase_wise:
-        _run_head(chapters)
-        _run_script_phases(workdir, chapters, **script_kwargs)
-        _check_unresolved_flags(workdir, ignore=ignore_flags)
-        _run_perform_phases(workdir, chapters, **perform_kwargs)
-        return
+    _run_head(chapters)
 
-    chapter_nums = _enumerate_chapters(workdir, chapters)
+    chapter_nums = _enumerate_chapters(workdir, chapters) if chapter_wise else []
     if not chapter_nums:
-        _run_head(chapters)
         _run_script_phases(workdir, chapters, **script_kwargs)
         _check_unresolved_flags(workdir, ignore=ignore_flags)
         _run_perform_phases(workdir, chapters, **perform_kwargs)
         return
 
-    # single chapter-wise pass: everything for chapter N completes (including
-    # export) before chapter N+1 begins. unresolved flags from chapter N skip
-    # perform/export for that chapter but do not block chapter N+1's review.
+    # single chapter-wise pass: the whole tail for chapter N completes
+    # (including export) before chapter N+1 begins. unresolved flags from
+    # chapter N skip perform/export for that chapter but do not block chapter
+    # N+1's review. the head phases already ran across every chapter above.
     deferred: list[int] = []
     for num in chapter_nums:
         print(f"dramatize: chapter {num}")
-        _run_head([num])
         _run_script_phases(workdir, [num], **script_kwargs)
         try:
             _check_unresolved_flags(workdir, ignore=ignore_flags, chapters=[num])

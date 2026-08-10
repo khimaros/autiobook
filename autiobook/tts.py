@@ -417,7 +417,7 @@ def _perform_synthesis(
         cast = load_cast(workdir)
         char = next((c for c in cast if c.name == voice_name), None)
         if char:
-            voice_text = char.audition_line
+            voice_text = char.audition_text()
 
     for txt_path, wav_path in pending:
         text = txt_path.read_text(encoding="utf-8")

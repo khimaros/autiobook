@@ -18,7 +18,7 @@ from autiobook.casting import (
     save_voices,
     voices_path,
 )
-from autiobook.config import SAMPLE_RATE
+from autiobook.config import AUDITION_SAMPLE_LINE, SAMPLE_RATE
 from autiobook.llm import Character
 from autiobook.resume import get_command_dir
 from autiobook.utils import dir_mtime
@@ -29,7 +29,7 @@ TAKE = np.zeros(SAMPLE_RATE // 10, dtype=np.float32)
 
 
 def _char() -> Character:
-    return Character(name="Narrator", description="d", audition_line="hello there")
+    return Character(name="Narrator", description="d")
 
 
 class FakeEngine:
@@ -84,7 +84,7 @@ class TestStartPreview:
 
         assert handle is player
         assert engine.synthesized == []
-        assert engine.streamed == [("hello there", "Zephyr")]
+        assert engine.streamed == [(AUDITION_SAMPLE_LINE, "Zephyr")]
         # pcm reached the player, and the take was cached for replay
         player.stdin.write.assert_called()
         assert preview.exists()
@@ -99,7 +99,7 @@ class TestStartPreview:
 
         assert handle is player
         assert engine.streamed == []
-        assert engine.synthesized == ["hello there"]
+        assert engine.synthesized == [AUDITION_SAMPLE_LINE]
         assert preview.exists()
         play.assert_called_once_with(preview)
 
@@ -125,7 +125,7 @@ class TestStartPreview:
                 _start_preview(engine, _char(), "Zephyr", preview)
 
         assert engine.streamed == []
-        assert engine.synthesized == ["hello there"]
+        assert engine.synthesized == [AUDITION_SAMPLE_LINE]
 
 
 class TestResumedRunIsInert:
@@ -175,7 +175,7 @@ class TestVoiceNavigation:
             played.append(voice_id)
             return None
 
-        with patch("autiobook.casting._prompt", side_effect=answers):
+        with patch("autiobook.casting.prompt_choice", side_effect=answers):
             with patch("autiobook.casting._start_preview", start_preview):
                 with patch("autiobook.casting._stop_playback"):
                     result = _audition_voices(tmp_path, _char(), VOICES, engine)

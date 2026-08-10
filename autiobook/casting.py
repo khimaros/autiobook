@@ -12,6 +12,7 @@ import soundfile as sf  # type: ignore
 from .config import SAMPLE_RATE, WAV_EXT
 from .llm import Character
 from .resume import get_command_dir
+from .utils import prompt_choice
 
 VOICES_FILE = "voices.json"
 PRESETS_DIR = "presets"
@@ -48,11 +49,16 @@ def save_voices(workdir: Path, voices: dict[str, str]) -> None:
 
 
 def _play_wav_async(path: Path) -> subprocess.Popen | None:
-    """spawn a non-blocking player subprocess; returns Popen handle or None."""
+    """spawn a non-blocking player subprocess; returns Popen handle or None.
+
+    stdin is detached: ffplay reads the terminal for its own key bindings, and
+    a player left running would swallow the keystrokes meant for our prompt.
+    """
     player = shutil.which("ffplay")
     if player:
         return subprocess.Popen(
             [player, "-nodisp", "-autoexit", "-loglevel", "quiet", str(path)],
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -61,6 +67,7 @@ def _play_wav_async(path: Path) -> subprocess.Popen | None:
         if p:
             return subprocess.Popen(
                 [p, str(path)],
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
@@ -125,7 +132,7 @@ def _synthesize_preview(
     original = engine.config.speaker
     try:
         engine.config.speaker = voice_id
-        audio, sr = engine.synthesize(char.audition_line)
+        audio, sr = engine.synthesize(char.audition_text())
         sf.write(str(preview_path), audio, sr)
     finally:
         engine.config.speaker = original
@@ -180,18 +187,11 @@ def _start_preview(engine: Any, char: Character, voice_id: str, preview: Path) -
     then plays the cached wav.
     """
     if not preview.exists() and getattr(engine, "streaming", False):
-        proc = _stream_preview(engine, char.audition_line, voice_id, preview)
+        proc = _stream_preview(engine, char.audition_text(), voice_id, preview)
         if proc is not None:
             return proc
     _synthesize_preview(engine, char, voice_id, preview)
     return _play_wav_async(preview)
-
-
-def _prompt(msg: str) -> str:
-    try:
-        return input(msg).strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        return "q"
 
 
 def _audition_voices(
@@ -217,7 +217,7 @@ def _audition_voices(
 
         step = 1
         while True:
-            ans = _prompt(
+            ans = prompt_choice(
                 "  [y]es / [n]ext / [p]rev / [r]eplay / [s]kip char / [q]uit: "
             )
             # any answer cuts the take short rather than waiting it out
@@ -280,7 +280,7 @@ def run_casting(
         print(f"\n=== {char.name} ===")
         print(f"  {char.description}")
         print(f"  voice: {char.voice_prompt()}")
-        print(f"  line: {char.audition_line!r}")
+        print(f"  line: {char.audition_text()!r}")
 
         cast_voice, quit_requested = _audition_voices(workdir, char, available, engine)
 

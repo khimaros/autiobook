@@ -1,8 +1,10 @@
 """tests for the http tts engine across local and hosted backends."""
 
 import argparse
+import http.client
 import io
 import json
+import urllib.error
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from threading import Thread
@@ -41,6 +43,19 @@ def _pcm_bytes(count: int = 8) -> bytes:
     return np.arange(count, dtype=np.int16).tobytes()
 
 
+def _dropped() -> Exception:
+    """what urlopen raises when the server closes the socket mid-request."""
+    return http.client.RemoteDisconnected(
+        "Remote end closed connection without response"
+    )
+
+
+def _http_error(code: int) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError(
+        f"{OPENROUTER_BASE}/audio/speech", code, "err", {}, io.BytesIO(b"upstream")
+    )
+
+
 def _mock_response(payload: bytes):
     resp = MagicMock()
     resp.read.return_value = payload
@@ -48,6 +63,15 @@ def _mock_response(payload: bytes):
     resp.__exit__ = MagicMock(return_value=False)
     # SSE parsing iterates the response line by line
     resp.__iter__ = lambda s: iter(payload.splitlines(keepends=True))
+    return resp
+
+
+def _stream_response(*chunks):
+    """a response body read incrementally: each chunk in turn, then EOF."""
+    resp = MagicMock()
+    resp.__enter__ = lambda s: s
+    resp.__exit__ = MagicMock(return_value=False)
+    resp.read1.side_effect = [*chunks, b""]
     return resp
 
 
@@ -281,6 +305,78 @@ class TestUnsupportedFeatures:
             engine.clone_voice("hello", np.zeros(10, dtype="float32"), "ref")
 
 
+class TestStaleServerVoice:
+    """server voice ids live in the model process, so a swap forgets them."""
+
+    def _engine_and_ref(self, tmp_path):
+        from autiobook.tts_http import _voice_cache
+
+        _voice_cache.clear()
+        ref = tmp_path / "Narrator.wav"
+        sf.write(str(ref), np.zeros(SAMPLE_RATE // 10, dtype="float32"), SAMPLE_RATE)
+        return _engine(api_base=LOCAL_BASE), ref
+
+    def test_reregisters_and_retries(self, tmp_path):
+        created = []
+
+        def fake_create(self, ref_audio, ref_text, refresh=False):
+            created.append(refresh)
+            return f"voice_{len(created)}"
+
+        calls = []
+
+        def fake_synth(self, text, voice="", instruct=""):
+            calls.append(voice)
+            if voice == "voice_1":
+                raise RuntimeError(
+                    'http 400: {"error":{"message":"unknown voice '
+                    '\'voice_1\'","type":"invalid_request_error"}}'
+                )
+            return np.zeros(10, dtype="float32")
+
+        engine, ref = self._engine_and_ref(tmp_path)
+        with patch.object(HTTPTTSEngine, "_get_or_create_voice", fake_create):
+            with patch.object(HTTPTTSEngine, "_synthesize_one", fake_synth):
+                out, sr = engine.clone_voice(["one", "two"], str(ref), "ref text")
+
+        assert len(out) == 2 and sr == SAMPLE_RATE
+        # the stale id is retried once against a freshly registered voice
+        assert created == [False, True]
+        assert calls == ["voice_1", "voice_2", "voice_2"]
+
+    def test_other_errors_are_not_retried(self, tmp_path):
+        def fake_synth(self, text, voice="", instruct=""):
+            raise RuntimeError("http 500: server on fire")
+
+        engine, ref = self._engine_and_ref(tmp_path)
+        with patch.object(
+            HTTPTTSEngine, "_get_or_create_voice", lambda *a, **k: "voice_1"
+        ):
+            with patch.object(HTTPTTSEngine, "_synthesize_one", fake_synth):
+                with pytest.raises(RuntimeError, match="on fire"):
+                    engine.clone_voice("one", str(ref), "ref text")
+
+    def test_refresh_bypasses_the_cache(self, tmp_path):
+        from autiobook.tts_http import _voice_cache
+
+        engine, ref = self._engine_and_ref(tmp_path)
+        posted = []
+
+        def fake_post(url, fields, files, api_key=""):
+            posted.append(url)
+            return {"id": f"voice_{len(posted)}"}
+
+        with patch("autiobook.tts_http._post_multipart", fake_post):
+            first = engine._get_or_create_voice(str(ref), "ref text")
+            cached = engine._get_or_create_voice(str(ref), "ref text")
+            fresh = engine._get_or_create_voice(str(ref), "ref text", refresh=True)
+
+        assert (first, cached, fresh) == ("voice_1", "voice_1", "voice_2")
+        assert len(posted) == 2
+        # the new id replaces the stale one for later calls
+        assert _voice_cache[(LOCAL_BASE, str(ref), "ref text")] == "voice_2"
+
+
 class TestStreaming:
     """progressive playback, by sse locally and chunked reads when hosted."""
 
@@ -333,7 +429,7 @@ class TestStreaming:
     def test_qwen_still_uses_sse(self):
         engine = _engine(api_base=LOCAL_BASE, stream_batch_size=8)
         with patch(
-            "autiobook.tts_http._post_sse_pcm_live",
+            "autiobook.tts_http._post_sse",
             return_value=(_pcm_bytes(2), {}, {}),
         ) as mock_sse:
             engine.design_voice_stream("hello", "warm voice")
@@ -341,6 +437,124 @@ class TestStreaming:
         body = mock_sse.call_args[0][1]
         assert body["stream_format"] == "sse"
         assert body["stream_batch_size"] == 8
+
+
+class TestTransientRetry:
+    """a dropped socket must not end a multi-hour synthesis run."""
+
+    def _synthesize(self, side_effect, api_base=OPENROUTER_BASE):
+        """synthesize one take against a scripted sequence of urlopen results."""
+        engine = _engine(api_base=api_base)
+        with patch("time.sleep") as sleep:
+            with patch("urllib.request.urlopen", side_effect=side_effect) as mock_url:
+                audio, _ = engine.synthesize("hello")
+        return audio, mock_url, sleep
+
+    def test_dropped_connection_is_retried(self):
+        audio, mock_url, _ = self._synthesize(
+            [_dropped(), _mock_response(_pcm_bytes(4))]
+        )
+
+        assert mock_url.call_count == 2
+        assert len(audio) == 4
+
+    def test_backoff_doubles_between_attempts(self):
+        from autiobook.config import TTS_RETRY_DELAY
+
+        _, _, sleep = self._synthesize(
+            [_dropped(), _dropped(), _mock_response(_pcm_bytes(4))]
+        )
+
+        delays = [c[0][0] for c in sleep.call_args_list]
+        assert delays == [TTS_RETRY_DELAY, TTS_RETRY_DELAY * 2]
+
+    def _failing_synthesis(self, side_effect, match: str) -> int:
+        """synthesize against a failure; return how many requests were sent."""
+        engine = _engine(api_base=OPENROUTER_BASE)
+        with patch("time.sleep"):
+            with patch("urllib.request.urlopen", side_effect=side_effect) as mock_url:
+                with pytest.raises(Exception, match=match):
+                    engine.synthesize("hello")
+        return int(mock_url.call_count)
+
+    def test_gives_up_after_max_retries(self):
+        from autiobook.config import TTS_MAX_RETRIES
+
+        sent = self._failing_synthesis(_dropped(), "Remote end closed")
+        assert sent == TTS_MAX_RETRIES + 1
+
+    def test_server_error_is_retried(self):
+        audio, mock_url, _ = self._synthesize(
+            [_http_error(503), _mock_response(_pcm_bytes(4))]
+        )
+
+        assert mock_url.call_count == 2
+        assert len(audio) == 4
+
+    def test_rate_limit_is_retried(self):
+        _, mock_url, _ = self._synthesize(
+            [_http_error(429), _mock_response(_pcm_bytes(4))]
+        )
+
+        assert mock_url.call_count == 2
+
+    def test_client_error_fails_fast(self):
+        """a bad body or unknown voice answers the same way however often it is
+        sent, and every send is billed."""
+        assert self._failing_synthesis(_http_error(400), "http 400") == 1
+
+    def test_voice_listing_is_retried(self):
+        engine = _engine(api_base=LOCAL_BASE)
+        payload = json.dumps({"tts-1": ["ryan"]}).encode()
+        with patch("time.sleep"):
+            with patch(
+                "urllib.request.urlopen",
+                side_effect=[_dropped(), _mock_response(payload)],
+            ) as mock_url:
+                assert engine.list_voices() == ["ryan"]
+        assert mock_url.call_count == 2
+
+    def test_qwen_probe_falls_back_after_a_dropped_sse(self):
+        """the sse probe's failure route already exists; a reset socket takes it."""
+        engine = _engine(api_base=LOCAL_BASE)
+        with patch("autiobook.tts_http._post_sse", side_effect=_dropped()):
+            with patch(
+                "urllib.request.urlopen", return_value=_mock_response(_wav_bytes())
+            ) as mock_url:
+                audio, sr = engine.synthesize("hello")
+
+        assert sr == SAMPLE_RATE and len(audio) > 0
+        assert mock_url.call_count == 1
+
+    def test_stream_retried_before_any_audio(self):
+        engine = _engine(api_base=OPENROUTER_BASE)
+        chunks: list[bytes] = []
+        with patch("time.sleep"):
+            with patch(
+                "urllib.request.urlopen",
+                side_effect=[_dropped(), _stream_response(_pcm_bytes(4))],
+            ) as mock_url:
+                engine.design_voice_stream("hello", "warm", on_chunk=chunks.append)
+
+        assert mock_url.call_count == 2
+        assert b"".join(chunks) == _pcm_bytes(4)
+
+    def test_stream_not_replayed_once_the_player_has_audio(self):
+        """a retry mid-take would play its opening seconds twice."""
+        engine = _engine(api_base=OPENROUTER_BASE)
+        broken = _stream_response()
+        broken.read1.side_effect = [_pcm_bytes(2), _dropped()]
+        chunks: list[bytes] = []
+        with patch("time.sleep"):
+            with patch(
+                "urllib.request.urlopen",
+                side_effect=[broken, _stream_response(_pcm_bytes(4))],
+            ) as mock_url:
+                with pytest.raises(Exception, match="Remote end closed"):
+                    engine.design_voice_stream("hello", "warm", on_chunk=chunks.append)
+
+        assert mock_url.call_count == 1
+        assert chunks == [_pcm_bytes(2)]
 
 
 class StubProvider(BaseHTTPRequestHandler):

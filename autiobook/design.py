@@ -20,15 +20,16 @@ def run_design(
         a.lower(): c.name.lower() for c in cast if c.aliases for a in c.aliases
     }
 
-    # default values if not provided (though args are required in CLI)
     new_char = Character(
         name=name,
         description=description or "neutral voice",
-        audition_line=text or "Hello, I am a new character.",
         aliases=[],
+        audition_line=text or "",
     )
 
-    result = _merge_character_into_cast(new_char, cast_map, alias_map, verbose=True)
+    result = _merge_character_into_cast(
+        new_char, cast_map, alias_map, verbose=True, overwrite_audition_line=True
+    )
 
     final_cast = list(cast_map.values())
 

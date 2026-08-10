@@ -13,13 +13,26 @@ import soundfile as sf  # type: ignore
 from tqdm import tqdm  # type: ignore
 
 from .audio import wav_sha256
-from .config import CAST_FILE, SAMPLE_RATE, VOICE_DESIGN_MODEL, WAV_EXT
+from .config import (
+    CAST_FILE,
+    SAMPLE_RATE,
+    VOICE_DESIGN_MODEL,
+    WAV_EXT,
+)
 from .dramatize import load_cast
 from .llm import Character
 from .resume import ResumeManager, compute_hash, get_command_dir
-from .utils import create_tts_engine
+from .utils import create_tts_engine, prompt_choice
 
 AUDITION_COMMAND = "audition"
+# resume key for the roster a directed session was approved against. leading
+# underscores keep it clear of character names, which share this namespace.
+CAST_APPROVAL_KEY = "__cast__"
+
+
+def audition_task_hash(name: str, instruct: str, text: str) -> str:
+    """resume hash for one character's base voice take."""
+    return compute_hash({"name": name, "description": instruct, "text": text})
 
 
 def _edit_description(initial: str) -> str:
@@ -67,6 +80,22 @@ def recorded_seed(workdir: Path, character_name: str) -> int:
     """return the seed recorded by audition for a character, or 0 if none."""
     resume = ResumeManager.for_command(workdir, AUDITION_COMMAND)
     return _seed_from_entry(resume.state.get(character_name))
+
+
+def recorded_audition_lines(workdir: Path) -> dict[str, str]:
+    """per character, the line their audition wav was actually rendered with.
+
+    the cast's audition_line can be reworded by a later merge, and `--accept`
+    marks an existing wav fresh without re-rendering it, so the cast is not a
+    safe source for ref_text. the resume entry is: it is written at the moment
+    the audio is produced.
+    """
+    resume = ResumeManager.for_command(workdir, AUDITION_COMMAND)
+    return {
+        name: str(entry["audition_line"])
+        for name, entry in resume.state.items()
+        if isinstance(entry, dict) and entry.get("audition_line")
+    }
 
 
 def _seed_from_entry(entry: Any) -> int:
@@ -118,6 +147,14 @@ def run_audition(
         _accept_existing(workdir, cast, voices_dir, resume, preset_voices=preset_voices)
         return
 
+    if directed:
+        pending = _pending_characters(
+            workdir, cast, voices_dir, preset_voices, force, audition_line
+        )
+        if not _confirm_cast(cast, pending, resume):
+            print("audition: cancelled.")
+            return
+
     if preset_voices:
         _run_preset(workdir, cast, config, voices_dir, force=force, directed=directed)
         return
@@ -148,15 +185,10 @@ def run_audition(
 
     for char in tqdm(cast, desc="auditioning voices"):
         wav_path = voices_dir / f"{char.name}{WAV_EXT}"
-        text = audition_line or char.audition_line
+        text = char.audition_text(audition_line)
         instruct = char.voice_prompt()
 
-        task_data = {
-            "name": char.name,
-            "description": instruct,
-            "text": text,
-        }
-        task_hash = compute_hash(task_data)
+        task_hash = audition_task_hash(char.name, instruct, text)
 
         if not force and wav_path.exists() and resume.is_fresh(char.name, task_hash):
             skipped_count += 1
@@ -208,6 +240,83 @@ def run_audition(
         print(f"audition: {generated_count} generated, {skipped_count} skipped")
 
 
+def _pending_characters(
+    workdir: Path,
+    cast: List[Character],
+    voices_dir: Path,
+    preset_voices: bool,
+    force: bool,
+    audition_line: str | None,
+) -> List[Character]:
+    """characters a directed session would actually stop on.
+
+    mirrors the skip each directed path applies per character, so the roster
+    covers the work ahead rather than voices that are already approved.
+    """
+    if force:
+        return list(cast)
+    if preset_voices:
+        from .casting import load_voices
+
+        voices = load_voices(workdir)
+        return [c for c in cast if not voices.get(c.name)]
+    resume = ResumeManager.for_command(workdir, AUDITION_COMMAND)
+    pending = []
+    for char in cast:
+        text = char.audition_text(audition_line)
+        task_hash = audition_task_hash(char.name, char.voice_prompt(), text)
+        if (voices_dir / f"{char.name}{WAV_EXT}").exists() and resume.is_fresh(
+            char.name, task_hash
+        ):
+            continue
+        pending.append(char)
+    return pending
+
+
+def _confirm_cast(
+    cast: List[Character], pending: List[Character], resume: ResumeManager
+) -> bool:
+    """show the pending roster and confirm before a directed session starts.
+
+    a directed run walks every character in turn and can take an hour, so a
+    cast with junk entries or duplicates is worth catching before the first
+    take rather than at character 30. approval is recorded against the cast
+    itself, so resuming an interrupted session goes straight back to work --
+    only an edited cast is worth a second look.
+    """
+    if not pending:
+        return True
+    roster_hash = compute_hash(
+        [
+            {
+                "name": c.name,
+                "description": c.description,
+                "voice": c.voice,
+                "aliases": c.aliases or [],
+            }
+            for c in cast
+        ]
+    )
+    if resume.is_fresh(CAST_APPROVAL_KEY, roster_hash):
+        return True
+
+    approved = len(cast) - len(pending)
+    suffix = f" ({approved} already approved)" if approved else ""
+    print(f"\ncast: {len(pending)} characters to audition{suffix}")
+    for i, char in enumerate(pending, 1):
+        aliases = f" (also: {', '.join(char.aliases)})" if char.aliases else ""
+        print(f"  {i:3d}. {char.name}{aliases}")
+        print(f"       {char.description}")
+    ans = prompt_choice(
+        f"\nproceed with these {len(pending)} characters? [y]es / [q]uit: "
+    )
+    if ans not in ("y", "yes", ""):
+        return False
+    resume.update(CAST_APPROVAL_KEY, roster_hash)
+    resume.save()
+    return True
+
+
 def _run_directed_design(
     workdir: Path,
     cast: List[Character],
@@ -227,12 +336,19 @@ def _run_directed_design(
     import random
     from threading import Event, Lock, Thread
 
-    from .casting import _play_pcm_stream, _play_wav_async, _prompt, _stop_playback
+    from .casting import _play_pcm_stream, _play_wav_async, _stop_playback
     from .dramatize import save_cast
 
     resume = ResumeManager.for_command(workdir, AUDITION_COMMAND, force=force)
     takes_dir = voices_dir / "takes"
     takes_dir.mkdir(parents=True, exist_ok=True)
+
+    # [n]ext and [e]dit walk config.seed to fresh random values, and the pregen
+    # worker sets it as a side effect. both outlive the character they were
+    # rolled for, so each character starts from the configured seed again --
+    # otherwise a character's first take depends on how many times the previous
+    # character was skipped past.
+    base_seed = int(getattr(config, "seed", 0) or 0)
 
     engine_lock = Lock()
 
@@ -252,13 +368,22 @@ def _run_directed_design(
             self.instruct: str = ""
             self.ready: list[tuple[int, Any, int]] = []
             self.thread: Thread | None = None
+            # one-shot seed for the next take, so a character's first take can
+            # start from the configured seed the way the streaming path does.
+            self.next_seed: int | None = None
             self._lock = Lock()
 
-        def set_target(self, text_: str, instruct_: str) -> None:
-            """declare the desired (text, instruct). flushes buffer on instruct change."""
+        def set_target(
+            self, text_: str, instruct_: str, first_seed: int | None = None
+        ) -> None:
+            """declare the desired (text, instruct). flushes buffer on instruct change.
+
+            first_seed applies to the take generated after the flush; later
+            takes roll their own, matching [n]ext on the streaming path."""
             with self._lock:
                 if instruct_ != self.instruct:
                     self.ready = []
+                    self.next_seed = first_seed
                 self.text = text_
                 self.instruct = instruct_
             self.ensure_running()
@@ -272,7 +397,10 @@ def _run_directed_design(
                     return
                 target_text = self.text
                 target_instruct = self.instruct
-                seed = random.randint(1, 2**31 - 1)
+                # `or` covers an unset configured seed (0), which the streaming
+                # path also answers with a random one
+                seed = self.next_seed or random.randint(1, 2**31 - 1)
+                self.next_seed = None
 
             def run() -> None:
                 audio: Any = None
@@ -364,12 +492,12 @@ def _run_directed_design(
     # inside the body executes and the post-loop check still has to read it.
     quit_requested = False
     for char in cast:
+        config.seed = base_seed
         final = voices_dir / f"{char.name}{WAV_EXT}"
-        text = audition_line or char.audition_line
+        text = char.audition_text(audition_line)
         instruct = char.voice_prompt()
 
-        task_data = {"name": char.name, "description": instruct, "text": text}
-        task_hash = compute_hash(task_data)
+        task_hash = audition_task_hash(char.name, instruct, text)
         if not force and final.exists() and resume.is_fresh(char.name, task_hash):
             skipped += 1
             continue
@@ -390,7 +518,7 @@ def _run_directed_design(
         pregen: PregenQueue | None = None
         if not streaming_available:
             pregen = PregenQueue(max_depth=PREGEN_DEPTH)
-            pregen.set_target(text, instruct)
+            pregen.set_target(text, instruct, first_seed=base_seed)
 
         # pending streaming synth: (thread, take_index, result, live_proc, cancel)
         pending: tuple[Thread, int, dict, Any, Event] | None = None
@@ -485,7 +613,7 @@ def _run_directed_design(
             next_action = None
 
             pos = f"{cursor + 1}/{len(takes)}"
-            ans = _prompt(
+            ans = prompt_choice(
                 f"  [{pos}] [y]es / [n]ext / [p]rev / [r]eplay / [e]dit / [s]kip / [q]uit: "
             )
             # resolve any pending streaming synth. y/r need full audio so we
@@ -543,9 +671,7 @@ def _run_directed_design(
                     takes[cursor][2] = cur_audio
                     takes[cursor][3] = cur_sr
                     takes[cursor][4] = cur_path
-                accept_hash = compute_hash(
-                    {"name": char.name, "description": cur_instruct, "text": text}
-                )
+                accept_hash = audition_task_hash(char.name, cur_instruct, text)
                 sf.write(str(final), cur_audio, cur_sr)
                 resume.update(
                     char.name,
@@ -662,7 +788,7 @@ def _accept_existing(
                 {
                     "name": char.name,
                     "voice_id": voice_id,
-                    "text": char.audition_line,
+                    "text": char.audition_text(),
                     "mode": "preset",
                 }
             )
@@ -671,23 +797,19 @@ def _accept_existing(
                 task_hash,
                 character=char.name,
                 voice_id=voice_id,
-                audition_line=char.audition_line,
+                audition_line=char.audition_text(),
                 wav_sha256=wav_sha256(wav_path),
             )
         else:
-            task_hash = compute_hash(
-                {
-                    "name": char.name,
-                    "description": char.voice_prompt(),
-                    "text": char.audition_line,
-                }
+            task_hash = audition_task_hash(
+                char.name, char.voice_prompt(), char.audition_text()
             )
             resume.update(
                 char.name,
                 task_hash,
                 character=char.name,
                 prompt=char.voice_prompt(),
-                audition_line=char.audition_line,
+                audition_line=char.audition_text(),
                 seed=int(prior_entry.get("seed", 0) or 0),
                 wav_sha256=wav_sha256(wav_path),
             )
@@ -741,7 +863,7 @@ def _run_preset(
             {
                 "name": char.name,
                 "voice_id": voice_id,
-                "text": char.audition_line,
+                "text": char.audition_text(),
                 "mode": "preset",
             }
         )
@@ -760,7 +882,7 @@ def _run_preset(
             original = engine.config.speaker
             try:
                 engine.config.speaker = voice_id
-                audio, sr = engine.synthesize(char.audition_line)
+                audio, sr = engine.synthesize(char.audition_text())
             finally:
                 engine.config.speaker = original
             sf_mod.write(str(final), audio, sr)
@@ -770,7 +892,7 @@ def _run_preset(
             task_hash,
             character=char.name,
             voice_id=voice_id,
-            audition_line=char.audition_line,
+            audition_line=char.audition_text(),
             wav_sha256=wav_sha256(final),
         )
     resume.save()

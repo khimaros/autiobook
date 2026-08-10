@@ -105,7 +105,6 @@ def cast_workdir():
                 {
                     "name": "Alice",
                     "description": "warm female voice",
-                    "audition_line": "Hello I am Alice.",
                     "aliases": None,
                 }
             ],

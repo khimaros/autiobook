@@ -2,13 +2,13 @@
 
 import json
 import re
-import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, TypeVar, cast
 
 from .config import (
+    AUDITION_SAMPLE_LINE,
     DEFAULT_LLM_MODEL,
     DEFAULT_THINKING_BUDGET,
     EMOTION_KEYS,
@@ -19,8 +19,17 @@ from .config import (
     VALIDATION_MAX_RETRIES,
     active_seed,
 )
+from .utils import retry_with_backoff as backoff
 
 T = TypeVar("T")
+
+
+class EmptyResponseError(RuntimeError):
+    """model returned no content, with its whole reply left in the reasoning.
+
+    not an api error: the request went through and the backend answered. under
+    a fixed seed the same body yields the same empty reply, so the conversation
+    has to change before another send is worth anything."""
 
 
 def retry_with_backoff(
@@ -29,32 +38,27 @@ def retry_with_backoff(
     initial_delay: float = LLM_RETRY_DELAY,
 ) -> T:
     """retry a function with exponential backoff on API errors."""
-    delay = initial_delay
-    last_error: Exception = RuntimeError("unknown error in retry_with_backoff")
-
-    for attempt in range(max_retries + 1):
-        try:
-            return fn()
-        except Exception as e:
-            last_error = e
-            if attempt < max_retries:
-                print(f"  api error: {e}, retrying in {delay:.1f}s...")
-                time.sleep(delay)
-                delay *= 2
-
-    raise last_error
+    return backoff(
+        fn,
+        max_retries,
+        initial_delay,
+        retryable=lambda e: not isinstance(e, EmptyResponseError),
+    )
 
 
 @dataclass
 class Character:
     name: str
     description: str  # who they are: role, condition, what a listener should sense
-    audition_line: str  # short text to generate the reference voice
     aliases: list[str] | None = None  # alternate names for the same character
     # the prompt actually sent to VoiceDesign. kept separate from `description`
     # so it stays purely acoustic -- backstory prose in the design prompt
     # dilutes the traits the model is being asked to produce.
     voice: str = ""
+    # user-supplied only: set by hand in characters.json or `design --text`.
+    # the llm is told not to propose one and any it proposes is dropped on
+    # parse, so this never churns on its own.
+    audition_line: str = ""
 
     def voice_prompt(self) -> str:
         """design prompt for this character, falling back to the description.
@@ -63,6 +67,14 @@ class Character:
         using it keeps their generated voices byte-identical.
         """
         return self.voice or self.description
+
+    def audition_text(self, override: str | None = None) -> str:
+        """text this character's base reference clip speaks.
+
+        a run-wide --audition-line wins, then a line set for this character by
+        hand, then the standing sample line so clips differ only in voice.
+        """
+        return override or self.audition_line or AUDITION_SAMPLE_LINE
 
 
 @dataclass
@@ -171,8 +183,7 @@ def _extract_inline_reasoning(content: str) -> str:
 
 # common keys that follow a value in script/cast segments; used for JSON repair.
 _SEGMENT_KEYS = (
-    r"speaker|text|instruction|name|description|voice|audition_line|aliases"
-    r"|s|t|i|n|d|v|a|al"
+    r"speaker|text|instruction|name|description|voice|aliases" r"|s|t|i|n|d|v|a|al"
 )
 
 # matches `\", \"key"` or `\", "key"` where the LLM failed to close a string value
@@ -199,6 +210,15 @@ def _json_error_snippet(content: str, pos: int, radius: int = 60) -> str:
     snippet = content[start:end].replace("\n", "\\n")
     caret_col = len(prefix) + (pos - start)
     return f"{prefix}{snippet}{suffix}\n{' ' * caret_col}^"
+
+
+def _parses_as_json(content: str) -> bool:
+    """true if content yields json under the same parsing the caller will use."""
+    try:
+        _parse_json_response(content)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    return True
 
 
 def _parse_json_response(content: str) -> dict | list:
@@ -284,28 +304,35 @@ def _call_llm(
             raise RuntimeError(f"llm returned no choices: {res}")
 
         choice = choices[0]
-        content = choice.get("message", {}).get("content", "")
-        if not content:
-            diag = {
-                "finish_reason": choice.get("finish_reason"),
-                "message": str(choice.get("message")),
-                "usage": str(res.get("usage")),
-            }
-            log("LLM_ERROR", f"model={model} empty content", diag)
-            raise RuntimeError(
-                f"llm returned empty content (finish_reason={diag['finish_reason']})"
-            )
-
+        msg = choice.get("message", {}) or {}
+        content = msg.get("content", "")
         # capture reasoning tokens from openai-compatible fields (reasoning_content,
         # reasoning) and from inline <think>/<reasoning> blocks in content. useful
         # for diagnosing retries where the model is "thinking" itself wrong.
-        msg = choice.get("message", {}) or {}
         reasoning = (
             msg.get("reasoning_content")
             or msg.get("reasoning")
             or _extract_inline_reasoning(content)
             or ""
         )
+
+        if not content:
+            # some models put the whole answer in the reasoning field and leave
+            # content empty. if what landed there parses, take it rather than
+            # discarding a usable reply -- parse and validation still judge it.
+            if reasoning and _parses_as_json(reasoning):
+                content = reasoning
+            else:
+                diag = {
+                    "finish_reason": choice.get("finish_reason"),
+                    "message": str(msg),
+                    "usage": str(res.get("usage")),
+                }
+                log("LLM_ERROR", f"model={model} empty content", diag)
+                raise EmptyResponseError(
+                    f"llm returned empty content "
+                    f"(finish_reason={diag['finish_reason']})"
+                )
         fields: dict[str, str] = {"response": content}
         if reasoning:
             fields["reasoning"] = reasoning
@@ -315,6 +342,15 @@ def _call_llm(
 
     response: str = retry_with_backoff(_call)
     return response
+
+
+def _feedback_for_empty(expected_shape: str | None = None) -> str:
+    """feedback for a reply whose content was empty (answer left in reasoning)."""
+    shape_hint = f" Expected shape: {expected_shape}" if expected_shape else ""
+    return (
+        "Your last reply had no content, only reasoning. Put the answer in "
+        f"the reply itself as valid JSON.{shape_hint}"
+    )
 
 
 def _feedback_for_error(
@@ -327,7 +363,9 @@ def _feedback_for_error(
             f"JSON parse error at line {err.lineno} col {err.colno}: {err.msg}.\n"
             f"Offending region (^ marks the error):\n"
             f"{_json_error_snippet(content, err.pos)}\n"
-            f"Re-emit the entire response as valid JSON.{shape_hint}"
+            f"Redo the original task and emit the entire response as valid "
+            f"JSON. Do NOT treat this error message or your previous reply as "
+            f"input to convert.{shape_hint}"
         )
     if isinstance(err, KeyError):
         return (
@@ -349,31 +387,41 @@ def _query_llm_validated(
     max_retries: int = VALIDATION_MAX_RETRIES,
     label: str = "query",
     expected_shape: str | None = None,
+    seed: int | None = None,
 ) -> T:
     """query LLM, parse, validate; retry with targeted feedback on failure.
 
     mutates `messages` by appending each assistant response and feedback turn."""
     total = max_retries + 1
     for attempt in range(1, total + 1):
-        content = _call_llm(messages, model, api_base, api_key, thinking_budget)
+        content = ""
         feedback: str | None = None
 
         try:
-            data = _parse_json_response(content)
-            parsed = parse_fn(data)
-        except (json.JSONDecodeError, KeyError, ValueError) as e:
-            feedback = _feedback_for_error(content, e, expected_shape)
-        else:
-            errors = validate_fn(parsed) if validate_fn else []
-            if not errors:
-                if attempt > 1:
-                    print(f"  {label}: attempt {attempt}/{total}: passed")
-                return parsed
-            feedback = (
-                "Validation errors:\n"
-                + "\n".join(f"- {e}" for e in errors)
-                + "\nFix these and re-emit the full JSON."
+            content = _call_llm(
+                messages, model, api_base, api_key, thinking_budget, seed
             )
+        except EmptyResponseError:
+            # re-sending is pointless under a fixed seed, but the feedback turn
+            # changes the conversation, so the next attempt is a real attempt.
+            feedback = _feedback_for_empty(expected_shape)
+
+        if feedback is None:
+            try:
+                parsed = parse_fn(_parse_json_response(content))
+            except (json.JSONDecodeError, KeyError, ValueError) as e:
+                feedback = _feedback_for_error(content, e, expected_shape)
+            else:
+                errors = validate_fn(parsed) if validate_fn else []
+                if not errors:
+                    if attempt > 1:
+                        print(f"  {label}: attempt {attempt}/{total}: passed")
+                    return parsed
+                feedback = (
+                    "Validation errors:\n"
+                    + "\n".join(f"- {e}" for e in errors)
+                    + "\nFix these and re-emit the full JSON."
+                )
 
         summary = feedback.splitlines()[0]
         if attempt >= total:
@@ -426,13 +474,41 @@ def generate_cast(
     model: str = DEFAULT_LLM_MODEL,
     existing_cast_summary: Optional[str] = None,
     thinking_budget: int = DEFAULT_THINKING_BUDGET,
+    audition_lines: bool = False,
 ) -> tuple[List[Character], List[CastMerge]]:
     """analyze text to identify characters and generate voice descriptions.
 
     returns `(characters, merges)`. `merges` directs the caller to fold
     previously-distinct cast entries together when the llm determines two
     names in `existing_cast_summary` actually refer to the same character.
+
+    `audition_lines` asks for a per-character sample line as well. the caller
+    only applies it where none is set, so it cannot overwrite a hand-written
+    one; without it every clip speaks the shared line.
     """
+    line_field = (
+        """
+- audition_line: Two full sentences this character would plausibly say, used \
+to render their reference voice clip. Natural spoken dialogue in their own \
+register. Avoid proper nouns, numbers and invented spellings, which a speech \
+model reads poorly."""
+        if audition_lines
+        else ""
+    )
+    line_rule = (
+        "Emit ONLY those five fields."
+        if audition_lines
+        else """Emit ONLY those four fields. In particular do NOT invent an \
+audition_line or sample line: every reference clip speaks a fixed sentence, \
+so one would be discarded. Put the accent and delivery in "voice" instead — \
+that is the text the voice model actually reads."""
+    )
+    line_example = (
+        '"audition_line": "I have seen worse, and I have seen better. '
+        'Let us get on with it.", '
+        if audition_lines
+        else ""
+    )
     context_str = (
         f"\nExisting characters (omit unless updating):\n{existing_cast_summary}\n"
         if existing_cast_summary
@@ -454,11 +530,25 @@ slackened by a hypnotic). Every detail must pay for itself by explaining a \
 vocal trait; skip plot twists, appearance unrelated to voice, \
 relationships, and goals. Ground every claim in the prose.
 - voice: The voice-design prompt, and ONLY the voice. A single sentence of \
-comma-separated acoustic traits: gender, age, pitch, speed, volume, accent, \
-texture/timbre, clarity, fluency, tone, and audible personality. NO \
-backstory, NO narrative, NO character name — those belong in description \
-and dilute the design prompt.
-- audition_line: A sample line for this character. It should be two full sentences long.
+comma-separated traits, drawn from the dimensions the voice model reads and \
+using ITS vocabulary wherever one fits:
+  gender: male, female, neutral
+  age: child, teenager, young adult, middle-aged, senior
+  pitch: high, medium, low, slightly high, slightly low
+  speed: fast, medium, slow, slightly fast, slightly slow
+  timbre: resonant, crisp, husky, mellow, sweet, deep, powerful
+  emotion: cheerful, calm, gentle, serious, lively, composed, soothing
+  accent: always name one, taken from how the character's dialogue is \
+written where it carries dialect, and otherwise from where they are from in \
+the story
+Cover every dimension. The listed words are the ones the voice model reads \
+best, so reach for them first, but add a short distinguishing phrase of your \
+own wherever they are too coarse to tell this character apart. A cast in \
+which two people share a voice is a failed cast: check the existing \
+characters above and make sure yours is audibly nobody else. Do NOT describe \
+volume or loudness: the model does not read it. NO backstory, NO narrative, \
+NO character name — those belong in description and dilute the design \
+prompt.{line_field}
 - aliases: Alternate forms the NARRATOR uses to refer to this character in \
 narration — i.e. names that appear in speaker-attribution tags ("said X", \
 "X replied") or in descriptive narration ("X walked in"). Include nicknames, \
@@ -466,19 +556,22 @@ shortened forms, last-name-only, first-name-only, and stylized variants that \
 the narrator actually uses this way. EXCLUDE vocatives and terms of address \
 spoken by other characters inside dialogue (e.g. "baby", "kid", "boyo", "boss", \
 "old son", "friend", "mon"), generic role words that aren't used as a name by \
-the narrator, and epithets another character invents in the moment. If in \
-doubt, ask: would a listener hear this word and know it refers to this \
-specific character as the speaker or subject? If not, omit it.
+the narrator, and epithets another character invents in the moment. NEVER a \
+pronoun — not "he", "him", "his", "she", "her", "it", "they", "them", nor any \
+other. A pronoun refers to whoever was last mentioned, so it names nobody; \
+listing one hands this character every line the script attributes to that \
+word. If in doubt, ask: would a listener hear this word and know it refers to \
+this specific character as the speaker or subject? If not, omit it.
 
 Example: {{"characters": [{{"name": "Mirabel Thatcher-Quinn", \
 "description": "A burnt-out field medic in her late twenties, still \
 running on triage reflexes and too much black coffee.", \
-"voice": "Female, late twenties, moderately low pitch, deliberate \
-conversational pace that clips into urgency, flat American Midwestern \
-accent, slightly roughened timbre, clear articulation, dry sardonic tone, \
-resilient but audibly worn.", \
-"audition_line": "I don't belong here. Let's just go.", \
-"aliases": ["Mirabel", "Mira", "Thatcher-Quinn"]}}]}}
+"voice": "Female, young adult, slightly low pitch, slightly fast speed that \
+clips into urgency under pressure, husky timbre, serious, flat American \
+Midwestern accent.", \
+{line_example}"aliases": ["Mirabel", "Mira", "Thatcher-Quinn"]}}]}}
+
+{line_rule}
 
 Always emit the "characters" key, even if the list has zero or one entries.
 
@@ -503,13 +596,14 @@ Thatcher-Quinn", "from": ["The Medic"], "reason": "narration in chapter 4 \
 reveals 'the medic' is Mirabel"}}]}}
 """
 
+    expected_line = '"audition_line": ..., ' if audition_lines else ""
     messages = [
         {"role": "system", "content": prompt},
         {"role": "user", "content": text_sample},
     ]
     return _query_llm_validated(
         messages,
-        _parse_cast_response,
+        lambda data: _parse_cast_response(data, keep_audition_line=audition_lines),
         validate_fn=_validate_cast_response,
         model=model,
         api_base=api_base,
@@ -517,7 +611,7 @@ reveals 'the medic' is Mirabel"}}]}}
         thinking_budget=thinking_budget,
         label="cast",
         expected_shape='{"characters": [{"name": ..., "description": ..., "voice": ..., '
-        '"audition_line": ..., "aliases": [...]}, ...], '
+        f'{expected_line}"aliases": [...]}}, ...], '
         '"merges": [{"into": ..., "from": [...], "reason": ...}]}',
     )
 
@@ -530,14 +624,14 @@ _CHARACTER_KEYS = {
     "d",
     "voice",
     "v",
-    "audition_line",
-    "a",
     "aliases",
     "al",
 }
 
 
-def _parse_cast_list(data: list | dict) -> List[Character]:
+def _parse_cast_list(
+    data: list | dict, keep_audition_line: bool = False
+) -> List[Character]:
     """parse LLM response into Character list, handling wrapped or bare formats."""
     if isinstance(data, dict):
         # unwrap common list wrappers
@@ -567,8 +661,12 @@ def _parse_cast_list(data: list | dict) -> List[Character]:
             Character(
                 name=name,
                 description=str(c.get("description", c.get("d", ""))),
-                audition_line=str(c.get("audition_line", c.get("a", ""))),
                 aliases=c.get("aliases", c.get("al")),
+                audition_line=(
+                    str(c.get("audition_line", c.get("a", "")))
+                    if keep_audition_line
+                    else ""
+                ),
                 voice=str(c.get("voice", c.get("v", ""))),
             )
         )
@@ -605,11 +703,11 @@ def _parse_merges(data: list | dict) -> List[CastMerge]:
 
 
 def _parse_cast_response(
-    data: list | dict,
+    data: list | dict, keep_audition_line: bool = False
 ) -> tuple[List[Character], List[CastMerge]]:
     """parse the full cast LLM response into characters and optional merges."""
     merges = _parse_merges(data) if isinstance(data, dict) else []
-    characters = _parse_cast_list(data)
+    characters = _parse_cast_list(data, keep_audition_line=keep_audition_line)
     return characters, merges
 
 
@@ -651,8 +749,6 @@ def _validate_cast_list(characters: List[Character]) -> list[str]:
             errors.append(f"character {i} ({c.name}): missing 'description'")
         if not c.voice:
             errors.append(f"character {i} ({c.name}): missing 'voice'")
-        if not c.audition_line:
-            errors.append(f"character {i} ({c.name}): missing 'audition_line'")
 
     # name/alias collisions (normalized) across characters
     owners: dict[str, str] = {}
@@ -707,6 +803,7 @@ def process_script_chunk(
     api_key: Optional[str] = None,
     model: str = DEFAULT_LLM_MODEL,
     thinking_budget: int = DEFAULT_THINKING_BUDGET,
+    seed: int | None = None,
 ) -> List[ScriptSegment]:
     """convert a text chunk into script segments with validation and feedback."""
     cast_str = _format_cast_list(characters_list)
@@ -733,6 +830,7 @@ def process_script_chunk(
         thinking_budget=thinking_budget,
         label="script",
         expected_shape=SCRIPT_EXPECTED_SHAPE,
+        seed=seed,
     )
 
 

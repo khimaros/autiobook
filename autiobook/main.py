@@ -175,7 +175,7 @@ def cmd_dramatize(args):
     retake = args.retake or strict
     callback = getattr(args, "callback", False) or strict
 
-    phase_wise = getattr(args, "phase_wise", False)
+    chapter_wise = getattr(args, "chapter_wise", False)
 
     def process_fn(workdir, config, chapters, redo_phase=None):
         print(f"dramatize: dramatizing chapters in {workdir}...")
@@ -183,7 +183,7 @@ def cmd_dramatize(args):
         # per-chapter export is only meaningful for mp3; m4b bundles the whole
         # book into one file at the end.
         export_fn = None
-        if not phase_wise and not args.m4b:
+        if chapter_wise and not args.m4b:
             force_export = args.force or redo_phase == "export"
             export_dir = workdir / "export"
 
@@ -222,7 +222,8 @@ def cmd_dramatize(args):
             directed=directed,
             accept=accept,
             ignore_flags=getattr(args, "ignore_flags", False),
-            phase_wise=phase_wise,
+            chapter_wise=chapter_wise,
+            audition_lines=getattr(args, "llm_audition_lines", False),
             export_fn=export_fn,
         )
 
@@ -561,13 +562,15 @@ def main():
                     },
                 ),
                 (
-                    ("--phase-wise",),
+                    ("--chapter-wise",),
                     {
                         "action": "store_true",
-                        "help": "run each tail phase (script/revise/review/"
-                        "perform/retake) across all chapters before advancing "
-                        "to the next phase. default is chapter-wise: all tail "
-                        "phases run per chapter before the next chapter starts.",
+                        "help": "run the tail phases (script/revise/review/"
+                        "perform/retake/export) per chapter, completing chapter "
+                        "1 before chapter 2 starts. default is phase-wise: each "
+                        "tail phase runs across all chapters before the next "
+                        "phase. cast/audition/emote always run across all "
+                        "chapters first either way.",
                     },
                 ),
             ],
@@ -596,7 +599,10 @@ def main():
             [
                 (("workdir",), {"help": "path to workdir"}),
                 (("--name",), {"required": True, "help": "character name"}),
-                (("--text",), {"help": "audition line (text to speak)"}),
+                (
+                    ("--text",),
+                    {"help": "audition line for this character (default: shared)"},
+                ),
                 (("--description",), {"help": "voice description (prompt)"}),
             ],
         ),
@@ -776,7 +782,7 @@ def main():
         "audit": (
             _cmd_audit,
             "walk through the review audit log (flags + edits)",
-            [("runtime",)],
+            [("scripting",), ("runtime",)],
             [
                 (("workdir",), {"help": "path to workdir"}),
                 (

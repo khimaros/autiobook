@@ -89,6 +89,15 @@ def set_active_seed(seed: int) -> None:
 
 # tts http settings
 TTS_HTTP_TIMEOUT = int(os.getenv("AUTIOBOOK_TTS_TIMEOUT", "300"))
+# a dropped socket or an overloaded provider would otherwise end a synthesis
+# run of hours, so transient failures are retried with exponential backoff:
+# 4 retries at 2s doubling waits ~30s before giving the request up.
+TTS_MAX_RETRIES = int(os.getenv("AUTIOBOOK_TTS_MAX_RETRIES", "4"))
+TTS_RETRY_DELAY = float(os.getenv("AUTIOBOOK_TTS_RETRY_DELAY", "2.0"))
+# responses worth sending again. any other 4xx (bad body, unknown voice, bad
+# key) answers the same way however often it is sent, and hosted providers
+# bill for each send.
+TTS_RETRY_STATUS = {408, 425, 429, 500, 502, 503, 504}
 # tts backend dialects. "qwen" is the local qwen3-tts server: wav responses,
 # sse streaming, /audio/voices for listing and cloning, and sampler fields.
 # "openai" is the strict subset hosted providers accept (openrouter, openai):
@@ -241,6 +250,31 @@ VOICE_EMOTIONS = {
 }
 EMOTION_KEYS = list(VOICE_EMOTIONS.keys())
 
+# every reference clip speaks the same line, so clips differ only in voice.
+# the base audition clip is the neutral identity, so it uses neutral's sample
+# line -- the emote clips have always used their own emotion's. overridable
+# for a whole run with --audition-line.
+AUDITION_SAMPLE_LINE = VOICE_EMOTIONS["neutral"][1]
+
+# words that are never a name, however often the llm offers them as aliases.
+# an alias resolves script speakers, so one of these captures every segment
+# attributed to that word -- a cast carrying "she" for Vin turns every such
+# line into Vin. matched against the whole alias only: "the steward" is a
+# legitimate narrator alias, "she" is not.
+ALIAS_STOPWORDS = frozenset("""
+    i me my mine myself
+    you your yours yourself yourselves
+    he him his himself
+    she her hers herself
+    it its itself
+    we us our ours ourselves
+    they them their theirs themselves
+    who whom whose
+    someone somebody anyone anybody everyone everybody
+    one ones others another
+    this that these those
+    """.split())
+
 # separator for emotion variant filenames (e.g. CharacterName__happy.wav)
 EMOTION_SEP = "__"
 
@@ -252,29 +286,17 @@ DEFAULT_CAST = [
             "Warm, articulate male voice; mature age; measured slow pace; "
             "authoritative yet compassionate."
         ),
-        "audition_line": (
-            "The history of the valley wasn't written in books, but in the layers "
-            "of sediment resting quietly beneath the river."
-        ),
     },
     {
         "name": "Extra Female",
         "description": "An unnamed or minor female character.",
         "voice": "Neutral, casual, female voice, older adult; lower than average pitch.",
-        "audition_line": (
-            "I really don't think we should be going in there without a map; "
-            "honestly, it looks dangerous."
-        ),
     },
     {
         "name": "Extra Male",
         "description": "An unnamed or minor male character.",
         "voice": (
             "Gruff, textured baritone voice; older adult; relaxed slow speed; weary but kind."
-        ),
-        "audition_line": (
-            "Just hold the light steady for a minute. I've got to get this wire "
-            "connected before the generator fails."
         ),
     },
 ]

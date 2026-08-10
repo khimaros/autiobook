@@ -82,7 +82,7 @@ class TestReviewCastList:
     every name it is expected to preserve."""
 
     def _cast(self):
-        return [Character(name="Portia", description="d", audition_line="a")]
+        return [Character(name="Portia", description="d")]
 
     def test_specials_present_for_review(self):
         listed = _format_cast_list(self._cast(), specials=True)

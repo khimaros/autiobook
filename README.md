@@ -123,10 +123,15 @@ autiobook extract book.epub -o workdir/
 
 # 2. generate cast list (using llm)
 #    each character gets a description (who they are) and a separate
-#    voice prompt; only the voice prompt is sent to the tts model
+#    voice prompt; only the voice prompt is sent to the tts model.
+#    --llm-audition-lines also asks for a per-character audition line,
+#    filling only characters that don't already have one
 autiobook cast workdir/ --api-key sk-...
 
 # 3. generate base voice per character (review/edit characters.json first if needed)
+#    every character auditions on the same sentence, so takes differ only in
+#    voice. set "audition_line" on a character in characters.json to give that
+#    one its own line; --audition-line changes it for the whole run
 autiobook audition workdir/
 
 # 4. generate per-emotion voice variants
@@ -158,7 +163,17 @@ autiobook dramatize book.epub --redo
 
 # enable all inline quality checks (script revise + voice/segment retake)
 autiobook dramatize book.epub --strict
+
+# finish each chapter end to end before starting the next
+autiobook dramatize book.epub --chapter-wise
 ```
+
+each phase runs across all chapters before the next phase starts. `--chapter-wise`
+instead completes script → revise → review → perform → retake → export for
+chapter 1 before chapter 2 begins, so you hear finished audio sooner. either way
+cast, audition and emote run across every chapter first: the script phase keys
+its resume state on the whole cast, so casting chapter by chapter would send
+every earlier chapter back through the LLM each time a new character turned up.
 
 ### script revision
 
@@ -175,6 +190,22 @@ autiobook revise workdir/ --dry-run
 # local cleanup only: strip hallucinations, skip the llm fix-missing pass
 autiobook revise workdir/ --prune
 ```
+
+### audit
+
+`audit` walks the flags `review` and `revise` raised for human attention. an
+open flag defers its chapter from `perform`, so this is where a stalled
+chapter gets unblocked.
+
+```bash
+autiobook audit workdir/
+autiobook audit workdir/ --list      # non-interactive
+autiobook audit workdir/ --all       # include applied-edit records
+```
+
+per entry: `[a]pply` writes the suggested correction, `[s]uggest` asks the llm
+for one when the flag arrived without it, `[e]dit` opens the chapter script,
+`[d]ismiss` clears the flag, `[n]ext` leaves it open for later.
 
 ### voice and segment quality checks
 
@@ -223,7 +254,8 @@ environment variables (also loadable from `.env`; see `.env.example`):
 `AUTIOBOOK_LLM_THINKING_BUDGET`, `AUTIOBOOK_CAST_BATCH_SIZE`,
 `AUTIOBOOK_TTS_MODEL`, `AUTIOBOOK_TTS_API_BASE`, `AUTIOBOOK_TTS_API_KEY`,
 `AUTIOBOOK_TTS_DIALECT`, `AUTIOBOOK_TTS_VOICES`, `AUTIOBOOK_TTS_DIRECTION`,
-`AUTIOBOOK_TTS_RESPONSE_FORMAT`.
+`AUTIOBOOK_TTS_RESPONSE_FORMAT`, `AUTIOBOOK_TTS_MAX_RETRIES`,
+`AUTIOBOOK_TTS_RETRY_DELAY`.
 
 ### hosted tts backends
 
@@ -248,11 +280,27 @@ autiobook dramatize book.epub \
 three per-mode defaults are qwen model ids, so a hosted run that leaves them
 in place asks openrouter for a model it has never heard of.
 
+against any http backend, a dropped connection, a timeout or a 429/5xx reply
+is retried with exponential backoff, so a blip an hour into a synthesis run no
+longer ends it: `AUTIOBOOK_TTS_MAX_RETRIES` (4) retries at
+`AUTIOBOOK_TTS_RETRY_DELAY` (2 seconds), doubling each time. every other 4xx
+-- a malformed body, an unknown voice, a rejected key -- fails at once, since
+the reply will not change and hosted providers bill for each send.
+
 takes play while they render on a hosted backend without any extra setting --
 `AUTIOBOOK_TTS_STREAM_BATCH_SIZE` is a qwen-server knob, and the provider's
 response body is already a stream. in `--directed` casting the prompt stays
 live during playback, so `n` moves on mid-take instead of after it, and
 `[p]rev` steps back to an earlier voice (replayed from cache, not re-rendered).
+
+`--directed` opens with the cast roster (names, aliases, descriptions) and waits
+for approval before the first take, so a cast with junk entries or duplicates
+can be fixed before an hour of takes rather than after. only characters the
+session will stop on are listed; approved voices are left off, a finished cast
+is not prompted at all, and resuming asks again only if the cast changed. each
+character starts from the configured seed, so `[n]ext` on one character does not
+change what the next character's first take sounds like, and a character opens
+on the same take whether or not the backend streams.
 
 `--preset-voices` is required: hosted providers have fixed voices and no
 server-side voice creation, so voice design and cloning are unavailable there.
