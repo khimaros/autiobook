@@ -485,3 +485,75 @@ class TestVerboseLogging:
             "perform: [Alice__angry] cloned",
             "perform: [(default)] plain",
         ]
+
+
+# the script llm emits a bare resumption quote as its own segment whenever
+# narration interrupts dialogue; the tts server answers it with a 500.
+UNSPEAKABLE_TEXT = "\u201c"
+
+
+@pytest.fixture
+def picky_engine():
+    """engine that answers unspeakable input with a 500, as qwen3-tts does."""
+    engine = MagicMock()
+    engine.config = MagicMock()
+    engine.config.batch_size = 2
+    engine.config.compile_model = False
+    engine.config.seed = 0
+
+    call_log = []
+
+    def voice(texts, *args, **kwargs):
+        call_log.append(list(texts))
+        for t in texts:
+            if not any(c.isalnum() for c in t):
+                raise RuntimeError(f"http 500: Internal Server Error ({t!r})")
+        return [np.full(100, 0.2, dtype=np.float32) for _ in texts], SAMPLE_RATE
+
+    engine.synthesize = voice
+    engine.clone_voice = lambda texts, ref_audio, ref_text: voice(texts)
+    engine.call_log = call_log
+    return engine
+
+
+def _silent_only(audio, sr=SAMPLE_RATE):
+    """categorize_audio stand-in: flags silence and nothing else."""
+    if len(audio) == 0 or float(np.mean(np.abs(audio))) < 0.001:
+        return ["silent"]
+    return []
+
+
+class TestUnspeakableSegments:
+    """segments whose text carries nothing to read aloud."""
+
+    def _chapter(self, temp_workdir):
+        segments_dir = temp_workdir / "segments"
+        segments_dir.mkdir(exist_ok=True)
+        texts = [
+            "One would think,",
+            UNSPEAKABLE_TEXT,
+            "that a thousand years of working in fields would have bred them.",
+        ]
+        tasks = [
+            make_task(t, f"hash_seg{i}", segments_dir) for i, t in enumerate(texts)
+        ]
+        return temp_workdir / "chapter_0.wav", tasks
+
+    def test_never_reaches_the_engine(self, temp_workdir, picky_engine):
+        """punctuation alone is not worth a request, and the backend rejects it."""
+        wav_path, tasks = self._chapter(temp_workdir)
+
+        process_audio_pipeline(picky_engine, [(wav_path, tasks)])
+
+        sent = [t for batch in picky_engine.call_log for t in batch]
+        assert UNSPEAKABLE_TEXT not in sent, f"unspeakable text sent to engine: {sent}"
+        assert wav_path.exists(), "chapter not assembled"
+
+    def test_never_reaches_retake(self, temp_workdir, picky_engine):
+        """whatever stands in for it must not be flagged as a silent take."""
+        wav_path, tasks = self._chapter(temp_workdir)
+
+        with patch("autiobook.retake.categorize_audio", _silent_only):
+            process_audio_pipeline(picky_engine, [(wav_path, tasks)], retake=True)
+
+        assert wav_path.exists(), "chapter not assembled"

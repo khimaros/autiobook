@@ -84,8 +84,22 @@ the head phases (cast, audition, emote) always run across every selected chapter
   ceiling in isolated samples, and a count of those grows with take length,
   failing long segments while passing the same voice in short ones.
 - `script`: rewrites text into `NN_Title.json` script with speaker attribution using LLM. Supports `--validate` for iterative fixing of missing or hallucinated segments during generation.
+  where narration interrupts dialogue, the model reliably emits the resumption
+  quote as a segment of its own, which has no words to perform;
+  `merge_unspeakable_segments` folds any wordless segment into a neighbour
+  sharing its speaker (the next one first, since an opening quote belongs to
+  the line it opens). text is only moved, so the concatenation still matches
+  the source and `revise` still validates. the split path parses without it:
+  its parts must stay as the model drew them for the concatenation and
+  minimum-count checks.
 - `revise`: review and repair scripts. compares script to source, then fills missing segments via LLM and removes hallucinated segments. `--dry-run` reports without modifying; `--prune` strips hallucinations but skips LLM fix-missing.
 - `perform`: synthesizes audio using `Qwen3-TTS-Base` voice cloning from scripts + voice samples.
+  segments with nothing to read aloud (`is_speakable`: no alphanumeric
+  character) are dropped in `process_audio_pipeline` before hashes are taken,
+  so no request is spent on them and no placeholder wav lands in the segment
+  cache for `retake` to flag as silent. a tts backend answers a bare quote
+  mark with a 500, which is retryable, so one such segment would otherwise
+  spend the whole retry budget and end the run.
 
 ### review
 

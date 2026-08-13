@@ -142,6 +142,17 @@ def normalize_tts_text(text: str) -> str:
     return stripped or text
 
 
+def is_speakable(text: str) -> bool:
+    """true if there is anything here for a voice to say.
+
+    punctuation alone carries no words, and a tts backend answers a bare
+    quote mark with a 500 -- a retryable status, so the whole retry budget is
+    spent on a request that can never succeed. isalnum rather than an ascii
+    class, so a non-latin script still reads as speech.
+    """
+    return any(c.isalnum() for c in text)
+
+
 SENTENCE_ENDINGS = re.compile(r"(?<=[.!?])\s+")
 
 

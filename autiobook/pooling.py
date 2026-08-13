@@ -20,6 +20,7 @@ from .audio import (
 )
 from .config import EMOTION_SEP, PARAGRAPH_PAUSE_MS, SAMPLE_RATE
 from .resume import ResumeManager, compute_hash
+from .utils import is_speakable
 
 SEGMENT_STATE_PREFIX = "segment:"
 
@@ -512,6 +513,9 @@ def process_audio_pipeline(
     generated_hashes: set[str] = set()  # track globally generated segments
 
     for ch_idx, (wav_path, tasks) in enumerate(chapter_data):
+        # dropped before hashes are taken, so no placeholder wav reaches the
+        # segment cache for `retake` to flag as a silent take forever
+        tasks = [t for t in tasks if is_speakable(t.text)]
         if not tasks:
             continue
 

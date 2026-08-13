@@ -19,6 +19,7 @@ from .config import (
     VALIDATION_MAX_RETRIES,
     active_seed,
 )
+from .utils import is_speakable
 from .utils import retry_with_backoff as backoff
 
 T = TypeVar("T")
@@ -822,7 +823,7 @@ def process_script_chunk(
     ]
     return _query_llm_validated(
         messages,
-        _parse_script_segments,
+        _parse_script_response,
         validate_fn=lambda segs: _validate_script_segments(segs, characters_list),
         model=model,
         api_base=api_base,
@@ -913,6 +914,43 @@ def _parse_script_segments(data: list | dict) -> List[ScriptSegment]:
             )
         )
     return results
+
+
+def merge_unspeakable_segments(segments: List[ScriptSegment]) -> List[ScriptSegment]:
+    """fold a wordless segment into a neighbour sharing its speaker.
+
+    where narration interrupts dialogue, the model reliably emits the
+    resumption quote as a segment of its own ("One would think," / Tresting
+    noted, / the bare quote / "that a thousand years..."), which has nothing to
+    perform. it belongs to the line it opens, so the next segment is preferred
+    and the previous one takes a closing mark. text is only moved, never
+    rewritten, so the concatenation still matches the source.
+    """
+    out: List[ScriptSegment] = []
+    carry = ""
+    for i, seg in enumerate(segments):
+        text = carry + seg.text
+        carry = ""
+        if is_speakable(seg.text):
+            out.append(ScriptSegment(seg.speaker, text, seg.instruction))
+        elif i + 1 < len(segments) and segments[i + 1].speaker == seg.speaker:
+            carry = text
+        elif out and out[-1].speaker == seg.speaker:
+            prev = out[-1]
+            out[-1] = ScriptSegment(prev.speaker, prev.text + text, prev.instruction)
+        else:
+            # no neighbour to take it; perform drops it rather than synthesizing
+            out.append(ScriptSegment(seg.speaker, text, seg.instruction))
+    return out
+
+
+def _parse_script_response(data: list | dict) -> List[ScriptSegment]:
+    """parse generated script segments, folding away the wordless ones.
+
+    the split path parses without this: its parts must stay as the model drew
+    them for the concatenation and minimum-count checks.
+    """
+    return merge_unspeakable_segments(_parse_script_segments(data))
 
 
 def _normalize_name(s: str) -> str:
@@ -1527,7 +1565,7 @@ Convert ONLY the "MISSING TEXT" to JSON. No markdown.
     ]
     return _query_llm_validated(
         messages,
-        _parse_script_segments,
+        _parse_script_response,
         validate_fn=lambda segs: _validate_script_segments(segs, characters_list),
         model=model,
         api_base=api_base,

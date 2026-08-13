@@ -692,3 +692,82 @@ class TestGroupedFeedback:
         joined = "\n".join(errors)
         assert "segments [0, 1, 2, 3, 4]" in joined
         assert "Valid speakers" in joined
+
+
+class TestMergeUnspeakableSegments:
+    """the resumption quote of interrupted dialogue, emitted on its own."""
+
+    OPEN_QUOTE = "\u201c"
+    CLOSE_QUOTE = "\u201d"
+
+    def _segs(self, pairs):
+        from autiobook.llm import ScriptSegment
+
+        return [ScriptSegment(s, t, "neutral") for s, t in pairs]
+
+    def _texts(self, segs):
+        return [(s.speaker, s.text) for s in segs]
+
+    def test_opening_quote_joins_the_line_it_opens(self):
+        from autiobook.llm import merge_unspeakable_segments
+
+        segs = self._segs(
+            [
+                ("Tresting", "One would think,"),
+                ("Narrator", " Tresting noted, "),
+                ("Tresting", self.OPEN_QUOTE),
+                ("Tresting", "that a thousand years would have bred them."),
+            ]
+        )
+        assert self._texts(merge_unspeakable_segments(segs)) == [
+            ("Tresting", "One would think,"),
+            ("Narrator", " Tresting noted, "),
+            (
+                "Tresting",
+                self.OPEN_QUOTE + "that a thousand years would have bred them.",
+            ),
+        ]
+
+    def test_closing_quote_joins_the_line_it_closes(self):
+        from autiobook.llm import merge_unspeakable_segments
+
+        segs = self._segs(
+            [
+                ("Laird", "Very well, Tresting,"),
+                ("Laird", self.CLOSE_QUOTE),
+                ("Narrator", "The obligator turned."),
+            ]
+        )
+        assert self._texts(merge_unspeakable_segments(segs)) == [
+            ("Laird", "Very well, Tresting," + self.CLOSE_QUOTE),
+            ("Narrator", "The obligator turned."),
+        ]
+
+    def test_kept_when_no_neighbour_shares_the_speaker(self):
+        """perform drops it; rewriting it onto another voice would be a guess."""
+        from autiobook.llm import merge_unspeakable_segments
+
+        segs = self._segs(
+            [
+                ("Narrator", "He paused."),
+                ("Tresting", self.OPEN_QUOTE),
+                ("Narrator", "Then went on."),
+            ]
+        )
+        assert self._texts(merge_unspeakable_segments(segs)) == self._texts(segs)
+
+    def test_concatenation_is_preserved(self):
+        from autiobook.llm import merge_unspeakable_segments
+
+        segs = self._segs(
+            [
+                ("Tresting", "Oh, a half dozen or so,"),
+                ("Narrator", " Tresting said. "),
+                ("Tresting", self.OPEN_QUOTE),
+                ("Tresting", self.OPEN_QUOTE),
+                ("Tresting", "Some to beatings, some to exhaustion."),
+            ]
+        )
+        merged = merge_unspeakable_segments(segs)
+        assert "".join(s.text for s in merged) == "".join(s.text for s in segs)
+        assert len(merged) == 3
